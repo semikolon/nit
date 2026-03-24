@@ -388,7 +388,7 @@ mod tests {
 
     #[test]
     fn test_file_with_multiple_dots_in_name() {
-        // e.g., "com.fredrikbranstrom.tts-daemon.plist.tmpl"
+        // e.g., "com.example.my-daemon.plist.tmpl"
         let dir = tempfile::tempdir().unwrap();
         let templates_dir = dir.path().join("templates");
         std::fs::create_dir_all(templates_dir.join("Library/LaunchAgents")).unwrap();
