@@ -2,7 +2,7 @@
 
 AI-era dotfiles manager — git's rivet.
 
-**nit** tracks dotfiles directly in `$HOME` via bare git. Most dotfiles are plain configs that don't need source/target indirection — edit in place, commit with `nit commit`, push with `nit push`. For the handful of files that need per-machine templating, nit renders [Tera](https://keats.github.io/tera/) templates. For secrets, [age](https://age-encryption.org/) encryption with tiered access. For provisioning, hash-based triggers that fire only when watched files change.
+**nit** tracks dotfiles directly in `$HOME` via bare git. Edit your configs in place, commit with `nit commit`, push with `nit push`. For the handful of files that need per-machine differences, nit renders [Tera](https://keats.github.io/tera/) templates. For secrets, [age](https://age-encryption.org/) encryption with tiered access. For provisioning automation, hash-based triggers that fire only when watched files change.
 
 ```
 $HOME (bare git work tree — plain files tracked directly)
@@ -13,24 +13,58 @@ $HOME (bare git work tree — plain files tracked directly)
         ├── templates/            ← .tmpl source files
         ├── secrets/              ← .age encrypted files (tiered)
         ├── scripts/              ← trigger scripts
-        ├── fleet.toml            ← shared config (machines, tiers, triggers)
+        ├── fleet.toml            ← machine inventory + config
         └── triggers.toml         ← hash-based trigger definitions
 ```
 
 ## Why nit?
 
-Existing dotfile managers fall into two camps:
+### The one-machine story
 
-1. **Bare git wrappers** (yadm, dotbare) — great for plain files, but no templates, no secrets, no triggers. You outgrow them when you manage multiple machines.
+You have a laptop. Your `.zshrc`, `.gitconfig`, and editor configs are exactly how you like them. You want them in git so they're safe and versioned. The simplest approach: track them with a bare git repo in `$HOME`. Edit a file, commit, push. Done.
 
-2. **Source/target managers** (chezmoi, dotter) — powerful templating and encryption, but every file goes through a source → target pipeline. This creates friction when multiple sessions edit the same files concurrently, and adds overhead for the majority of files that don't need the indirection.
+nit does exactly this. `nit add ~/.zshrc && nit commit -m "update" && nit push` — it's just git with the right `--git-dir` flags so your home directory doesn't need a `~/.git` folder.
+
+### The multi-machine story
+
+Then you get a server. And maybe a Raspberry Pi. And a work laptop. Now you need:
+
+- **The same base config everywhere** — your shell setup, git config, editor prefs
+- **Per-machine differences** — your server needs different PATH entries, your Pi doesn't need your dev tools, your work laptop has different API keys
+- **Secrets that don't leak** — API keys encrypted in git, but only your server can decrypt the production ones
+- **Automated setup** — when your Brewfile changes, packages install automatically; when a service config changes, the service restarts
+
+This is where most people reach for [chezmoi](https://www.chezmoi.io/) or [Nix Home Manager](https://nix-community.github.io/home-manager/). These are powerful tools, but they put *every* file through a transformation pipeline — even the 90%+ of files that are identical across all your machines.
 
 nit takes a different approach: **plain git for plain files, nit for everything else.**
 
-- **Plain files**: edit in place. `nit add`, `nit commit`, `nit push` — just git with the right `--git-dir` flags.
-- **Templates**: Tera (Jinja2-like) rendering with per-machine variables. Source always wins on deploy. Drift is saved for review, never auto-merged.
-- **Secrets**: age-encrypted with tiered per-machine access (e.g., production secrets only decrypt on servers).
-- **Triggers**: provisioning scripts that run automatically when their watched files change — package installation, service reload, build tasks.
+Most of your dotfiles are the same everywhere. They don't need templating, encryption, or any processing. nit tracks them directly in `$HOME` with bare git — no source/target split, no rename prefixes, no apply step. You edit the actual file.
+
+For the ~5-10% that DO need per-machine treatment:
+
+- **Templates** ([Tera/Jinja2](https://keats.github.io/tera/)): your `.zshenv` needs different exports on macOS vs Linux? Write a template with `{% if os == "darwin" %}`. nit renders it on each machine.
+- **Secrets** ([age](https://age-encryption.org/)): API keys encrypted in git, with tiered access — your server decrypts production keys, your laptop only decrypts dev keys, your Pi gets neither.
+- **Triggers**: your Brewfile changed? nit runs the package install script. A LaunchAgent plist changed? nit reloads it. Declarative, hash-based — only runs when files actually change.
+
+### How nit compares
+
+| | Plain files | Templates | Secrets | Triggers | Multi-machine |
+|---|---|---|---|---|---|
+| **Bare git** (manual) | Edit in place | No | No | No | Manual |
+| **yadm** | Edit in place | Alt-files or Jinja2 | GPG | No | Manual |
+| **chezmoi** | Source/target for all | Go templates | age | Hash-based scripts | chezmoi apply |
+| **nit** | Edit in place | Tera (only where needed) | age (tiered) | Hash-based scripts | nit update |
+
+nit gives you chezmoi's power (templates, encryption, triggers) without requiring every file to go through the pipeline. Plain files stay plain.
+
+### Designed for concurrent AI workflows
+
+nit is also built for environments where multiple AI agents or terminal sessions edit dotfiles simultaneously:
+
+- **Per-session ack system**: each session writes its own review state. No lock file, no contention.
+- **No auto-merge**: template drift is saved and shown at every touchpoint. Impossible to miss.
+- **No interactive prompts**: all output to stderr. No TTY input, ever. Agents and humans use the same interface.
+- **Smart `nit add`**: detects template targets and redirects to staging the source file — agents don't need to know the template architecture.
 
 ## Commands
 
@@ -222,41 +256,51 @@ When Session B commits and finds that Session A already reviewed the identical s
 
 `nit add`, `nit apply`, `nit pick`, and `nit commit` — all four show drift and write acks. There is no separate "review" step to forget. Interacting with templates at all means reviewing them. This is by design: gates that require discipline fail; gates that resolve themselves protect.
 
-## Fleet Sync
+## Managing Multiple Machines
 
-### `nit update` — fleet machines
+If you only have one machine, you can skip this section. nit works great as a simple dotfile tracker. But when you have two or more machines sharing the same dotfiles repo, these features help keep them in sync.
 
-`nit update` is what remote machines run (via cron, SSH, or your fleet orchestrator):
+### `fleet.toml` — your machine inventory
 
-```bash
-nit update         # git pull + render + decrypt + triggers
-nit update --safe  # same, but skip service-restarting triggers (for production)
-```
-
-Key behavior: **drifted template targets are SKIPPED, not overwritten**. If an agent SSH'd into a server and hotfixed a config, `nit update` preserves that fix and reports it. This is the opposite of `nit commit` (which overwrites drift on your dev machine but saves it). The reasoning: fleet machines may have locally-applied fixes that haven't been promoted to source yet. Clobbering them would cause outages.
-
-### `fleet.toml` — shared fleet inventory
-
-`fleet.toml` is the single source of truth for your machine inventory. It's designed to be read by both nit and your fleet orchestrator (such as [hemma](https://github.com/semikolon/hemma), a Just-based fleet provisioning tool that shares this config file).
+`fleet.toml` describes your machines. nit reads it to figure out "who am I?" and decide which templates to render, which secrets to decrypt, and which triggers to run.
 
 ```toml
 [machines.laptop]
-ssh_host = "laptop"
+ssh_host = "laptop"        # matches your ~/.ssh/config
 role = ["dev"]
 
 [machines.server]
 ssh_host = "server"
 role = ["dev", "server"]
-critical = true    # excluded from bulk operations by default
+critical = true            # safety flag (see below)
 
 [machines.router]
 ssh_host = "router"
 role = ["router"]
 ```
 
-`role` is an array of strings. Triggers, template exclusions, and secret tiers all filter on role — a machine with `role = ["dev", "server"]` gets both dev-only and server-only resources.
+**Roles** drive per-machine behavior. A trigger with `role = "dev"` only runs on dev machines. A secret tier with recipients for `"server"` only decrypts on servers. A template exclusion with `unless_role = "dev"` skips rendering on non-dev machines.
 
-Marking a machine as `critical = true` is a signal to fleet orchestrators that it should be excluded from automated bulk operations (like `hemma apply --all`) and require explicit targeting.
+Each machine also has a `local.toml` (not tracked in git) that says "I am `laptop`" — nit looks up the rest from fleet.toml.
+
+If you also use [hemma](https://github.com/semikolon/hemma) for fleet orchestration, it reads the same fleet.toml — one file, both tools.
+
+### `nit update` — syncing remote machines
+
+On your remote machines (servers, Pis, etc.), `nit update` pulls the latest changes and applies them:
+
+```bash
+nit update         # git pull + render + decrypt + triggers
+nit update --safe  # same, but skip service-restarting triggers (for production)
+```
+
+Key safety behavior: **drifted template targets are SKIPPED, not overwritten**. If someone SSH'd into a server and hotfixed a config, `nit update` preserves that fix and reports it. The reasoning: clobbering a production hotfix could cause an outage. The drift is saved for later review with `nit pick`.
+
+You can run `nit update` manually via SSH, schedule it via cron, or let a fleet orchestrator like [hemma](https://github.com/semikolon/hemma) trigger it across all your machines in parallel.
+
+### `critical = true` — protecting infrastructure
+
+Marking a machine as `critical = true` signals to fleet orchestrators that it needs special care. Your router is also your DNS server — a bad config push takes down the network for every machine. hemma excludes critical machines from bulk operations and requires explicit confirmation.
 
 ## Secrets
 
@@ -399,11 +443,18 @@ Or download pre-built binaries from [GitHub Releases](https://github.com/semikol
 
 ## Status
 
-**Work in progress.** Core CLI skeleton, config loading, template discovery, smart `nit add`, and comprehensive tests (49) are implemented. Template rendering, encryption, triggers, and the ack system are coming next.
+**Work in progress.** Core implementation complete: config loading, template rendering, sync-base drift detection, ack system, age encryption, hash-based triggers, all CLI commands, bootstrap, permissions, GitHub Actions CI. 129 tests passing. Migration tooling ready. Currently in pre-migration testing.
 
-## Related
+## Companion: hemma
 
-- **[hemma](https://github.com/semikolon/hemma)** — fleet provisioning orchestrator (Just-based). Shares `fleet.toml` with nit as a single source of truth for machine inventory. Handles SSH-based fleet operations, system overlays, and bootstrap.
+nit manages dotfiles on each machine locally. For orchestrating across multiple machines — SSH-based fleet sync, system config overlays for `/etc/`, bootstrapping new machines, managing configs that need root — there's **[hemma](https://github.com/semikolon/hemma)**.
+
+hemma and nit are independent tools that work well together:
+- **nit alone**: manage dotfiles on one or more machines (pull manually or via cron)
+- **hemma alone**: manage system configs and fleet operations (works with chezmoi too)
+- **nit + hemma**: full-stack fleet management — dotfiles, system configs, secrets, triggers, bootstrap
+
+They share `fleet.toml` as a single source of truth for your machine inventory.
 
 ## License
 
