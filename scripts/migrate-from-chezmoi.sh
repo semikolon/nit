@@ -246,7 +246,7 @@ resolve_chezmoi_path() {
 
 # Test a few resolutions
 printf "  Prefix resolution examples:\n"
-for test_path in "dot_zshrc" "private_dot_secrets/encrypted_private_tier-all.env.age" "dot_claude/hooks/symlink_stop.sh" "private_Library/LaunchAgents/com.fredrikbranstrom.tts-daemon.plist.tmpl" "dot_local/bin/executable_hemma-diff-triage"; do
+for test_path in "dot_zshrc" "private_dot_secrets/encrypted_private_tier-all.env.age" "dot_claude/hooks/symlink_stop.sh" "private_Library/LaunchAgents/com.example.daemon.plist.tmpl" "dot_local/bin/executable_my-tool"; do
     resolved=$(resolve_chezmoi_path "$test_path")
     printf "    %s → %s\n" "$test_path" "$resolved"
 done
@@ -368,16 +368,33 @@ fi
 # ─── Phase 8: Generate local.toml ────────────────────────────────────────────
 info "Phase 8: local.toml generation"
 
-machine_name="unknown"
 hostname_val=$(hostname -s 2>/dev/null || echo "unknown")
-case "$hostname_val" in
-    *Mac-Mini*|*mac-mini*) machine_name="mac-mini" ;;
-    *MacBook*|*mbp*|*merian*) machine_name="merian" ;;
-    darwin|dell) machine_name="darwin" ;;
-    shannon) machine_name="shannon" ;;
-    turing) machine_name="turing" ;;
-    *) machine_name="$hostname_val" ;;
-esac
+
+# Try to match hostname against fleet.toml machine names
+machine_name=""
+fleet_toml="$DOTFILES_DIR/fleet.toml"
+if [ -f "$fleet_toml" ] && command -v python3 >/dev/null 2>&1; then
+    # Auto-detect from fleet.toml
+    machine_name=$(python3 -c "
+import tomllib, sys
+from pathlib import Path
+try:
+    data = tomllib.loads(Path('$fleet_toml').read_text())
+    hostname = '$hostname_val'.lower()
+    for name, m in data.get('machines', {}).items():
+        if name.lower() == hostname or hostname in name.lower() or name.lower() in hostname:
+            print(name)
+            sys.exit(0)
+except: pass
+" 2>/dev/null || true)
+fi
+
+# Fall back to hostname
+if [ -z "$machine_name" ]; then
+    machine_name="$hostname_val"
+    warn "could not match hostname to fleet.toml — using '$machine_name'"
+    warn "edit ~/.config/nit/local.toml to set the correct machine name"
+fi
 
 printf "  Machine: %s (from hostname: %s)\n" "$machine_name" "$hostname_val"
 printf "  Will write: ~/.config/nit/local.toml\n\n"
