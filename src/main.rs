@@ -105,11 +105,7 @@ enum NitCommand {
     },
 
     /// Output fleet inventory (for hemma integration)
-    Fleet {
-        /// Output format
-        #[arg(long, default_value = "hemma")]
-        format: String,
-    },
+    Fleet,
 
     /// Any unrecognized subcommand falls through to git
     #[command(external_subcommand)]
@@ -138,9 +134,9 @@ fn main() -> ExitCode {
                 }
             }
         }
-        Some(NitCommand::Fleet { format }) => {
+        Some(NitCommand::Fleet) => {
             // Fleet only needs fleet.toml, not local.toml
-            match cmd_fleet(&format) {
+            match cmd_fleet() {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("nit: {e}");
@@ -199,7 +195,7 @@ fn run_command(cmd: NitCommand, config: &NitConfig) -> Result<(), Box<dyn std::e
         NitCommand::List => cmd_list(config),
         NitCommand::Run { name } => cmd_run(&name, config),
         // Bootstrap, Fleet, and Git handled in main()
-        NitCommand::Bootstrap { .. } | NitCommand::Fleet { .. } | NitCommand::Git(_) => {
+        NitCommand::Bootstrap { .. } | NitCommand::Fleet | NitCommand::Git(_) => {
             unreachable!()
         }
     }
@@ -1211,38 +1207,20 @@ fn cmd_bootstrap(url: &str) -> Result<(), Box<dyn std::error::Error>> {
     bootstrap::run_bootstrap(url)
 }
 
-fn cmd_fleet(format: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_fleet() -> Result<(), Box<dyn std::error::Error>> {
     let fleet = config::load_fleet_only()?;
 
-    match format {
-        "hemma" => {
-            let mut names: Vec<&String> = fleet.machines.keys().collect();
-            names.sort();
-            for name in names {
-                let m = &fleet.machines[name];
-                let role = if m.role.is_empty() {
-                    String::new()
-                } else {
-                    m.role.join(",")
-                };
-                println!("{}:{}:{}:{}", name, m.ssh_host, role, m.critical);
-            }
-        }
-        "json" => {
-            let output = serde_json::to_string_pretty(&fleet.machines)?;
-            println!("{}", output);
-        }
-        "names" => {
-            let mut names: Vec<&String> = fleet.machines.keys().collect();
-            names.sort();
-            for name in names {
-                println!("{}", name);
-            }
-        }
-        other => {
-            return Err(format!("unknown format '{}' (expected: hemma, json, names)", other).into());
-        }
+    // Output format: name:ssh_host:role:critical (space-separated)
+    // Consumed by hemma Justfile via: fleet := `nit fleet`
+    let mut entries = Vec::new();
+    let mut names: Vec<&String> = fleet.machines.keys().collect();
+    names.sort();
+    for name in names {
+        let m = &fleet.machines[name];
+        let role = m.role.join(",");
+        entries.push(format!("{}:{}:{}:{}", name, m.ssh_host, role, m.critical));
     }
+    println!("{}", entries.join(" "));
 
     Ok(())
 }

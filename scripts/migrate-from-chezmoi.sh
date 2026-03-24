@@ -264,150 +264,200 @@ printf "\n"
 # ─── Go → Tera template conversion ──────────────────────────────────────────
 # Converts chezmoi Go template syntax to Tera/Jinja2 syntax.
 # Called when moving .tmpl files to templates/.
+# Uses Python for reliable regex handling (no shell escaping issues with perl).
 convert_go_to_tera() {
-    local content="$1"
+    local input_file="$1"
 
-    # Phase 1: Protect escaped Go braces (docker format strings)
-    # In chezmoi, {{`{{.Names}}`}} produces literal {{.Names}} in output.
-    # Convert to Tera raw blocks. We use a sentinel to protect during processing.
-    # Pattern: {{` ... `}} → raw block content
-    # Handle the backtick-escaped pattern: {{ ` ... ` }}
-    # sed can't easily match backticks inside {{ }}, so use perl if available
-    if command -v perl >/dev/null 2>&1; then
-        content=$(printf '%s' "$content" | perl -0777 -pe '
-            # Match {{`...`}} patterns (Go template literal braces)
-            s/\{\{\s*`([^`]*)`\s*\}\}/{% raw %}$1{% endraw %}/g;
-        ')
-    fi
+    CONVERT_INPUT="$input_file" python3 << 'PYEOF'
+import re, sys, os
+from pathlib import Path
 
-    # Phase 2: Remove hash trigger lines (handled by triggers.toml in nit)
-    # Lines like: # hash: {{ include "dot_Brewfile" | sha256sum }}
-    # Also: # narrate-client src: {{ include "..." | sha256sum }}
-    content=$(printf '%s' "$content" | sed '/{{.*include.*sha256sum.*}}/d')
+content = Path(os.environ['CONVERT_INPUT']).read_text()
 
-    # Phase 3: Remove version trigger lines
-    # Lines like: # version: v1.0.0  or  # statusline-version: v1.2.8
-    # Only remove if they look like chezmoi hash triggers (not regular comments)
-    content=$(printf '%s' "$content" | sed '/^#[[:space:]]*\(version\|[a-z-]*-version\):[[:space:]]*/d')
+# Phase 1: Protect escaped Go braces (docker format strings)
+# In chezmoi, {{`{{.Names}}`}} produces literal {{.Names}} in output.
+# Convert to Tera raw blocks.
+content = re.sub(
+    r'\{\{\s*`([^`]*)`\s*\}\}',
+    r'{% raw %}\1{% endraw %}',
+    content
+)
 
-    # Phase 4: Convert whitespace-trimmed delimiters
-    # {{- → {{- (same in Tera for expressions)
-    # {%- → {%- (same in Tera for tags)
-    # But we need to convert Go tags to Tera tags first
+# Phase 2: Remove hash trigger lines (handled by triggers.toml in nit)
+# Lines like: # hash: {{ include "dot_Brewfile" | sha256sum }}
+# Also: # narrate-client src: {{ include "..." | sha256sum }}
+content = re.sub(r'^[^\n]*\{\{.*?include.*?sha256sum.*?\}\}[^\n]*\n?', '', content, flags=re.MULTILINE)
 
-    # Phase 5: Convert Go conditionals to Tera
+# Phase 3: Remove version trigger lines used as chezmoi hash triggers
+# Lines like: # version: v1.0.0  or  # statusline-version: v1.2.8-patched
+content = re.sub(r'^#\s*(?:version|[a-z]+-version):\s*\S+[^\n]*\n?', '', content, flags=re.MULTILINE)
 
-    # Complex: {{ if or (eq .chezmoi.hostname "a") (eq .chezmoi.hostname "b") ... }}
-    # This needs special handling — convert nested or/eq patterns
-    if command -v perl >/dev/null 2>&1; then
-        content=$(printf '%s' "$content" | perl -pe '
-            # Handle "if or (eq .X "a") (eq .X "b") ..." with variable number of args
-            if (/\{\{-?\s*if\s+or\s+(.*?)\s*-?\}\}/) {
-                my $inner = $1;
-                my @conditions;
-                while ($inner =~ /\(eq\s+\.(?:chezmoi\.)?(\w+)\s+"([^"]+)"\)/g) {
-                    my ($var, $val) = ($1, $2);
-                    push @conditions, "$var == \"$val\"";
-                }
-                if (@conditions) {
-                    my $joined = join(" or ", @conditions);
-                    my $ws_start = /^\{\{-/ ? "{%-" : "{%";
-                    my $ws_end = /-\}\}$/ ? "-%}" : "%}";
-                    s/\{\{-?\s*if\s+or\s+.*?-?\}\}/$ws_start if $joined $ws_end/;
-                }
-            }
+# Phase 4: Convert complex conditionals (or/and with multiple conditions)
 
-            # Handle "if and (cond1) (cond2)" patterns
-            if (/\{\{-?\s*if\s+and\s+(.*?)\s*-?\}\}/) {
-                my $inner = $1;
-                my @conditions;
-                # Match (eq .X "Y") patterns
-                while ($inner =~ /\(eq\s+\.(?:chezmoi\.)?(\w+)\s+"([^"]+)"\)/g) {
-                    my ($var, $val) = ($1, $2);
-                    push @conditions, "$var == \"$val\"";
-                }
-                # Match (ne .X "Y") patterns
-                while ($inner =~ /\(ne\s+\.(?:chezmoi\.)?(\w+)\s+"([^"]+)"\)/g) {
-                    my ($var, $val) = ($1, $2);
-                    push @conditions, "$var != \"$val\"";
-                }
-                # Match bare .var patterns (booleans)
-                while ($inner =~ /(?<!\()\.(\w+)(?!\))/g) {
-                    push @conditions, "$1";
-                }
-                # Match (not .var) patterns
-                while ($inner =~ /\(not\s+\.(\w+)\)/g) {
-                    push @conditions, "not $1";
-                }
-                if (@conditions) {
-                    my $joined = join(" and ", @conditions);
-                    my $ws_start = /^\{\{-/ ? "{%-" : "{%";
-                    my $ws_end = /-\}\}$/ ? "-%}" : "%}";
-                    s/\{\{-?\s*if\s+and\s+.*?-?\}\}/$ws_start if $joined $ws_end/;
-                }
-            }
-        ')
-    fi
+def convert_or_conditional(m):
+    full = m.group(0)
+    inner = m.group(1)
+    ws_start = "{%-" if full.startswith("{{-") else "{%"
+    ws_end = "-%}" if full.endswith("-%}}") or full.endswith("-}}") else "%}"
 
-    # Simple conditionals (order matters — do specific patterns first)
+    conditions = []
+    for eq_m in re.finditer(r'\(eq\s+\.(?:chezmoi\.)?(\w+)\s+"([^"]+)"\)', inner):
+        var, val = eq_m.group(1, 2)
+        conditions.append(f'{var} == "{val}"')
 
-    # {{ if eq .chezmoi.hostname "X" }} → {% if hostname == "X" %}
-    content=$(printf '%s' "$content" | sed -E '
-        s/\{\{-?[[:space:]]*if[[:space:]]+eq[[:space:]]+\.chezmoi\.hostname[[:space:]]+"([^"]+)"[[:space:]]*-?\}\}/{%-? if hostname == "\1" -%}/g
-    ')
-    # Fix the -? placeholders based on original whitespace trimming
-    content=$(printf '%s' "$content" | sed -E '
-        s/\{%-\? if/{%- if/g; s/ -\?%}/ -%}/g; s/\{%\? if/{% if/g; s/ \?%}/ %}/g
-    ')
+    if conditions:
+        joined = " or ".join(conditions)
+        return f"{ws_start} if {joined} {ws_end}"
+    return full
 
-    # {{ if eq .chezmoi.os "X" }} → {% if os == "X" %}
-    content=$(printf '%s' "$content" | sed -E 's/\{\{-?[[:space:]]*if[[:space:]]+eq[[:space:]]+\.chezmoi\.os[[:space:]]+"([^"]+)"[[:space:]]*-?\}\}/{% if os == "\1" %}/g')
+content = re.sub(
+    r'\{\{-?\s*if\s+or\s+(.*?)\s*-?\}\}',
+    convert_or_conditional,
+    content
+)
 
-    # {{ if eq .chezmoi.arch "X" }} → {% if arch == "X" %}
-    content=$(printf '%s' "$content" | sed -E 's/\{\{-?[[:space:]]*if[[:space:]]+eq[[:space:]]+\.chezmoi\.arch[[:space:]]+"([^"]+)"[[:space:]]*-?\}\}/{% if arch == "\1" %}/g')
+def convert_and_conditional(m):
+    full = m.group(0)
+    inner = m.group(1)
+    ws_start = "{%-" if full.startswith("{{-") else "{%"
+    ws_end = "-%}" if full.endswith("-%}}") or full.endswith("-}}") else "%}"
 
-    # {{ if ne .chezmoi.hostname "X" }} → {% if hostname != "X" %}
-    content=$(printf '%s' "$content" | sed -E 's/\{\{-?[[:space:]]*if[[:space:]]+ne[[:space:]]+\.chezmoi\.hostname[[:space:]]+"([^"]+)"[[:space:]]*-?\}\}/{% if hostname != "\1" %}/g')
+    conditions = []
+    for eq_m in re.finditer(r'\(eq\s+\.(?:chezmoi\.)?(\w+)\s+"([^"]+)"\)', inner):
+        var, val = eq_m.group(1, 2)
+        conditions.append(f'{var} == "{val}"')
+    for ne_m in re.finditer(r'\(ne\s+\.(?:chezmoi\.)?(\w+)\s+"([^"]+)"\)', inner):
+        var, val = ne_m.group(1, 2)
+        conditions.append(f'{var} != "{val}"')
+    for not_m in re.finditer(r'\(not\s+\.(\w+)\)', inner):
+        conditions.append(f'not {not_m.group(1)}')
+    # Bare boolean vars (not inside parens) — e.g., .is_router
+    for bare_m in re.finditer(r'(?<!\w)\.(\w+)(?!\w)(?!\s*")', inner):
+        var = bare_m.group(1)
+        # Skip if already captured as part of eq/ne/not
+        if var not in ('chezmoi',) and f'{var} ==' not in ' '.join(conditions) and f'{var} !=' not in ' '.join(conditions) and f'not {var}' not in conditions:
+            conditions.append(var)
 
-    # {{ if ne .chezmoi.os "X" }} → {% if os != "X" %}
-    content=$(printf '%s' "$content" | sed -E 's/\{\{-?[[:space:]]*if[[:space:]]+ne[[:space:]]+\.chezmoi\.os[[:space:]]+"([^"]+)"[[:space:]]*-?\}\}/{% if os != "\1" %}/g')
+    if conditions:
+        joined = " and ".join(conditions)
+        return f"{ws_start} if {joined} {ws_end}"
+    return full
 
-    # {{ if not .is_dev }} → {% if not is_dev %}
-    content=$(printf '%s' "$content" | sed -E 's/\{\{-?[[:space:]]*if[[:space:]]+not[[:space:]]+\.([a-zA-Z_]+)[[:space:]]*-?\}\}/{% if not \1 %}/g')
+content = re.sub(
+    r'\{\{-?\s*if\s+and\s+(.*?)\s*-?\}\}',
+    convert_and_conditional,
+    content
+)
 
-    # {{ if .is_dev }} → {% if is_dev %}
-    content=$(printf '%s' "$content" | sed -E 's/\{\{-?[[:space:]]*if[[:space:]]+\.([a-zA-Z_]+)[[:space:]]*-?\}\}/{% if \1 %}/g')
+# Phase 5: Convert simple conditionals
 
-    # {{ else }} → {% else %}
-    content=$(printf '%s' "$content" | sed -E 's/\{\{-?[[:space:]]*else[[:space:]]*-?\}\}/{% else %}/g')
+def detect_ws(m):
+    """Detect whitespace trimming from original Go delimiters."""
+    full = m.group(0)
+    ws_start = "{%-" if re.match(r'\{\{-', full) else "{%"
+    ws_end = "-%}" if re.search(r'-\}\}$', full) else "%}"
+    return ws_start, ws_end
 
-    # {{ end }} → {% endif %}
-    content=$(printf '%s' "$content" | sed -E 's/\{\{-?[[:space:]]*end[[:space:]]*-?\}\}/{% endif %}/g')
+# if eq .chezmoi.X "Y" → if X == "Y"
+def convert_if_eq_chezmoi(m):
+    ws_start, ws_end = detect_ws(m)
+    var = m.group(1)
+    val = m.group(2)
+    return f'{ws_start} if {var} == "{val}" {ws_end}'
 
-    # Phase 6: Convert variable references
-    # {{ .chezmoi.hostname }} → {{ hostname }}
-    content=$(printf '%s' "$content" | sed -E 's/\{\{-?[[:space:]]*\.chezmoi\.hostname[[:space:]]*-?\}\}/{{ hostname }}/g')
-    # {{ .chezmoi.os }} → {{ os }}
-    content=$(printf '%s' "$content" | sed -E 's/\{\{-?[[:space:]]*\.chezmoi\.os[[:space:]]*-?\}\}/{{ os }}/g')
-    # {{ .chezmoi.arch }} → {{ arch }}
-    content=$(printf '%s' "$content" | sed -E 's/\{\{-?[[:space:]]*\.chezmoi\.arch[[:space:]]*-?\}\}/{{ arch }}/g')
-    # {{ .chezmoi.homeDir }} → {{ home_dir }}
-    content=$(printf '%s' "$content" | sed -E 's/\{\{-?[[:space:]]*\.chezmoi\.homeDir[[:space:]]*-?\}\}/{{ home_dir }}/g')
-    # {{ .is_dev }} → {{ is_dev }}
-    content=$(printf '%s' "$content" | sed -E 's/\{\{-?[[:space:]]*\.([a-zA-Z_]+)[[:space:]]*-?\}\}/{{ \1 }}/g')
+content = re.sub(
+    r'\{\{-?\s*if\s+eq\s+\.chezmoi\.(\w+)\s+"([^"]+)"\s*-?\}\}',
+    convert_if_eq_chezmoi,
+    content
+)
 
-    # Phase 7: Convert joinPath expressions
-    # {{ joinPath .chezmoi.homeDir "path" | quote }} → "{{ home_dir }}/path"
-    content=$(printf '%s' "$content" | sed -E 's/\{\{[[:space:]]*joinPath[[:space:]]+\.chezmoi\.homeDir[[:space:]]+"([^"]+)"[[:space:]]*\|[[:space:]]*quote[[:space:]]*\}\}/"{{ home_dir }}\/\1"/g')
+# if ne .chezmoi.X "Y" → if X != "Y"
+def convert_if_ne_chezmoi(m):
+    ws_start, ws_end = detect_ws(m)
+    var = m.group(1)
+    val = m.group(2)
+    return f'{ws_start} if {var} != "{val}" {ws_end}'
 
-    # Phase 8: Preserve whitespace trimming on converted tags
-    # Go uses {{- and -}} for whitespace trimming
-    # Tera uses {%- -%} for tags and {{- -}} for expressions (same syntax)
-    # The sed replacements above already handle basic cases.
-    # Clean up any double-spaced artifacts
-    content=$(printf '%s' "$content" | sed 's/{%  /{% /g; s/  %}/  %}/g')
+content = re.sub(
+    r'\{\{-?\s*if\s+ne\s+\.chezmoi\.(\w+)\s+"([^"]+)"\s*-?\}\}',
+    convert_if_ne_chezmoi,
+    content
+)
 
-    printf '%s' "$content"
+# if eq .X "Y" (custom data like .chezmoi.arch handled above, this catches remaining)
+def convert_if_eq_data(m):
+    ws_start, ws_end = detect_ws(m)
+    var = m.group(1)
+    val = m.group(2)
+    return f'{ws_start} if {var} == "{val}" {ws_end}'
+
+content = re.sub(
+    r'\{\{-?\s*if\s+eq\s+\.(\w+)\s+"([^"]+)"\s*-?\}\}',
+    convert_if_eq_data,
+    content
+)
+
+# if not .var → if not var
+def convert_if_not(m):
+    ws_start, ws_end = detect_ws(m)
+    var = m.group(1)
+    return f'{ws_start} if not {var} {ws_end}'
+
+content = re.sub(
+    r'\{\{-?\s*if\s+not\s+\.(\w+)\s*-?\}\}',
+    convert_if_not,
+    content
+)
+
+# if .var → if var (bare boolean)
+def convert_if_bare(m):
+    ws_start, ws_end = detect_ws(m)
+    var = m.group(1)
+    return f'{ws_start} if {var} {ws_end}'
+
+content = re.sub(
+    r'\{\{-?\s*if\s+\.(\w+)\s*-?\}\}',
+    convert_if_bare,
+    content
+)
+
+# else
+def convert_else(m):
+    ws_start, ws_end = detect_ws(m)
+    return f'{ws_start} else {ws_end}'
+
+content = re.sub(r'\{\{-?\s*else\s*-?\}\}', convert_else, content)
+
+# end → endif
+def convert_end(m):
+    ws_start, ws_end = detect_ws(m)
+    return f'{ws_start} endif {ws_end}'
+
+content = re.sub(r'\{\{-?\s*end\s*-?\}\}', convert_end, content)
+
+# Phase 6: Convert variable references
+content = re.sub(r'\{\{-?\s*\.chezmoi\.homeDir\s*-?\}\}', '{{ home_dir }}', content)
+content = re.sub(r'\{\{-?\s*\.chezmoi\.hostname\s*-?\}\}', '{{ hostname }}', content)
+content = re.sub(r'\{\{-?\s*\.chezmoi\.os\s*-?\}\}', '{{ os }}', content)
+content = re.sub(r'\{\{-?\s*\.chezmoi\.arch\s*-?\}\}', '{{ arch }}', content)
+# Generic .var_name → {{ var_name }}
+content = re.sub(r'\{\{-?\s*\.([a-zA-Z_]\w*)\s*-?\}\}', r'{{ \1 }}', content)
+
+# Phase 7: Convert joinPath expressions
+# {{ joinPath .chezmoi.homeDir "path" | quote }} → "{{ home_dir }}/path"
+content = re.sub(
+    r'\{\{\s*joinPath\s+\.chezmoi\.homeDir\s+"([^"]+)"\s*\|\s*quote\s*\}\}',
+    r'"{{ home_dir }}/\1"',
+    content
+)
+
+# Phase 8: Convert merge command template escapes
+# chezmoi uses {{ "{{" }} and {{ "}}" }} to produce literal {{ and }}
+content = re.sub(r'\{\{\s*"(\{\{)"\s*\}\}', r'{% raw %}\1{% endraw %}', content)
+content = re.sub(r'\{\{\s*"(\}\})"\s*\}\}', r'{% raw %}\1{% endraw %}', content)
+
+sys.stdout.write(content)
+PYEOF
 }
 
 # ─── Phase 3: Plan file movements ────────────────────────────────────────────
@@ -467,7 +517,7 @@ for rel in "${SCRIPT_FILES[@]}"; do
         *) dest_dir="scripts" ;;
     esac
     # Clean up name: strip run_onchange_after_ prefix, strip .sh
-    clean_name=$(echo "$dest_name" | sed 's/^run_\(onchange_\)\?after_//' | sed 's/^run_after_//')
+    clean_name=$(echo "$dest_name" | sed -E 's/^run_(onchange_)?after_//' | sed 's/^run_after_//')
     printf "    %s → %s/%s\n" "$rel" "$dest_dir" "$clean_name"
 done
 
@@ -520,7 +570,7 @@ if ! $DRY_RUN; then
         esac
         mkdir -p "$dest_dir"
 
-        clean_name=$(echo "$dest_name" | sed 's/^run_\(onchange_\)\?after_//' | sed 's/^run_after_//')
+        clean_name=$(echo "$dest_name" | sed -E 's/^run_(onchange_)?after_//' | sed 's/^run_after_//')
         dest_path="$dest_dir/$clean_name"
 
         # If the script is a .tmpl, convert Go→Tera, then strip template wrapper
@@ -767,7 +817,7 @@ for rel in "${SCRIPT_FILES[@]}"; do
         *.chezmoiscripts/linux/*) os_filter='os = "linux"' ;;
         *) os_filter="" ;;
     esac
-    clean_name=$(echo "$basename_script" | sed 's/^run_\(onchange_\)\?after_//' | sed 's/^run_after_//' | sed 's/\.sh$//')
+    clean_name=$(echo "$basename_script" | sed -E 's/^run_(onchange_)?after_//' | sed 's/^run_after_//' | sed 's/\.sh$//')
     printf "    [[trigger]] name = \"%s\" %s\n" "$clean_name" "$os_filter"
 done
 printf "\n"
