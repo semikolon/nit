@@ -61,7 +61,7 @@ nit gives you chezmoi's power (templates, encryption, triggers) without requirin
 
 nit is also built for environments where multiple AI agents or terminal sessions edit dotfiles simultaneously.
 
-The core safety principle: **no template change should be deployed without the person or agent seeing what's about to happen.** A `nit commit` renders templates, deploys them, and may trigger service restarts or app reloads that read from those files. But the rendered target on disk might have been edited directly — a hotfix, an automated script that updated a config, or someone who didn't realize the file was managed by nit. If those edits exist AND someone also changed the template source, both changes need to be seen and consciously reconciled before deploying — otherwise you might restart a service with the wrong config.
+The core safety principle: **no template should be deployed without the person or agent seeing what's about to happen.** Every `nit commit` re-renders templates, deploys them to their target paths, and may trigger service restarts or app reloads that read from those files. But the target on disk might have been edited since the last deploy — a hotfix, an automated script that updated a config, or someone who didn't realize the file was managed by nit. Those edits need to be seen before nit overwrites them — otherwise you might lose a fix, or restart a service with config that silently dropped someone's changes.
 
 nit enforces this structurally:
 
