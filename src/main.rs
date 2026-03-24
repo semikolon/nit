@@ -1194,10 +1194,8 @@ fn cmd_rekey(config: &NitConfig) -> Result<(), Box<dyn std::error::Error>> {
 // cmd_bootstrap — stub (T-13)
 // ---------------------------------------------------------------------------
 
-fn cmd_bootstrap(_url: &str) -> Result<(), Box<dyn std::error::Error>> {
-    // T-13: Clone bare repo + configure + initial deploy
-    eprintln!("nit bootstrap: not yet implemented");
-    Ok(())
+fn cmd_bootstrap(url: &str) -> Result<(), Box<dyn std::error::Error>> {
+    bootstrap::run_bootstrap(url)
 }
 
 // ---------------------------------------------------------------------------
