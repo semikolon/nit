@@ -114,6 +114,30 @@ nit update --safe  # same, but skip service-restarting triggers
 
 ## How Templates Work
 
+Most dotfiles are plain files — identical on every machine, tracked directly by git. But some files need to be *slightly different* per machine. Your `.zshenv` might need different `PATH` entries on macOS vs Linux. A LaunchAgent plist needs your actual home directory path baked in.
+
+For these files, nit uses **templates**. A template is a file with placeholders that nit fills in for each machine:
+
+```
+# templates/.zshenv.tmpl (the source — what you edit)
+export PATH="{{ home_dir }}/.local/bin:$PATH"
+{% if os == "darwin" %}
+export HOMEBREW_PREFIX="/opt/homebrew"
+{% endif %}
+```
+
+When nit renders this template, it produces the actual file your shell reads:
+
+```
+# ~/.zshenv (the target — what nit generates)
+# Managed by nit — edit templates/.zshenv.tmpl instead
+export PATH="/Users/you/.local/bin:$PATH"
+export HOMEBREW_PREFIX="/opt/homebrew"
+```
+
+**Source** = the template you edit (`templates/.zshenv.tmpl`)
+**Target** = the rendered file on disk (`~/.zshenv`)
+
 Templates live in `~/dotfiles/templates/` and mirror the target directory structure:
 
 ```
@@ -122,20 +146,26 @@ templates/.config/foo/config.tmpl   → ~/.config/foo/config
 templates/Library/LaunchAgents/x.plist.tmpl → ~/Library/LaunchAgents/x.plist
 ```
 
-Rendered files include a warning comment (`# Managed by nit` or `<!-- Managed by nit -->`). Template variables include `hostname`, `os`, `arch`, `role`, and custom data from `fleet.toml`.
+Rendered files include a warning comment so you know not to edit them directly. Template variables include `hostname`, `os`, `arch`, `role`, and custom data from `fleet.toml`.
+
+### What is "drift"?
+
+Drift is when someone edits a rendered target directly instead of editing the template source. This happens naturally — you SSH into a server, hotfix `~/.zshenv` to unblock something, and forget to update the template. Now the file on disk differs from what nit would render.
 
 ### Why source always wins
 
-In practice, drift (edits to rendered targets) is roughly 50/50 junk vs valuable. But the failure modes are asymmetric:
+When nit deploys, the template source always wins — the rendered output overwrites whatever is on disk. But the overwritten content is never lost. nit saves it as "drift" that you can review later.
+
+Why not auto-merge the target edits back into the source? Because drift is roughly 50/50 junk vs valuable in practice, and the failure modes are asymmetric:
 
 - **Wrongly discarding drift** → recoverable. Drift is saved to `~/.local/share/nit/drift/`, recoverable via `nit pick` at any time.
 - **Wrongly merging junk** → contamination. Silent, hard to detect, and triggers may fire with bad config.
 
-The safer default is the one with the recoverable failure mode. Source wins. Drift persists until you consciously address it.
+The safer default is the one with the recoverable failure mode.
 
 ### Drift handling walkthrough
 
-**Scenario:** You SSH into a server and hotfix `~/.zshenv` directly (a rendered template target). Later, `nit update` pulls new changes.
+**Scenario:** You SSH into a server and hotfix `~/.zshenv` directly. Later, `nit update` pulls new changes.
 
 ```
 $ nit update
@@ -174,10 +204,9 @@ Three paths forward:
 
 ### Smart `nit add`
 
-`nit add` detects template targets and does the right thing:
+What if you (or an AI agent) accidentally run `nit add ~/.zshenv` — the rendered file, not the template? nit detects this and does the right thing automatically:
 
 ```bash
-# Agent edits a rendered template target directly:
 nit add ~/.zshenv
 # nit: ~/.zshenv is a template target → staging source templates/.zshenv.tmpl
 # nit: drift check for ~/.zshenv (full review with `nit pick`)
@@ -188,18 +217,20 @@ nit add .
 # Additionally scans all templates for drift
 ```
 
-Agents don't need to understand the template architecture. They edit files, run `nit add`, and nit routes everything correctly.
+You don't need to remember which files are templates and which are plain. nit routes everything to the right place.
 
 ## The Ack System: Why It Works This Way
 
-The ack (acknowledgment) system is the commit gate for template changes. It exists because templates have a source/target split where drift can go unnoticed — unlike plain files where git's merge conflict is the only gate needed.
+Plain files don't need special review — git's normal merge conflict handling is enough. But templates have two copies of the truth: the source (what you edit) and the target (what's on disk). These can diverge silently. The ack (acknowledgment) system ensures you've seen any divergence before committing.
 
 ### The problem it solves
 
-Without a gate, an agent could:
-1. Edit a template source
-2. Run `nit commit`
-3. Silently overwrite a valuable target hotfix it never saw
+Imagine this scenario:
+1. You hotfix `~/.zshenv` on your server (editing the rendered target directly)
+2. Meanwhile, you also update `templates/.zshenv.tmpl` (the template source)
+3. You run `nit commit` — nit renders the template and overwrites your hotfix
+
+Without a safety gate, step 3 silently destroys your hotfix. You might not notice for days.
 
 The ack system ensures **every template change is reviewed before commit**, without requiring a separate review step. It's structural enforcement — the tool refuses, not the process.
 
