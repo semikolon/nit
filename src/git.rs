@@ -102,3 +102,66 @@ pub fn fall_through_with(strategy: &GitStrategy, args: &[String]) -> ! {
 
     std::process::exit(status.code().unwrap_or(1));
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_bare_git_dir_location() {
+        let dir = bare_git_dir();
+        let home = dirs::home_dir().unwrap();
+        assert_eq!(dir, home.join(".local/share/nit/repo.git"));
+    }
+
+    #[test]
+    fn test_home_git_dir_location() {
+        let dir = home_git_dir();
+        let home = dirs::home_dir().unwrap();
+        assert_eq!(dir, home.join(".git"));
+    }
+
+    #[test]
+    fn test_work_tree_is_home() {
+        let wt = work_tree();
+        let home = dirs::home_dir().unwrap();
+        assert_eq!(wt, home);
+    }
+
+    #[test]
+    fn test_git_dir_for_strategy() {
+        let bare = git_dir_for(&GitStrategy::Bare);
+        let home_strategy = git_dir_for(&GitStrategy::Home);
+
+        // Bare repo is NOT in $HOME directly
+        assert!(bare.to_string_lossy().contains(".local/share/nit/repo.git"));
+        // Home strategy IS at $HOME/.git
+        assert!(home_strategy.to_string_lossy().ends_with("/.git"));
+
+        // They should be different paths
+        assert_ne!(bare, home_strategy);
+    }
+
+    #[test]
+    fn test_git_command_bare_has_flags() {
+        // Verify the command builder includes --git-dir and --work-tree for bare strategy
+        let cmd = git_command(&GitStrategy::Bare);
+        let args: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
+        assert!(args.contains(&std::ffi::OsStr::new("--git-dir")));
+        assert!(args.contains(&std::ffi::OsStr::new("--work-tree")));
+    }
+
+    #[test]
+    fn test_git_command_home_has_ceiling() {
+        // Home strategy sets GIT_CEILING_DIRECTORIES env var
+        let cmd = git_command(&GitStrategy::Home);
+        let envs: Vec<(&std::ffi::OsStr, Option<&std::ffi::OsStr>)> =
+            cmd.get_envs().collect();
+        let has_ceiling = envs.iter().any(|(k, _)| k == &"GIT_CEILING_DIRECTORIES");
+        assert!(has_ceiling);
+
+        // Should NOT have --git-dir flag
+        let args: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
+        assert!(!args.contains(&std::ffi::OsStr::new("--git-dir")));
+    }
+}

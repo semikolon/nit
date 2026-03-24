@@ -575,4 +575,308 @@ role = "server"
         assert!(err.contains("cannot read fleet.toml"));
         assert!(err.contains("nit bootstrap"));
     }
+
+    #[test]
+    fn test_missing_local_toml() {
+        let result = load_local(Path::new("/nonexistent/local.toml"));
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("cannot read local.toml"));
+        assert!(err.contains("nit bootstrap"));
+    }
+
+    #[test]
+    fn test_empty_fleet_toml() {
+        // An empty fleet.toml is valid — all fields have defaults
+        let config: FleetConfig = toml::from_str("").unwrap();
+        assert!(config.machines.is_empty());
+        assert!(config.exclude.is_empty());
+        assert!(config.sync.is_none());
+    }
+
+    #[test]
+    fn test_machine_with_empty_role() {
+        let toml_str = r#"
+[machines.turing]
+ssh_host = "turing"
+"#;
+        let config: FleetConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.machines["turing"].role.is_empty());
+        assert!(!config.machines["turing"].critical);
+    }
+
+    #[test]
+    fn test_machine_with_many_roles() {
+        let toml_str = r#"
+[machines.darwin]
+ssh_host = "darwin"
+role = ["dev", "server", "router", "gpu"]
+critical = true
+"#;
+        let config: FleetConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.machines["darwin"].role.len(), 4);
+        assert!(config.machines["darwin"].role.contains(&"gpu".to_string()));
+    }
+
+    #[test]
+    fn test_unknown_toml_keys_ignored() {
+        // serde(default) + no deny_unknown_fields → extra keys are silently ignored
+        let toml_str = r#"
+[machines.test]
+ssh_host = "test"
+role = ["dev"]
+some_future_field = "value"
+another_field = 42
+"#;
+        let config: FleetConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.machines["test"].ssh_host, "test");
+    }
+
+    #[test]
+    fn test_invalid_strategy_string() {
+        let toml_str = r#"
+machine = "test"
+
+[git]
+strategy = "cloud"
+"#;
+        let result: Result<LocalConfig, _> = toml::from_str(toml_str);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_local_toml_custom_identity() {
+        let toml_str = r#"
+machine = "darwin"
+identity = "/etc/nit/darwin-key.txt"
+"#;
+        let config: LocalConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.identity, "/etc/nit/darwin-key.txt");
+    }
+
+    #[test]
+    fn test_triggers_toml_parse_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let triggers_path = dir.path().join("triggers.toml");
+        std::fs::write(&triggers_path, "[[trigger]]\nname = 123").unwrap();
+
+        let result = load_triggers(&triggers_path);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("parse error"));
+    }
+
+    #[test]
+    fn test_trigger_with_no_optional_fields() {
+        let toml_str = r#"
+[[trigger]]
+name = "universal"
+script = "scripts/universal.sh"
+"#;
+        let file: TriggersFile = toml::from_str(toml_str).unwrap();
+        assert_eq!(file.trigger[0].watch, Vec::<String>::new());
+        assert_eq!(file.trigger[0].os, None);
+        assert_eq!(file.trigger[0].role, None);
+    }
+
+    #[test]
+    fn test_trigger_with_multiple_watch_globs() {
+        let toml_str = r#"
+[[trigger]]
+name = "multi-watch"
+script = "scripts/multi.sh"
+watch = ["*.toml", "*.json", "src/**/*.rs", "Cargo.lock"]
+"#;
+        let file: TriggersFile = toml::from_str(toml_str).unwrap();
+        assert_eq!(file.trigger[0].watch.len(), 4);
+    }
+
+    #[test]
+    fn test_exclude_rules() {
+        let toml_str = r#"
+[exclude]
+"templates/.claude/**" = { unless_role = "dev" }
+"secrets/tier-servers*" = { unless_role = "server" }
+"#;
+        let config: FleetConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.exclude.len(), 2);
+        assert_eq!(
+            config.exclude["templates/.claude/**"].unless_role,
+            Some("dev".to_string())
+        );
+    }
+
+    #[test]
+    fn test_sync_config_with_overrides() {
+        let toml_str = r#"
+[sync]
+command = "nit update"
+schedule = "03:00"
+idle_gated = true
+
+[sync.overrides.darwin]
+strategy = "safe"
+"#;
+        let config: FleetConfig = toml::from_str(toml_str).unwrap();
+        let sync = config.sync.unwrap();
+        assert_eq!(sync.command, "nit update");
+        assert!(sync.idle_gated);
+        assert_eq!(
+            sync.overrides["darwin"].strategy,
+            Some("safe".to_string())
+        );
+    }
+
+    #[test]
+    fn test_multiple_secret_tiers() {
+        let toml_str = r#"
+[secrets.tiers.tier-all]
+recipients = ["age1a...", "age1b...", "age1c..."]
+target = "~/.secrets/tier-all.env"
+
+[secrets.tiers.tier-servers]
+recipients = ["age1a...", "age1b..."]
+target = "~/.secrets/tier-servers.env"
+
+[secrets.tiers.tier-mac]
+recipients = ["age1a..."]
+target = "~/.secrets/tier-mac.env"
+
+[secrets.tiers.tier-edge]
+recipients = ["age1a...", "age1d..."]
+target = "~/.secrets/tier-edge.env"
+"#;
+        let config: FleetConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.secrets.tiers.len(), 4);
+        assert_eq!(config.secrets.tiers["tier-all"].recipients.len(), 3);
+        assert_eq!(config.secrets.tiers["tier-mac"].recipients.len(), 1);
+    }
+
+    #[test]
+    fn test_expand_tilde_with_nested_path() {
+        let expanded = expand_tilde("~/a/b/c/d/e.txt");
+        let home = dirs::home_dir().unwrap();
+        assert_eq!(expanded, home.join("a/b/c/d/e.txt"));
+    }
+
+    #[test]
+    fn test_expand_tilde_not_at_start() {
+        // ~/ only expanded when it's the prefix
+        let expanded = expand_tilde("/home/user/~/weird");
+        assert_eq!(expanded, PathBuf::from("/home/user/~/weird"));
+    }
+
+    #[test]
+    fn test_has_role_with_multiple_roles() {
+        let dir = tempfile::tempdir().unwrap();
+        let fleet_path = dir.path().join("fleet.toml");
+        let local_path = dir.path().join("local.toml");
+        let triggers_path = dir.path().join("triggers.toml");
+
+        std::fs::write(
+            &fleet_path,
+            r#"
+[machines.darwin]
+ssh_host = "darwin"
+role = ["dev", "server", "router"]
+"#,
+        )
+        .unwrap();
+        std::fs::write(&local_path, "machine = \"darwin\"\n").unwrap();
+
+        let config = load_config_from(&fleet_path, &local_path, &triggers_path).unwrap();
+        assert!(config.has_role("dev"));
+        assert!(config.has_role("server"));
+        assert!(config.has_role("router"));
+        assert!(!config.has_role("iot"));
+        assert!(!config.has_role(""));
+        assert!(!config.has_role("DEV")); // case-sensitive
+    }
+
+    #[test]
+    fn test_applicable_triggers_both_os_and_role() {
+        let dir = tempfile::tempdir().unwrap();
+        let fleet_path = dir.path().join("fleet.toml");
+        let local_path = dir.path().join("local.toml");
+        let triggers_path = dir.path().join("triggers.toml");
+
+        std::fs::write(
+            &fleet_path,
+            r#"
+[machines.mac-mini]
+ssh_host = "localhost"
+role = ["dev"]
+"#,
+        )
+        .unwrap();
+        std::fs::write(&local_path, "machine = \"mac-mini\"\n").unwrap();
+
+        // Trigger with BOTH os and role filters — must match both
+        let current_os = std::env::consts::OS;
+        std::fs::write(
+            &triggers_path,
+            &format!(
+                r#"
+[[trigger]]
+name = "matching-both"
+script = "scripts/test.sh"
+os = "{current_os}"
+role = "dev"
+
+[[trigger]]
+name = "wrong-os-right-role"
+script = "scripts/test.sh"
+os = "freebsd"
+role = "dev"
+
+[[trigger]]
+name = "right-os-wrong-role"
+script = "scripts/test.sh"
+os = "{current_os}"
+role = "server"
+"#
+            ),
+        )
+        .unwrap();
+
+        let config = load_config_from(&fleet_path, &local_path, &triggers_path).unwrap();
+        let applicable = config.applicable_triggers();
+        let names: Vec<&str> = applicable.iter().map(|t| t.name.as_str()).collect();
+
+        assert!(names.contains(&"matching-both"));
+        assert!(!names.contains(&"wrong-os-right-role"));
+        assert!(!names.contains(&"right-os-wrong-role"));
+    }
+
+    #[test]
+    fn test_error_message_lists_available_machines() {
+        let dir = tempfile::tempdir().unwrap();
+        let fleet_path = dir.path().join("fleet.toml");
+        let local_path = dir.path().join("local.toml");
+        let triggers_path = dir.path().join("triggers.toml");
+
+        std::fs::write(
+            &fleet_path,
+            r#"
+[machines.alpha]
+ssh_host = "alpha"
+
+[machines.beta]
+ssh_host = "beta"
+
+[machines.gamma]
+ssh_host = "gamma"
+"#,
+        )
+        .unwrap();
+        std::fs::write(&local_path, "machine = \"delta\"\n").unwrap();
+
+        let err = load_config_from(&fleet_path, &local_path, &triggers_path)
+            .unwrap_err()
+            .to_string();
+
+        // Error should list available machines to help the user
+        assert!(err.contains("delta"));
+        // At least one of the available machines should appear
+        assert!(err.contains("alpha") || err.contains("beta") || err.contains("gamma"));
+    }
 }

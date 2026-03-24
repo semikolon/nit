@@ -189,4 +189,227 @@ mod tests {
             None
         );
     }
+
+    /// Helper to build a test NitConfig with a given templates_dir
+    fn test_config(templates_dir: PathBuf, project_dir: PathBuf) -> NitConfig {
+        NitConfig {
+            fleet: crate::config::FleetConfig {
+                machines: Default::default(),
+                templates: crate::config::TemplatesConfig {
+                    source_dir: templates_dir.to_string_lossy().to_string(),
+                },
+                secrets: Default::default(),
+                permissions: Default::default(),
+                exclude: Default::default(),
+                sync: None,
+            },
+            local: crate::config::LocalConfig {
+                machine: "test".to_string(),
+                identity: "~/.config/nit/age-key.txt".to_string(),
+                git: Default::default(),
+            },
+            machine_name: "test".to_string(),
+            machine: crate::config::MachineConfig {
+                ssh_host: "localhost".to_string(),
+                role: vec![],
+                critical: false,
+            },
+            triggers: vec![],
+            templates_dir,
+            secrets_dir: project_dir.join("secrets"),
+            project_dir,
+        }
+    }
+
+    #[test]
+    fn test_empty_templates_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let templates_dir = dir.path().join("templates");
+        std::fs::create_dir_all(&templates_dir).unwrap();
+
+        let config = test_config(templates_dir, dir.path().to_path_buf());
+        let mappings = discover_templates(&config);
+        assert!(mappings.is_empty());
+    }
+
+    #[test]
+    fn test_nonexistent_templates_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let templates_dir = dir.path().join("templates"); // not created
+
+        let config = test_config(templates_dir, dir.path().to_path_buf());
+        let mappings = discover_templates(&config);
+        assert!(mappings.is_empty());
+    }
+
+    #[test]
+    fn test_deeply_nested_template_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let templates_dir = dir.path().join("templates");
+        std::fs::create_dir_all(
+            templates_dir.join(".config/deeply/nested/path"),
+        )
+        .unwrap();
+        std::fs::write(
+            templates_dir.join(".config/deeply/nested/path/config.toml.tmpl"),
+            "# deep",
+        )
+        .unwrap();
+
+        let home = dirs::home_dir().unwrap();
+        let config = test_config(templates_dir, dir.path().to_path_buf());
+        let mappings = discover_templates(&config);
+        assert_eq!(mappings.len(), 1);
+        assert_eq!(
+            mappings[0].target,
+            home.join(".config/deeply/nested/path/config.toml")
+        );
+    }
+
+    #[test]
+    fn test_file_with_multiple_dots_in_name() {
+        // e.g., "com.fredrikbranstrom.tts-daemon.plist.tmpl"
+        let dir = tempfile::tempdir().unwrap();
+        let templates_dir = dir.path().join("templates");
+        std::fs::create_dir_all(templates_dir.join("Library/LaunchAgents")).unwrap();
+        std::fs::write(
+            templates_dir.join("Library/LaunchAgents/com.example.daemon.plist.tmpl"),
+            "<!-- plist -->",
+        )
+        .unwrap();
+
+        let home = dirs::home_dir().unwrap();
+        let config = test_config(templates_dir, dir.path().to_path_buf());
+        let mappings = discover_templates(&config);
+        assert_eq!(mappings.len(), 1);
+        assert_eq!(
+            mappings[0].target,
+            home.join("Library/LaunchAgents/com.example.daemon.plist")
+        );
+    }
+
+    #[test]
+    fn test_non_tmpl_files_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let templates_dir = dir.path().join("templates");
+        std::fs::create_dir_all(&templates_dir).unwrap();
+
+        // Various non-.tmpl files that should all be ignored
+        std::fs::write(templates_dir.join("README.md"), "docs").unwrap();
+        std::fs::write(templates_dir.join(".gitkeep"), "").unwrap();
+        std::fs::write(templates_dir.join("config.toml"), "not a template").unwrap();
+        std::fs::write(templates_dir.join("script.sh"), "#!/bin/bash").unwrap();
+        // Only this one should be discovered
+        std::fs::write(templates_dir.join(".zshrc.tmpl"), "# shell").unwrap();
+
+        let config = test_config(templates_dir, dir.path().to_path_buf());
+        let mappings = discover_templates(&config);
+        assert_eq!(mappings.len(), 1);
+        assert!(mappings[0].source.to_string_lossy().contains(".zshrc.tmpl"));
+    }
+
+    #[test]
+    fn test_build_target_to_source_map() {
+        let home = dirs::home_dir().unwrap();
+        let mappings = vec![
+            TemplateMapping {
+                source: PathBuf::from("/dotfiles/templates/.zshenv.tmpl"),
+                target: home.join(".zshenv"),
+                rel_source: PathBuf::from(".zshenv.tmpl"),
+            },
+            TemplateMapping {
+                source: PathBuf::from("/dotfiles/templates/.zprofile.tmpl"),
+                target: home.join(".zprofile"),
+                rel_source: PathBuf::from(".zprofile.tmpl"),
+            },
+        ];
+
+        let map = build_target_to_source_map(&mappings);
+        assert_eq!(map.len(), 2);
+        assert_eq!(
+            map[&home.join(".zshenv")],
+            PathBuf::from("/dotfiles/templates/.zshenv.tmpl")
+        );
+    }
+
+    #[test]
+    fn test_resolve_template_target_absolute_path() {
+        let home = dirs::home_dir().unwrap();
+        let source = PathBuf::from("/tmp/templates/.zshenv.tmpl");
+        let target = home.join(".zshenv");
+
+        let mut map = HashMap::new();
+        map.insert(target.clone(), source.clone());
+
+        // Absolute path should match
+        let abs_target = home.join(".zshenv");
+        assert_eq!(
+            resolve_template_target(&abs_target, &map),
+            Some(source.clone())
+        );
+    }
+
+    #[test]
+    fn test_resolve_template_target_no_match() {
+        let map = HashMap::new(); // empty map
+        assert_eq!(
+            resolve_template_target(Path::new("/any/path"), &map),
+            None
+        );
+        assert_eq!(
+            resolve_template_target(Path::new("~/.zshrc"), &map),
+            None
+        );
+    }
+
+    #[test]
+    fn test_multiple_templates_unique_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let templates_dir = dir.path().join("templates");
+        std::fs::create_dir_all(&templates_dir).unwrap();
+
+        // Create several templates
+        for name in &[".zshenv", ".zprofile", ".gitconfig"] {
+            std::fs::write(
+                templates_dir.join(format!("{}.tmpl", name)),
+                "# content",
+            )
+            .unwrap();
+        }
+
+        let config = test_config(templates_dir, dir.path().to_path_buf());
+        let mappings = discover_templates(&config);
+        assert_eq!(mappings.len(), 3);
+
+        // All targets should be unique
+        let targets: std::collections::HashSet<PathBuf> =
+            mappings.iter().map(|m| m.target.clone()).collect();
+        assert_eq!(targets.len(), 3);
+
+        // All sources should be unique
+        let sources: std::collections::HashSet<PathBuf> =
+            mappings.iter().map(|m| m.source.clone()).collect();
+        assert_eq!(sources.len(), 3);
+    }
+
+    #[test]
+    fn test_rel_source_preserved() {
+        let dir = tempfile::tempdir().unwrap();
+        let templates_dir = dir.path().join("templates");
+        std::fs::create_dir_all(templates_dir.join("Library/LaunchAgents")).unwrap();
+
+        std::fs::write(
+            templates_dir.join("Library/LaunchAgents/foo.plist.tmpl"),
+            "<!-- test -->",
+        )
+        .unwrap();
+
+        let config = test_config(templates_dir, dir.path().to_path_buf());
+        let mappings = discover_templates(&config);
+        assert_eq!(mappings.len(), 1);
+        assert_eq!(
+            mappings[0].rel_source,
+            PathBuf::from("Library/LaunchAgents/foo.plist.tmpl")
+        );
+    }
 }
