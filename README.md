@@ -56,8 +56,8 @@ nit takes a different approach: **plain git for plain files, nit for everything 
 ## Quick Start
 
 ```bash
-# Install
-cargo install nit
+# Install from source
+cargo install --git https://github.com/semikolon/nit.git
 
 # Bootstrap on a new machine (clones repo, sets up identity)
 nit bootstrap git@github.com:you/dotfiles.git
@@ -388,7 +388,8 @@ And yes — `nit pick` is the command that nitpicks your templates for drift.
 ## Installation
 
 ```bash
-cargo install nit
+# From source (crates.io publication coming soon)
+cargo install --git https://github.com/semikolon/nit.git
 ```
 
 Or download pre-built binaries from [GitHub Releases](https://github.com/semikolon/nit/releases) for:
