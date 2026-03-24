@@ -276,10 +276,16 @@ content = Path(os.environ['CONVERT_INPUT']).read_text()
 
 # Phase 1: Protect escaped Go braces (docker format strings)
 # In chezmoi, {{`{{.Names}}`}} produces literal {{.Names}} in output.
-# Convert to Tera raw blocks.
+# Use sentinels to protect from later regex phases, restore at the end.
+raw_blocks = []
+def protect_raw(m):
+    idx = len(raw_blocks)
+    raw_blocks.append(m.group(1))
+    return f'__NIT_RAW_{idx}__'
+
 content = re.sub(
     r'\{\{\s*`([^`]*)`\s*\}\}',
-    r'{% raw %}\1{% endraw %}',
+    protect_raw,
     content
 )
 
@@ -456,6 +462,10 @@ content = re.sub(
 content = re.sub(r'\{\{\s*"(\{\{)"\s*\}\}', r'{% raw %}\1{% endraw %}', content)
 content = re.sub(r'\{\{\s*"(\}\})"\s*\}\}', r'{% raw %}\1{% endraw %}', content)
 
+# Phase 9: Restore protected raw blocks from Phase 1
+for idx, block in enumerate(raw_blocks):
+    content = content.replace(f'__NIT_RAW_{idx}__', f'{{% raw %}}{block}{{% endraw %}}')
+
 sys.stdout.write(content)
 PYEOF
 }
@@ -538,10 +548,8 @@ if ! $DRY_RUN; then
         dest_dir_path=$(dirname "$dest")
         mkdir -p "$dest_dir_path"
 
-        # Read source, convert Go→Tera, write to templates/
-        src_content=$(cat "$CHEZMOI_SOURCE/$rel")
-        converted=$(convert_go_to_tera "$src_content")
-        printf '%s\n' "$converted" > "$dest"
+        # Convert Go→Tera and write to templates/
+        convert_go_to_tera "$CHEZMOI_SOURCE/$rel" > "$dest"
 
         tmpl_moved=$((tmpl_moved + 1))
     done
@@ -573,13 +581,10 @@ if ! $DRY_RUN; then
         clean_name=$(echo "$dest_name" | sed -E 's/^run_(onchange_)?after_//' | sed 's/^run_after_//')
         dest_path="$dest_dir/$clean_name"
 
-        # If the script is a .tmpl, convert Go→Tera, then strip template wrapper
-        # (scripts become plain scripts — conditionals become comments/removed)
+        # If the script is a .tmpl, convert Go→Tera syntax
+        # (scripts retain template conditionals for nit to evaluate)
         if [[ "$basename_script" == *.tmpl ]]; then
-            src_content=$(cat "$CHEZMOI_SOURCE/$rel")
-            # Convert Go→Tera for any remaining template syntax
-            converted=$(convert_go_to_tera "$src_content")
-            printf '%s\n' "$converted" > "$dest_path"
+            convert_go_to_tera "$CHEZMOI_SOURCE/$rel" > "$dest_path"
         else
             cp "$CHEZMOI_SOURCE/$rel" "$dest_path"
         fi
