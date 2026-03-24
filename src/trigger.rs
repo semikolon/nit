@@ -53,6 +53,7 @@ fn default_state_path() -> PathBuf {
         .join(".local/share/nit/state.json")
 }
 
+#[allow(dead_code)]
 fn default_log_dir() -> PathBuf {
     dirs::home_dir()
         .expect("cannot determine home directory")

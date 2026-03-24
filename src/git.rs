@@ -16,6 +16,7 @@ pub fn bare_git_dir() -> PathBuf {
 }
 
 /// Get git-dir for Strategy A (home dir)
+#[allow(dead_code)]
 pub fn home_git_dir() -> PathBuf {
     dirs::home_dir()
         .expect("cannot determine home directory")
@@ -28,6 +29,7 @@ pub fn work_tree() -> PathBuf {
 }
 
 /// Get the git-dir for a given strategy
+#[allow(dead_code)]
 pub fn git_dir_for(strategy: &GitStrategy) -> PathBuf {
     match strategy {
         GitStrategy::Bare => bare_git_dir(),
@@ -59,6 +61,7 @@ pub fn exec_git_with(strategy: &GitStrategy, args: &[&str]) -> Result<ExitStatus
 }
 
 /// Execute a git command with Strategy B (bare) — used when no config loaded yet
+#[allow(dead_code)]
 pub fn exec_git(args: &[&str]) -> Result<ExitStatus, std::io::Error> {
     exec_git_with(&GitStrategy::Bare, args)
 }
@@ -79,11 +82,13 @@ pub fn git_output_with(
 }
 
 /// Execute a git command and capture stdout using default bare strategy
+#[allow(dead_code)]
 pub fn git_output(args: &[&str]) -> Result<String, Box<dyn std::error::Error>> {
     git_output_with(&GitStrategy::Bare, args)
 }
 
 /// Fall through to git for unrecognized subcommands (default bare strategy)
+#[allow(dead_code)]
 pub fn fall_through(args: &[String]) -> ! {
     fall_through_with(&GitStrategy::Bare, args)
 }

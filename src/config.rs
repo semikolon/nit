@@ -1,6 +1,6 @@
 //! Configuration loading: fleet.toml (shared) + local.toml (per-machine) + triggers.toml
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -16,12 +16,14 @@ pub struct FleetConfig {
     #[serde(default)]
     pub permissions: PermissionsConfig,
     #[serde(default)]
+    #[allow(dead_code)]
     pub exclude: HashMap<String, ExcludeRule>,
     #[serde(default)]
+    #[allow(dead_code)]
     pub sync: Option<SyncConfig>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct MachineConfig {
     pub ssh_host: String,
     #[serde(default)]
@@ -65,11 +67,13 @@ pub struct PermissionsConfig {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct ExcludeRule {
     pub unless_role: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct SyncConfig {
     #[serde(default = "default_sync_command")]
     pub command: String,
@@ -86,6 +90,7 @@ fn default_sync_command() -> String {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct SyncOverride {
     pub strategy: Option<String>,
 }
@@ -186,16 +191,16 @@ impl NitConfig {
             .iter()
             .filter(|t| {
                 // OS filter
-                if let Some(ref trigger_os) = t.os {
-                    if trigger_os != os {
-                        return false;
-                    }
+                if let Some(ref trigger_os) = t.os
+                    && trigger_os != os
+                {
+                    return false;
                 }
                 // Role filter
-                if let Some(ref trigger_role) = t.role {
-                    if !self.has_role(trigger_role) {
-                        return false;
-                    }
+                if let Some(ref trigger_role) = t.role
+                    && !self.has_role(trigger_role)
+                {
+                    return false;
                 }
                 true
             })
@@ -264,6 +269,13 @@ pub fn load_config_from(
     })
 }
 
+/// Load only fleet.toml from default path (no local.toml required).
+/// Useful for commands like `nit fleet` that work without per-machine config.
+pub fn load_fleet_only() -> Result<FleetConfig, Box<dyn std::error::Error>> {
+    let fleet_path = expand_tilde("~/dotfiles/fleet.toml");
+    load_fleet(&fleet_path)
+}
+
 fn load_fleet(path: &Path) -> Result<FleetConfig, Box<dyn std::error::Error>> {
     let content = std::fs::read_to_string(path).map_err(|e| {
         format!(
@@ -310,7 +322,6 @@ fn load_triggers(path: &Path) -> Result<Vec<TriggerDef>, Box<dyn std::error::Err
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
 
     #[test]
     fn test_expand_tilde() {

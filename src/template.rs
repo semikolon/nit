@@ -106,6 +106,7 @@ pub fn resolve_template_target(
 
 /// Result of rendering a single template
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct RenderResult {
     /// The template mapping that was rendered
     pub mapping: TemplateMapping,
@@ -138,7 +139,7 @@ pub fn render_template(
 
     // is_<role> booleans for each role this machine has
     for role in &config.machine.role {
-        context.insert(&format!("is_{}", role), &true);
+        context.insert(format!("is_{}", role), &true);
     }
 
     // Home directory
@@ -158,6 +159,7 @@ pub fn render_template(
 }
 
 /// Render all discovered templates, returning results for each (partial success supported)
+#[allow(dead_code)]
 pub fn render_all(config: &NitConfig) -> Vec<RenderResult> {
     let mappings = discover_templates(config);
 

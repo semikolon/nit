@@ -214,14 +214,15 @@ pub fn find_cross_session_ack(
     let entries = fs::read_dir(&dir).ok()?;
     for entry in entries.filter_map(|e| e.ok()) {
         let name = entry.file_name().to_string_lossy().to_string();
-        if let Some(ppid_str) = name.strip_suffix(".json") {
-            if let Ok(ppid) = ppid_str.parse::<u32>() {
-                let acks = read_acks(ppid);
-                if let Some(ack) = acks.get(target_rel) {
-                    if ack.target_hash == target_hash && ack.rendered_hash == rendered_hash {
-                        return Some(ppid);
-                    }
-                }
+        if let Some(ppid_str) = name.strip_suffix(".json")
+            && let Ok(ppid) = ppid_str.parse::<u32>()
+        {
+            let acks = read_acks(ppid);
+            if let Some(ack) = acks.get(target_rel)
+                && ack.target_hash == target_hash
+                && ack.rendered_hash == rendered_hash
+            {
+                return Some(ppid);
             }
         }
     }
@@ -242,12 +243,11 @@ pub fn prune_dead_acks() {
 
     for entry in entries.filter_map(|e| e.ok()) {
         let name = entry.file_name().to_string_lossy().to_string();
-        if let Some(ppid_str) = name.strip_suffix(".json") {
-            if let Ok(pid) = ppid_str.parse::<u32>() {
-                if !is_pid_alive(pid) {
-                    let _ = fs::remove_file(entry.path());
-                }
-            }
+        if let Some(ppid_str) = name.strip_suffix(".json")
+            && let Ok(pid) = ppid_str.parse::<u32>()
+            && !is_pid_alive(pid)
+        {
+            let _ = fs::remove_file(entry.path());
         }
     }
 }

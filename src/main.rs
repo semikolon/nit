@@ -104,6 +104,13 @@ enum NitCommand {
         name: String,
     },
 
+    /// Output fleet inventory (for hemma integration)
+    Fleet {
+        /// Output format
+        #[arg(long, default_value = "hemma")]
+        format: String,
+    },
+
     /// Any unrecognized subcommand falls through to git
     #[command(external_subcommand)]
     Git(Vec<String>),
@@ -124,6 +131,16 @@ fn main() -> ExitCode {
         Some(NitCommand::Bootstrap { url }) => {
             // Bootstrap doesn't need existing config (it creates it)
             match cmd_bootstrap(&url) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("nit: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Some(NitCommand::Fleet { format }) => {
+            // Fleet only needs fleet.toml, not local.toml
+            match cmd_fleet(&format) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("nit: {e}");
@@ -181,8 +198,10 @@ fn run_command(cmd: NitCommand, config: &NitConfig) -> Result<(), Box<dyn std::e
         NitCommand::Rekey => cmd_rekey(config),
         NitCommand::List => cmd_list(config),
         NitCommand::Run { name } => cmd_run(&name, config),
-        // Bootstrap and Git handled in main()
-        NitCommand::Bootstrap { .. } | NitCommand::Git(_) => unreachable!(),
+        // Bootstrap, Fleet, and Git handled in main()
+        NitCommand::Bootstrap { .. } | NitCommand::Fleet { .. } | NitCommand::Git(_) => {
+            unreachable!()
+        }
     }
 }
 
@@ -200,10 +219,10 @@ fn resolve_path(path_str: &str) -> PathBuf {
     }
 
     // Handle relative paths
-    if path.is_relative() {
-        if let Ok(cwd) = std::env::current_dir() {
-            return cwd.join(path);
-        }
+    if path.is_relative()
+        && let Ok(cwd) = std::env::current_dir()
+    {
+        return cwd.join(path);
     }
 
     path.to_path_buf()
@@ -391,8 +410,8 @@ fn cmd_apply(file: Option<&str>, config: &NitConfig) -> Result<(), Box<dyn std::
     };
 
     if mappings_to_process.is_empty() {
-        if file.is_some() {
-            return Err(format!("no template matching '{}'", file.unwrap()).into());
+        if let Some(f) = file {
+            return Err(format!("no template matching '{}'", f).into());
         }
         eprintln!("nit apply: no templates found");
         return Ok(());
@@ -423,10 +442,8 @@ fn cmd_apply(file: Option<&str>, config: &NitConfig) -> Result<(), Box<dyn std::
         // 3. Read target
         let target_content = std::fs::read_to_string(&mapping.target).ok();
 
-        let has_drift = match (&base_content, &target_content) {
-            (Some(base), Some(target)) if base != target => true,
-            _ => false,
-        };
+        let has_drift =
+            matches!((&base_content, &target_content), (Some(base), Some(target)) if base != target);
 
         if has_drift {
             // 5. base != target: save drift, deploy source-wins, update sync-base, SKIP triggers
@@ -833,10 +850,8 @@ fn cmd_commit(
         let base_content = syncbase::read_sync_base(&rel);
         let target_content = std::fs::read_to_string(&mapping.target).ok();
 
-        let has_drift = match (&base_content, &target_content) {
-            (Some(base), Some(target)) if base != target => true,
-            _ => false,
-        };
+        let has_drift =
+            matches!((&base_content, &target_content), (Some(base), Some(target)) if base != target);
 
         if has_drift {
             let drift_diff =
@@ -935,10 +950,8 @@ fn cmd_update(safe: bool, config: &NitConfig) -> Result<(), Box<dyn std::error::
         let base_content = syncbase::read_sync_base(&rel);
         let target_content = std::fs::read_to_string(&mapping.target).ok();
 
-        let has_drift = match (&base_content, &target_content) {
-            (Some(base), Some(target)) if base != target => true,
-            _ => false,
-        };
+        let has_drift =
+            matches!((&base_content, &target_content), (Some(base), Some(target)) if base != target);
 
         if has_drift {
             // nit update special behavior: SKIP drifted files (preserve local fixes)
@@ -1196,6 +1209,42 @@ fn cmd_rekey(config: &NitConfig) -> Result<(), Box<dyn std::error::Error>> {
 
 fn cmd_bootstrap(url: &str) -> Result<(), Box<dyn std::error::Error>> {
     bootstrap::run_bootstrap(url)
+}
+
+fn cmd_fleet(format: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let fleet = config::load_fleet_only()?;
+
+    match format {
+        "hemma" => {
+            let mut names: Vec<&String> = fleet.machines.keys().collect();
+            names.sort();
+            for name in names {
+                let m = &fleet.machines[name];
+                let role = if m.role.is_empty() {
+                    String::new()
+                } else {
+                    m.role.join(",")
+                };
+                println!("{}:{}:{}:{}", name, m.ssh_host, role, m.critical);
+            }
+        }
+        "json" => {
+            let output = serde_json::to_string_pretty(&fleet.machines)?;
+            println!("{}", output);
+        }
+        "names" => {
+            let mut names: Vec<&String> = fleet.machines.keys().collect();
+            names.sort();
+            for name in names {
+                println!("{}", name);
+            }
+        }
+        other => {
+            return Err(format!("unknown format '{}' (expected: hemma, json, names)", other).into());
+        }
+    }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

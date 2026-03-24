@@ -10,6 +10,7 @@ use std::path::PathBuf;
 
 /// Result of applying permissions to a file
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct PermissionResult {
     pub path: PathBuf,
     pub mode: u32,
@@ -20,6 +21,7 @@ pub struct PermissionResult {
 pub enum PermissionStatus {
     Set,
     AlreadyCorrect,
+    #[allow(dead_code)]
     Skipped(String),
     Error(String),
 }
