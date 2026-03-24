@@ -59,12 +59,18 @@ nit gives you chezmoi's power (templates, encryption, triggers) without requirin
 
 ### Designed for concurrent AI workflows
 
-nit is also built for environments where multiple AI agents or terminal sessions edit dotfiles simultaneously:
+nit is also built for environments where multiple AI agents or terminal sessions edit dotfiles simultaneously.
 
-- **Per-session ack system**: each session writes its own review state. No lock file, no contention.
-- **No auto-merge**: template drift is saved and shown at every touchpoint. Impossible to miss.
+The core safety principle: **no template change should be deployed without the person or agent seeing what's about to happen.** A `nit commit` renders templates, deploys them, and may trigger service restarts or app reloads that read from those files. If someone edited the target directly (a hotfix) AND someone else edited the source (a new feature), both changes need to be seen and consciously reconciled before deploying — otherwise you might restart a service with the wrong config.
+
+nit enforces this structurally:
+
+- **Drift shown at every touchpoint**: `nit add`, `nit apply`, `nit pick`, `nit commit` — all four show any difference between template source and target on disk. You can't interact with templates without seeing the current state.
+- **Ack-gated commits**: `nit commit` refuses to proceed for template changes until you've reviewed the drift. No flag to bypass this — the tool enforces review, not your discipline.
+- **Per-session isolation**: each terminal session tracks its own review state. No lock file, no contention between concurrent sessions. Scales to any number of agents.
+- **No auto-merge**: drift is saved for conscious review, never silently incorporated. You decide what's junk and what's valuable.
 - **No interactive prompts**: all output to stderr. No TTY input, ever. Agents and humans use the same interface.
-- **Smart `nit add`**: detects template targets and redirects to staging the source file — agents don't need to know the template architecture.
+- **Smart `nit add`**: detects template targets and redirects to staging the source — agents don't need to know which files are templates.
 
 ## Commands
 
