@@ -5,7 +5,7 @@ use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
-use crate::config::{expand_tilde, NitConfig};
+use crate::config::{NitConfig, expand_tilde};
 
 /// Result of deploying a single secret file
 #[derive(Debug)]
@@ -33,8 +33,13 @@ pub fn encrypt_file(
         return Err("no recipients provided".into());
     }
 
-    let plaintext = fs::read(plaintext_path)
-        .map_err(|e| format!("cannot read plaintext file {}: {}", plaintext_path.display(), e))?;
+    let plaintext = fs::read(plaintext_path).map_err(|e| {
+        format!(
+            "cannot read plaintext file {}: {}",
+            plaintext_path.display(),
+            e
+        )
+    })?;
 
     let parsed_recipients: Vec<age::x25519::Recipient> = recipients
         .iter()
@@ -77,7 +82,13 @@ pub fn decrypt_file(
             .ok_or("identity path is not valid UTF-8")?
             .to_string(),
     )
-    .map_err(|e| format!("cannot read identity file {}: {}", identity_path.display(), e))?;
+    .map_err(|e| {
+        format!(
+            "cannot read identity file {}: {}",
+            identity_path.display(),
+            e
+        )
+    })?;
 
     let identities = identity_file
         .into_identities()
@@ -94,8 +105,7 @@ pub fn decrypt_file(
     let decryptor = age::Decryptor::new_buffered(&ciphertext[..])
         .map_err(|e| format!("cannot create decryptor: {}", e))?;
 
-    let identity_refs: Vec<&dyn age::Identity> =
-        identities.iter().map(|i| i.as_ref()).collect();
+    let identity_refs: Vec<&dyn age::Identity> = identities.iter().map(|i| i.as_ref()).collect();
 
     let mut reader = decryptor
         .decrypt(identity_refs.into_iter())
@@ -104,7 +114,8 @@ pub fn decrypt_file(
     let mut plaintext = Vec::new();
     reader.read_to_end(&mut plaintext)?;
 
-    String::from_utf8(plaintext).map_err(|e| format!("decrypted content is not valid UTF-8: {}", e).into())
+    String::from_utf8(plaintext)
+        .map_err(|e| format!("decrypted content is not valid UTF-8: {}", e).into())
 }
 
 /// Decrypt an age-encrypted file and write the plaintext to a target path
@@ -137,10 +148,7 @@ pub fn rekey_file(
 
     // Write to a temp file in the same directory, then rename for atomicity
     let parent = encrypted_path.parent().unwrap_or(Path::new("."));
-    let temp_path = parent.join(format!(
-        ".nit-rekey-{}.tmp",
-        std::process::id()
-    ));
+    let temp_path = parent.join(format!(".nit-rekey-{}.tmp", std::process::id()));
 
     // Encrypt plaintext to new recipients, writing to temp file
     let parsed_recipients: Vec<age::x25519::Recipient> = new_recipients
@@ -256,11 +264,7 @@ fn read_public_key_from_identity(
         }
     }
 
-    Err(format!(
-        "no valid age identity found in {}",
-        identity_path.display()
-    )
-    .into())
+    Err(format!("no valid age identity found in {}", identity_path.display()).into())
 }
 
 #[cfg(test)]
@@ -317,12 +321,7 @@ mod tests {
         let encrypted_path = dir.path().join("secret.txt.age");
         fs::write(&plaintext_path, "multi-recipient secret").unwrap();
 
-        encrypt_file(
-            &plaintext_path,
-            &[pubkey_a, pubkey_b],
-            &encrypted_path,
-        )
-        .unwrap();
+        encrypt_file(&plaintext_path, &[pubkey_a, pubkey_b], &encrypted_path).unwrap();
 
         // Both keys should decrypt
         let decrypted_a = decrypt_file(&encrypted_path, &identity_a).unwrap();
@@ -442,7 +441,11 @@ mod tests {
             dir.path(),
             &identity_path,
             &secrets_dir,
-            &[("tier-all", &[pubkey.as_str()], target_path.to_str().unwrap())],
+            &[(
+                "tier-all",
+                &[pubkey.as_str()],
+                target_path.to_str().unwrap(),
+            )],
         );
 
         let results = deploy_secrets(&config).unwrap();
@@ -469,7 +472,11 @@ mod tests {
             dir.path(),
             &identity_path,
             &secrets_dir,
-            &[("tier-servers", &["age1notourkey"], target_path.to_str().unwrap())],
+            &[(
+                "tier-servers",
+                &["age1notourkey"],
+                target_path.to_str().unwrap(),
+            )],
         );
 
         let results = deploy_secrets(&config).unwrap();
@@ -493,7 +500,11 @@ mod tests {
             dir.path(),
             &identity_path,
             &secrets_dir,
-            &[("tier-all", &[pubkey.as_str()], target_path.to_str().unwrap())],
+            &[(
+                "tier-all",
+                &[pubkey.as_str()],
+                target_path.to_str().unwrap(),
+            )],
         );
 
         let results = deploy_secrets(&config).unwrap();

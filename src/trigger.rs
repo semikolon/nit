@@ -129,11 +129,7 @@ pub fn resolve_watch_globs(watch: &[String], work_tree: &Path) -> Vec<PathBuf> {
 
 /// Hash all watched files and compare to stored state.
 /// Returns Changed(new_hashes) if any file hash differs or is new, Unchanged otherwise.
-pub fn check_trigger(
-    trigger: &TriggerDef,
-    state: &TriggerState,
-    work_tree: &Path,
-) -> TriggerCheck {
+pub fn check_trigger(trigger: &TriggerDef, state: &TriggerState, work_tree: &Path) -> TriggerCheck {
     let resolved = resolve_watch_globs(&trigger.watch, work_tree);
     let stored = state.trigger_hashes.get(&trigger.name);
 
@@ -548,7 +544,10 @@ mod tests {
             skip_drifted.contains(&rel)
         });
 
-        assert!(has_drifted, "trigger should be skipped when watched file is drifted");
+        assert!(
+            has_drifted,
+            "trigger should be skipped when watched file is drifted"
+        );
     }
 
     // ─── state persistence roundtrip ────────────────────────────────
@@ -570,10 +569,7 @@ mod tests {
         let loaded = load_trigger_state_from(&state_path);
 
         assert_eq!(loaded.last_apply, state.last_apply);
-        assert_eq!(
-            loaded.trigger_hashes["my-trigger"]["file.txt"],
-            "abc123"
-        );
+        assert_eq!(loaded.trigger_hashes["my-trigger"]["file.txt"], "abc123");
     }
 
     #[test]

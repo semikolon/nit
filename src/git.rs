@@ -160,8 +160,7 @@ mod tests {
     fn test_git_command_home_has_ceiling() {
         // Home strategy sets GIT_CEILING_DIRECTORIES env var
         let cmd = git_command(&GitStrategy::Home);
-        let envs: Vec<(&std::ffi::OsStr, Option<&std::ffi::OsStr>)> =
-            cmd.get_envs().collect();
+        let envs: Vec<(&std::ffi::OsStr, Option<&std::ffi::OsStr>)> = cmd.get_envs().collect();
         let has_ceiling = envs.iter().any(|(k, _)| k == &"GIT_CEILING_DIRECTORIES");
         assert!(has_ceiling);
 

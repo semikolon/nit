@@ -4,7 +4,7 @@
 //! (templates + plain). Git doesn't track permissions beyond executable bit;
 //! nit fills this gap.
 
-use crate::config::{expand_tilde, NitConfig};
+use crate::config::{NitConfig, expand_tilde};
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 

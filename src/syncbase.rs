@@ -105,9 +105,8 @@ pub fn read_drift(target_rel: &str) -> Option<String> {
 /// Dismiss drift: read + delete the drift file. Returns the diff that was dismissed.
 pub fn dismiss_drift(target_rel: &str) -> Result<String, Box<dyn std::error::Error>> {
     let path = drift_dir().join(format!("{}.diff", target_rel));
-    let diff = fs::read_to_string(&path).map_err(|e| {
-        format!("no drift saved for '{}': {}", target_rel, e)
-    })?;
+    let diff = fs::read_to_string(&path)
+        .map_err(|e| format!("no drift saved for '{}': {}", target_rel, e))?;
     fs::remove_file(&path)?;
     Ok(diff)
 }
@@ -433,7 +432,12 @@ mod tests {
             }
         }
 
-        fn find_cross_session(&self, rel: &str, target_hash: &str, rendered_hash: &str) -> Option<u32> {
+        fn find_cross_session(
+            &self,
+            rel: &str,
+            target_hash: &str,
+            rendered_hash: &str,
+        ) -> Option<u32> {
             let entries = fs::read_dir(&self.acks).ok()?;
             for entry in entries.filter_map(|e| e.ok()) {
                 let name = entry.file_name().to_string_lossy().to_string();
@@ -441,7 +445,8 @@ mod tests {
                     if let Ok(ppid) = ppid_str.parse::<u32>() {
                         let acks = self.read_acks_for(ppid);
                         if let Some(ack) = acks.get(rel) {
-                            if ack.target_hash == target_hash && ack.rendered_hash == rendered_hash {
+                            if ack.target_hash == target_hash && ack.rendered_hash == rendered_hash
+                            {
                                 return Some(ppid);
                             }
                         }

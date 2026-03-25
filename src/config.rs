@@ -248,7 +248,12 @@ pub fn load_config_from(
             format!(
                 "machine '{}' not found in fleet.toml (available: {})",
                 machine_name,
-                fleet.machines.keys().cloned().collect::<Vec<_>>().join(", ")
+                fleet
+                    .machines
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
             )
         })?
         .clone();
@@ -284,9 +289,8 @@ fn load_fleet(path: &Path) -> Result<FleetConfig, Box<dyn std::error::Error>> {
             e
         )
     })?;
-    let config: FleetConfig = toml::from_str(&content).map_err(|e| {
-        format!("nit: parse error in fleet.toml: {}", e)
-    })?;
+    let config: FleetConfig =
+        toml::from_str(&content).map_err(|e| format!("nit: parse error in fleet.toml: {}", e))?;
     Ok(config)
 }
 
@@ -298,9 +302,8 @@ fn load_local(path: &Path) -> Result<LocalConfig, Box<dyn std::error::Error>> {
             e
         )
     })?;
-    let config: LocalConfig = toml::from_str(&content).map_err(|e| {
-        format!("nit: parse error in local.toml: {}", e)
-    })?;
+    let config: LocalConfig =
+        toml::from_str(&content).map_err(|e| format!("nit: parse error in local.toml: {}", e))?;
     Ok(config)
 }
 
@@ -313,9 +316,8 @@ fn load_triggers(path: &Path) -> Result<Vec<TriggerDef>, Box<dyn std::error::Err
             return Err(format!("nit: cannot read triggers.toml: {}", e).into());
         }
     };
-    let file: TriggersFile = toml::from_str(&content).map_err(|e| {
-        format!("nit: parse error in triggers.toml: {}", e)
-    })?;
+    let file: TriggersFile = toml::from_str(&content)
+        .map_err(|e| format!("nit: parse error in triggers.toml: {}", e))?;
     Ok(file.trigger)
 }
 
@@ -731,10 +733,7 @@ strategy = "safe"
         let sync = config.sync.unwrap();
         assert_eq!(sync.command, "nit update");
         assert!(sync.idle_gated);
-        assert_eq!(
-            sync.overrides["darwin"].strategy,
-            Some("safe".to_string())
-        );
+        assert_eq!(sync.overrides["darwin"].strategy, Some("safe".to_string()));
     }
 
     #[test]

@@ -2,7 +2,7 @@
 //!
 //! `nit bootstrap <url>` takes a fresh machine from zero to fully configured.
 
-use crate::config::{expand_tilde, FleetConfig, GitStrategy};
+use crate::config::{FleetConfig, GitStrategy, expand_tilde};
 use crate::git;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -37,7 +37,14 @@ pub fn run_bootstrap(url: &str) -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // Configure the bare repo to track the remote
-        git::exec_git_with(&GitStrategy::Bare, &["config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"])?;
+        git::exec_git_with(
+            &GitStrategy::Bare,
+            &[
+                "config",
+                "remote.origin.fetch",
+                "+refs/heads/*:refs/remotes/origin/*",
+            ],
+        )?;
     }
 
     // Step 2: Checkout files to $HOME (work tree)
@@ -126,13 +133,12 @@ strategy = "bare"
                     .trim_start_matches('/');
 
                 // Prepend warning comment
-                let with_comment = if let Some(comment) =
-                    crate::template::warning_comment(&mapping.target)
-                {
-                    format!("{}\n{}", comment, rendered)
-                } else {
-                    rendered.clone()
-                };
+                let with_comment =
+                    if let Some(comment) = crate::template::warning_comment(&mapping.target) {
+                        format!("{}\n{}", comment, rendered)
+                    } else {
+                        rendered.clone()
+                    };
 
                 if let Some(parent) = mapping.target.parent() {
                     let _ = fs::create_dir_all(parent);
@@ -185,8 +191,8 @@ strategy = "bare"
     let trigger_results = crate::trigger::run_applicable_triggers(
         &config,
         &mut trigger_state,
-        &[],    // no drifted files on fresh bootstrap
-        false,  // not safe mode
+        &[],   // no drifted files on fresh bootstrap
+        false, // not safe mode
         &log_dir,
     );
     crate::trigger::save_trigger_state(&trigger_state);
@@ -234,12 +240,7 @@ fn select_machine_name(fleet_path: &Path) -> Result<String, Box<dyn std::error::
     names.sort();
     for (i, name) in names.iter().enumerate() {
         let config = &fleet.machines[*name];
-        eprintln!(
-            "  {}: {} ({})",
-            i + 1,
-            name,
-            config.role.join(", ")
-        );
+        eprintln!("  {}: {} ({})", i + 1, name, config.role.join(", "));
     }
 
     // For non-interactive use (agents), use the hostname to auto-select
@@ -258,7 +259,10 @@ fn select_machine_name(fleet_path: &Path) -> Result<String, Box<dyn std::error::
         if hostname.to_lowercase().contains(&name.to_lowercase())
             || name.to_lowercase().contains(&hostname.to_lowercase())
         {
-            eprintln!("nit: auto-selected '{}' (matches hostname '{}')", name, hostname);
+            eprintln!(
+                "nit: auto-selected '{}' (matches hostname '{}')",
+                name, hostname
+            );
             return Ok(name.clone());
         }
     }

@@ -4,7 +4,7 @@
 //!   templates/.zshenv.tmpl → ~/.zshenv
 //!   templates/Library/LaunchAgents/foo.plist.tmpl → ~/Library/LaunchAgents/foo.plist
 
-use crate::config::{expand_tilde, NitConfig};
+use crate::config::{NitConfig, expand_tilde};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tera::{Context, Tera};
@@ -119,13 +119,8 @@ pub fn render_template(
     mapping: &TemplateMapping,
     config: &NitConfig,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let template_content = std::fs::read_to_string(&mapping.source).map_err(|e| {
-        format!(
-            "cannot read template {}: {}",
-            mapping.source.display(),
-            e
-        )
-    })?;
+    let template_content = std::fs::read_to_string(&mapping.source)
+        .map_err(|e| format!("cannot read template {}: {}", mapping.source.display(), e))?;
 
     let mut context = Context::new();
 
@@ -147,13 +142,8 @@ pub fn render_template(
     context.insert("home_dir", &home.to_string_lossy().to_string());
 
     // Render using one_off (no template directory needed)
-    let rendered = Tera::one_off(&template_content, &context, false).map_err(|e| {
-        format!(
-            "template error in {}: {}",
-            mapping.rel_source.display(),
-            e
-        )
-    })?;
+    let rendered = Tera::one_off(&template_content, &context, false)
+        .map_err(|e| format!("template error in {}: {}", mapping.rel_source.display(), e))?;
 
     Ok(rendered)
 }
@@ -166,8 +156,7 @@ pub fn render_all(config: &NitConfig) -> Vec<RenderResult> {
     mappings
         .into_iter()
         .map(|mapping| {
-            let result = render_template(&mapping, config)
-                .map_err(|e| e.to_string());
+            let result = render_template(&mapping, config).map_err(|e| e.to_string());
             RenderResult { mapping, result }
         })
         .collect()
@@ -184,19 +173,13 @@ pub fn warning_comment(file_path: &Path) -> Option<String> {
     let ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
 
     // Also check the full filename for dotfiles without extensions
-    let filename = file_path
-        .file_name()
-        .and_then(|f| f.to_str())
-        .unwrap_or("");
+    let filename = file_path.file_name().and_then(|f| f.to_str()).unwrap_or("");
 
     match ext {
         // Hash-style comments
-        "sh" | "zsh" | "bash" | "py" | "rb" | "toml" | "yaml" | "yml" | "conf" | "env" => {
-            Some(format!(
-                "# Managed by nit — edit templates/{} instead",
-                source_hint
-            ))
-        }
+        "sh" | "zsh" | "bash" | "py" | "rb" | "toml" | "yaml" | "yml" | "conf" | "env" => Some(
+            format!("# Managed by nit — edit templates/{} instead", source_hint),
+        ),
         // XML-style comments
         "plist" | "xml" | "html" | "svg" => Some(format!(
             "<!-- Managed by nit — edit templates/{} instead -->",
@@ -292,10 +275,7 @@ mod tests {
         map.insert(target.clone(), source.clone());
 
         // Direct path match
-        assert_eq!(
-            resolve_template_target(&target, &map),
-            Some(source.clone())
-        );
+        assert_eq!(resolve_template_target(&target, &map), Some(source.clone()));
 
         // Tilde path match
         assert_eq!(
@@ -304,10 +284,7 @@ mod tests {
         );
 
         // Non-template path
-        assert_eq!(
-            resolve_template_target(Path::new("~/.bashrc"), &map),
-            None
-        );
+        assert_eq!(resolve_template_target(Path::new("~/.bashrc"), &map), None);
     }
 
     /// Helper to build a test NitConfig with a given templates_dir
@@ -366,10 +343,7 @@ mod tests {
     fn test_deeply_nested_template_path() {
         let dir = tempfile::tempdir().unwrap();
         let templates_dir = dir.path().join("templates");
-        std::fs::create_dir_all(
-            templates_dir.join(".config/deeply/nested/path"),
-        )
-        .unwrap();
+        std::fs::create_dir_all(templates_dir.join(".config/deeply/nested/path")).unwrap();
         std::fs::write(
             templates_dir.join(".config/deeply/nested/path/config.toml.tmpl"),
             "# deep",
@@ -472,14 +446,8 @@ mod tests {
     #[test]
     fn test_resolve_template_target_no_match() {
         let map = HashMap::new(); // empty map
-        assert_eq!(
-            resolve_template_target(Path::new("/any/path"), &map),
-            None
-        );
-        assert_eq!(
-            resolve_template_target(Path::new("~/.zshrc"), &map),
-            None
-        );
+        assert_eq!(resolve_template_target(Path::new("/any/path"), &map), None);
+        assert_eq!(resolve_template_target(Path::new("~/.zshrc"), &map), None);
     }
 
     #[test]
@@ -490,11 +458,7 @@ mod tests {
 
         // Create several templates
         for name in &[".zshenv", ".zprofile", ".gitconfig"] {
-            std::fs::write(
-                templates_dir.join(format!("{}.tmpl", name)),
-                "# content",
-            )
-            .unwrap();
+            std::fs::write(templates_dir.join(format!("{}.tmpl", name)), "# content").unwrap();
         }
 
         let config = test_config(templates_dir, dir.path().to_path_buf());
@@ -672,8 +636,7 @@ mod tests {
     #[test]
     fn test_render_conditional_role_check() {
         let template = "{% if is_dev is defined and is_dev %}DEV MODE{% else %}PROD{% endif %}";
-        let (_dir, config, mapping) =
-            render_test_setup(template, ".mode.conf.tmpl", vec!["dev"]);
+        let (_dir, config, mapping) = render_test_setup(template, ".mode.conf.tmpl", vec!["dev"]);
 
         let rendered = render_template(&mapping, &config).unwrap();
         assert_eq!(rendered, "DEV MODE");
@@ -691,11 +654,8 @@ mod tests {
 
     #[test]
     fn test_render_home_dir() {
-        let (_dir, config, mapping) = render_test_setup(
-            "home={{ home_dir }}",
-            ".home.conf.tmpl",
-            vec![],
-        );
+        let (_dir, config, mapping) =
+            render_test_setup("home={{ home_dir }}", ".home.conf.tmpl", vec![]);
 
         let rendered = render_template(&mapping, &config).unwrap();
         let home = dirs::home_dir().unwrap();
@@ -704,11 +664,8 @@ mod tests {
 
     #[test]
     fn test_render_template_syntax_error() {
-        let (_dir, config, mapping) = render_test_setup(
-            "{% if unclosed",
-            ".broken.conf.tmpl",
-            vec![],
-        );
+        let (_dir, config, mapping) =
+            render_test_setup("{% if unclosed", ".broken.conf.tmpl", vec![]);
 
         let err = render_template(&mapping, &config).unwrap_err();
         let err_str = err.to_string();
@@ -732,17 +689,9 @@ mod tests {
             "host={{ hostname }}",
         )
         .unwrap();
-        std::fs::write(
-            templates_dir.join(".good2.conf.tmpl"),
-            "arch={{ arch }}",
-        )
-        .unwrap();
+        std::fs::write(templates_dir.join(".good2.conf.tmpl"), "arch={{ arch }}").unwrap();
         // One broken template
-        std::fs::write(
-            templates_dir.join(".broken.conf.tmpl"),
-            "{% if unclosed",
-        )
-        .unwrap();
+        std::fs::write(templates_dir.join(".broken.conf.tmpl"), "{% if unclosed").unwrap();
 
         let config = NitConfig {
             fleet: crate::config::FleetConfig {
@@ -781,19 +730,19 @@ mod tests {
         assert_eq!(err_count, 1);
 
         // The broken one should have an error mentioning the file
-        let broken = results
-            .iter()
-            .find(|r| r.result.is_err())
-            .unwrap();
+        let broken = results.iter().find(|r| r.result.is_err()).unwrap();
         assert!(
-            broken.result.as_ref().unwrap_err().contains(".broken.conf.tmpl"),
+            broken
+                .result
+                .as_ref()
+                .unwrap_err()
+                .contains(".broken.conf.tmpl"),
         );
     }
 
     #[test]
     fn test_render_empty_template() {
-        let (_dir, config, mapping) =
-            render_test_setup("", ".empty.conf.tmpl", vec![]);
+        let (_dir, config, mapping) = render_test_setup("", ".empty.conf.tmpl", vec![]);
 
         let rendered = render_template(&mapping, &config).unwrap();
         assert_eq!(rendered, "");
@@ -803,14 +752,12 @@ mod tests {
 
     #[test]
     fn test_warning_comment_hash_by_extension() {
-        for ext in &["sh", "zsh", "bash", "py", "rb", "toml", "yaml", "yml", "conf", "env"] {
+        for ext in &[
+            "sh", "zsh", "bash", "py", "rb", "toml", "yaml", "yml", "conf", "env",
+        ] {
             let path = PathBuf::from(format!("test.{}", ext));
             let comment = warning_comment(&path);
-            assert!(
-                comment.is_some(),
-                "expected comment for .{} extension",
-                ext
-            );
+            assert!(comment.is_some(), "expected comment for .{} extension", ext);
             assert!(
                 comment.as_ref().unwrap().starts_with("# Managed by nit"),
                 "expected hash comment for .{}, got: {:?}",
@@ -825,11 +772,7 @@ mod tests {
         for ext in &["plist", "xml", "html", "svg"] {
             let path = PathBuf::from(format!("test.{}", ext));
             let comment = warning_comment(&path);
-            assert!(
-                comment.is_some(),
-                "expected comment for .{} extension",
-                ext
-            );
+            assert!(comment.is_some(), "expected comment for .{} extension", ext);
             assert!(
                 comment.as_ref().unwrap().starts_with("<!-- Managed by nit"),
                 "expected XML comment for .{}, got: {:?}",
@@ -847,14 +790,17 @@ mod tests {
 
     #[test]
     fn test_warning_comment_dotfiles_no_extension() {
-        for name in &[".zshenv", ".zshrc", ".zprofile", ".bashrc", ".bash_profile", ".gitconfig"] {
+        for name in &[
+            ".zshenv",
+            ".zshrc",
+            ".zprofile",
+            ".bashrc",
+            ".bash_profile",
+            ".gitconfig",
+        ] {
             let path = PathBuf::from(name);
             let comment = warning_comment(&path);
-            assert!(
-                comment.is_some(),
-                "expected comment for {}",
-                name
-            );
+            assert!(comment.is_some(), "expected comment for {}", name);
             assert!(
                 comment.as_ref().unwrap().starts_with("# Managed by nit"),
                 "expected hash comment for {}, got: {:?}",

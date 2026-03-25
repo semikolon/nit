@@ -258,8 +258,7 @@ fn write_target(target: &Path, content: &str) -> Result<(), Box<dyn std::error::
 /// Summarise git status as (staged_count, modified_count)
 fn git_status_counts(config: &NitConfig) -> (usize, usize) {
     let strategy = config.git_strategy();
-    let git_status = git::git_output_with(strategy, &["status", "--porcelain"])
-        .unwrap_or_default();
+    let git_status = git::git_output_with(strategy, &["status", "--porcelain"]).unwrap_or_default();
     let staged = git_status
         .lines()
         .filter(|l| {
@@ -399,7 +398,11 @@ fn cmd_apply(file: Option<&str>, config: &NitConfig) -> Result<(), Box<dyn std::
         let filter_path = resolve_path(file_filter);
         mappings
             .iter()
-            .filter(|m| m.target == filter_path || m.source == filter_path || m.rel_source.to_string_lossy() == file_filter)
+            .filter(|m| {
+                m.target == filter_path
+                    || m.source == filter_path
+                    || m.rel_source.to_string_lossy() == file_filter
+            })
             .collect()
     } else {
         mappings.iter().collect()
@@ -424,7 +427,11 @@ fn cmd_apply(file: Option<&str>, config: &NitConfig) -> Result<(), Box<dyn std::
         let rendered = match template::render_template(mapping, config) {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("nit: ERROR rendering {}: {}", mapping.rel_source.display(), e);
+                eprintln!(
+                    "nit: ERROR rendering {}: {}",
+                    mapping.rel_source.display(),
+                    e
+                );
                 error_count += 1;
                 continue;
             }
@@ -438,8 +445,7 @@ fn cmd_apply(file: Option<&str>, config: &NitConfig) -> Result<(), Box<dyn std::
         // 3. Read target
         let target_content = std::fs::read_to_string(&mapping.target).ok();
 
-        let has_drift =
-            matches!((&base_content, &target_content), (Some(base), Some(target)) if base != target);
+        let has_drift = matches!((&base_content, &target_content), (Some(base), Some(target)) if base != target);
 
         if has_drift {
             // 5. base != target: save drift, deploy source-wins, update sync-base, SKIP triggers
@@ -523,7 +529,9 @@ fn cmd_apply(file: Option<&str>, config: &NitConfig) -> Result<(), Box<dyn std::
 
     eprintln!(
         "nit apply: {} deployed, {} errors, {} drifted",
-        deployed_count, error_count, drifted_rels.len()
+        deployed_count,
+        error_count,
+        drifted_rels.len()
     );
 
     Ok(())
@@ -600,27 +608,28 @@ fn cmd_pick(
         println!();
         println!("  \u{26a0} Drift is NEVER auto-merged. Source always wins on deploy.");
         println!("  Actions for each drifted file:");
-        println!("    \u{2192} Do nothing:          source wins on next nit commit (drift saved, recoverable)");
-        println!("    \u{2192} Edit template source: incorporate changes you want, then nit commit");
-        println!("    \u{2192} nit pick --dismiss:  acknowledge as junk, remove from drift permanently");
+        println!(
+            "    \u{2192} Do nothing:          source wins on next nit commit (drift saved, recoverable)"
+        );
+        println!(
+            "    \u{2192} Edit template source: incorporate changes you want, then nit commit"
+        );
+        println!(
+            "    \u{2192} nit pick --dismiss:  acknowledge as junk, remove from drift permanently"
+        );
         println!("  If drift is a valuable fix, edit the template source or it will be");
         println!("  overwritten (but always recoverable via nit pick).");
         println!();
-        println!("\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}");
-        println!();
         println!(
-            "Drift in {} of {} templates:",
-            drifted.len(),
-            total
+            "\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}"
         );
+        println!();
+        println!("Drift in {} of {} templates:", drifted.len(), total);
         println!();
 
         for (mapping, diff) in &drifted {
             let rel = target_rel_path(&mapping.target);
-            println!(
-                "  {} — target has content not in template source:",
-                rel
-            );
+            println!("  {} — target has content not in template source:", rel);
             for line in diff.lines() {
                 println!("    {}", line);
             }
@@ -665,10 +674,7 @@ fn resolve_pick_target(file_arg: &str, mappings: &[template::TemplateMapping]) -
 }
 
 /// Detect live drift (sync-base vs current target) for a mapping
-fn detect_live_drift(
-    mapping: &template::TemplateMapping,
-    _config: &NitConfig,
-) -> Option<String> {
+fn detect_live_drift(mapping: &template::TemplateMapping, _config: &NitConfig) -> Option<String> {
     let rel = target_rel_path(&mapping.target);
     let target_content = std::fs::read_to_string(&mapping.target).ok()?;
     syncbase::detect_drift(&rel, &target_content)
@@ -678,10 +684,7 @@ fn detect_live_drift(
 // T-10: cmd_commit — Render + deploy + ack gate + git commit + triggers
 // ---------------------------------------------------------------------------
 
-fn cmd_commit(
-    message: Option<&str>,
-    config: &NitConfig,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_commit(message: Option<&str>, config: &NitConfig) -> Result<(), Box<dyn std::error::Error>> {
     let strategy = config.git_strategy();
     let msg = message.unwrap_or("nit commit");
 
@@ -740,8 +743,7 @@ fn cmd_commit(
         let current_rendered_hash = syncbase::hash_content(&rendered_with_comment);
 
         // Current target content
-        let current_target_content =
-            std::fs::read_to_string(&mapping.target).unwrap_or_default();
+        let current_target_content = std::fs::read_to_string(&mapping.target).unwrap_or_default();
         let current_target_hash = syncbase::hash_content(&current_target_content);
 
         if let Some(ack) = my_acks.get(&rel) {
@@ -798,10 +800,7 @@ fn cmd_commit(
                 }
             } else {
                 // No matching cross-session ack → show drift inline, write ack, refuse
-                eprintln!(
-                    "nit: {} — no prior review found, showing drift:",
-                    rel
-                );
+                eprintln!("nit: {} — no prior review found, showing drift:", rel);
                 if let Some(drift) = detect_live_drift(mapping, config) {
                     for line in drift.lines() {
                         eprintln!("    {}", line);
@@ -835,7 +834,11 @@ fn cmd_commit(
         let rendered = match template::render_template(mapping, config) {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("nit: ERROR rendering {}: {}", mapping.rel_source.display(), e);
+                eprintln!(
+                    "nit: ERROR rendering {}: {}",
+                    mapping.rel_source.display(),
+                    e
+                );
                 continue;
             }
         };
@@ -846,20 +849,15 @@ fn cmd_commit(
         let base_content = syncbase::read_sync_base(&rel);
         let target_content = std::fs::read_to_string(&mapping.target).ok();
 
-        let has_drift =
-            matches!((&base_content, &target_content), (Some(base), Some(target)) if base != target);
+        let has_drift = matches!((&base_content, &target_content), (Some(base), Some(target)) if base != target);
 
         if has_drift {
-            let drift_diff =
-                syncbase::detect_drift(&rel, target_content.as_deref().unwrap_or(""));
+            let drift_diff = syncbase::detect_drift(&rel, target_content.as_deref().unwrap_or(""));
             if let Some(diff) = &drift_diff {
                 syncbase::save_drift(&rel, diff);
             }
             drifted_rels.push(rel.clone());
-            eprintln!(
-                "nit: \u{26a0} Drift saved for {} — source wins",
-                rel
-            );
+            eprintln!("nit: \u{26a0} Drift saved for {} — source wins", rel);
         }
 
         write_target(&mapping.target, &rendered_with_comment)?;
@@ -936,7 +934,11 @@ fn cmd_update(safe: bool, config: &NitConfig) -> Result<(), Box<dyn std::error::
         let rendered = match template::render_template(mapping, config) {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("nit: ERROR rendering {}: {}", mapping.rel_source.display(), e);
+                eprintln!(
+                    "nit: ERROR rendering {}: {}",
+                    mapping.rel_source.display(),
+                    e
+                );
                 continue;
             }
         };
@@ -946,22 +948,17 @@ fn cmd_update(safe: bool, config: &NitConfig) -> Result<(), Box<dyn std::error::
         let base_content = syncbase::read_sync_base(&rel);
         let target_content = std::fs::read_to_string(&mapping.target).ok();
 
-        let has_drift =
-            matches!((&base_content, &target_content), (Some(base), Some(target)) if base != target);
+        let has_drift = matches!((&base_content, &target_content), (Some(base), Some(target)) if base != target);
 
         if has_drift {
             // nit update special behavior: SKIP drifted files (preserve local fixes)
-            let drift_diff =
-                syncbase::detect_drift(&rel, target_content.as_deref().unwrap_or(""));
+            let drift_diff = syncbase::detect_drift(&rel, target_content.as_deref().unwrap_or(""));
             if let Some(diff) = &drift_diff {
                 syncbase::save_drift(&rel, diff);
             }
             drifted_rels.push(rel.clone());
             skipped_count += 1;
-            eprintln!(
-                "nit: \u{26a0} Skipped {} — target has local drift",
-                rel
-            );
+            eprintln!("nit: \u{26a0} Skipped {} — target has local drift", rel);
         } else {
             // No drift: deploy rendered, update sync-base
             write_target(&mapping.target, &rendered_with_comment)?;
@@ -995,13 +992,8 @@ fn cmd_update(safe: bool, config: &NitConfig) -> Result<(), Box<dyn std::error::
     // 4. Run triggers (skip drifted files; --safe skips all)
     let log_dir = default_log_dir();
     let mut trigger_state = trigger::load_trigger_state();
-    let trigger_results = trigger::run_applicable_triggers(
-        config,
-        &mut trigger_state,
-        &drifted_rels,
-        safe,
-        &log_dir,
-    );
+    let trigger_results =
+        trigger::run_applicable_triggers(config, &mut trigger_state, &drifted_rels, safe, &log_dir);
     trigger::save_trigger_state(&trigger_state);
 
     for tr in &trigger_results {
@@ -1045,8 +1037,7 @@ fn cmd_status(config: &NitConfig) -> Result<(), Box<dyn std::error::Error>> {
     let drift_count = syncbase::list_drifted_files().len();
 
     // Git status summary
-    let git_status = git::git_output_with(strategy, &["status", "--porcelain"])
-        .unwrap_or_default();
+    let git_status = git::git_output_with(strategy, &["status", "--porcelain"]).unwrap_or_default();
     let modified = git_status
         .lines()
         .filter(|l| l.starts_with(" M") || l.starts_with("M "))
@@ -1058,10 +1049,7 @@ fn cmd_status(config: &NitConfig) -> Result<(), Box<dyn std::error::Error>> {
             first != ' ' && first != '?'
         })
         .count();
-    let untracked = git_status
-        .lines()
-        .filter(|l| l.starts_with("??"))
-        .count();
+    let untracked = git_status.lines().filter(|l| l.starts_with("??")).count();
 
     // Trigger count
     let trigger_count = config.applicable_triggers().len();
@@ -1088,10 +1076,7 @@ fn cmd_run(name: &str, config: &NitConfig) -> Result<(), Box<dyn std::error::Err
             eprintln!("nit: log at {}", result.log_path.display());
         }
         trigger::RunStatus::Failed(code) => {
-            eprintln!(
-                "nit: trigger '{}' failed (exit {})",
-                result.name, code
-            );
+            eprintln!("nit: trigger '{}' failed (exit {})", result.name, code);
             eprintln!("nit: log at {}", result.log_path.display());
             return Err(format!("trigger '{}' failed", name).into());
         }
@@ -1139,9 +1124,7 @@ fn cmd_encrypt(file: &str, config: &NitConfig) -> Result<(), Box<dyn std::error:
         )
     })?;
 
-    let output_path = config
-        .secrets_dir
-        .join(format!("{}.env.age", tier_name));
+    let output_path = config.secrets_dir.join(format!("{}.env.age", tier_name));
 
     encrypt::encrypt_file(&plaintext_path, &tier_config.recipients, &output_path)?;
 
@@ -1179,10 +1162,7 @@ fn cmd_rekey(config: &NitConfig) -> Result<(), Box<dyn std::error::Error>> {
     for (tier_name, tier_config) in &config.fleet.secrets.tiers {
         let encrypted_path = secrets_dir.join(format!("{}.env.age", tier_name));
         if !encrypted_path.exists() {
-            eprintln!(
-                "nit: skipping {} — encrypted file not found",
-                tier_name
-            );
+            eprintln!("nit: skipping {} — encrypted file not found", tier_name);
             continue;
         }
 
@@ -1237,8 +1217,16 @@ fn cmd_list(config: &NitConfig) -> Result<(), Box<dyn std::error::Error>> {
     println!("Templates ({}):", mappings.len());
     for m in &mappings {
         let rel = target_rel_path(&m.target);
-        let drift_marker = if drifted.contains(&rel) { " [DRIFT]" } else { "" };
-        let exists = if m.target.exists() { "\u{2713}" } else { "\u{2717}" };
+        let drift_marker = if drifted.contains(&rel) {
+            " [DRIFT]"
+        } else {
+            ""
+        };
+        let exists = if m.target.exists() {
+            "\u{2713}"
+        } else {
+            "\u{2717}"
+        };
         println!(
             "  {} {} → {}{}",
             exists,
