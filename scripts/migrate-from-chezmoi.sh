@@ -725,8 +725,14 @@ out.append('# Merged from hemma/fleet.toml + .chezmoi.toml.tmpl')
 out.append('# Machine definitions shared by nit and hemma')
 out.append('')
 
-# Add mac-mini (localhost, not in hemma fleet since it runs locally)
-out.append('[machines.mac-mini]')
+# Add local machine (not in hemma fleet since it runs locally)
+import socket
+local_name = socket.gethostname().lower().replace(' ', '-').replace(\"'\", '')
+# Simplify common macOS hostname patterns
+for prefix in ['fredriks-', 'my-']:
+    if local_name.startswith(prefix):
+        local_name = local_name[len(prefix):]
+out.append(f'[machines.{local_name}]')
 out.append('ssh_host = \"localhost\"')
 out.append('role = [\"dev\", \"primary\"]')
 out.append('')
@@ -763,24 +769,24 @@ out.append(f'recipients = [{recip_str}]')
 out.append('target = \"~/.secrets/tier-all.env\"')
 out.append('')
 
-# tier-servers: mac-mini + darwin (first 2 recipients typically)
-# We preserve all recipients and let the user refine
+# All other tiers start with all recipients — user must narrow them
+# to match their actual tier access model
 out.append('[secrets.tiers.tier-servers]')
 out.append(f'recipients = [{recip_str}]')
 out.append('target = \"~/.secrets/tier-servers.env\"')
-out.append('# TODO: Narrow to mac-mini + darwin recipients only')
+out.append('# TODO: Narrow to only the machines that should have server secrets')
 out.append('')
 
 out.append('[secrets.tiers.tier-mac]')
 out.append(f'recipients = [{recip_str}]')
 out.append('target = \"~/.secrets/tier-mac.env\"')
-out.append('# TODO: Narrow to mac-mini + mbp recipients only')
+out.append('# TODO: Narrow to only dev machines')
 out.append('')
 
 out.append('[secrets.tiers.tier-edge]')
 out.append(f'recipients = [{recip_str}]')
 out.append('target = \"~/.secrets/tier-edge.env\"')
-out.append('# TODO: Narrow to mac-mini + shannon recipients only')
+out.append('# TODO: Narrow to only edge/perimeter machines')
 out.append('')
 
 # Permissions
