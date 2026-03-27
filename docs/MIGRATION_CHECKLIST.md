@@ -427,3 +427,4 @@ chezmoi init --apply
 - [ ] Set up publish trigger for public dotfiles repo (`semikolon/dotfiles`)
 - [ ] Fleet migration: install nit on remote machines, run `nit bootstrap`
 - [ ] Remove `chezmoi-final` tag when fully confident (optional — costs nothing to keep)
+- [ ] Evaluate CI runners for nit release builds — Blacksmith (Linux, 3K free min/mo) + GetMac (macOS M4) for cross-compiling fleet binaries. Research: `dotfiles/docs/ci_runner_alternatives_2026_03.md`
