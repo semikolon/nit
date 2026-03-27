@@ -52,6 +52,7 @@ Step-by-step guide for migrating a chezmoi-managed dotfiles repo to nit.
 - [ ] Working tree clean: `cd ~/dotfiles && git status` shows no uncommitted changes
 - [ ] Remote up to date: `git push`
 - [ ] Backup comfort: verify you can access the remote repo if something goes wrong
+- [ ] **Audit untracked dependencies**: Any dotfiles manager only deploys what it tracks. Scripts, LaunchAgents, cron jobs, and symlinks created outside the managed source tree are invisible to migration — they'll keep working on *this* machine but won't exist on a fresh provision. Before migrating, inventory `~/.local/bin/`, `~/Library/LaunchAgents/` (macOS), `~/.config/systemd/user/` (Linux), and any other locations where you've placed ad-hoc scripts or services. Add them to the dotfiles source or document them as external dependencies. *(Example audit: `docs/untracked_scripts_audit_2026_03.md` in the dotfiles repo.)*
 
 ## Phase 1: Safety Net
 
@@ -421,7 +422,7 @@ chezmoi init --apply
 - [ ] Update CLAUDE.md (global + project) — replace chezmoi references with nit
 - [ ] Remove chezmoi wrappers: `chezmoi-drift-guard`, `chezmoi-auto-apply`, `chezmoi-post-apply`, `chezmoi-git`, `chezmoi-triage`, `chezmoi-re-encrypt`, `chezmoi-update-if-idle`
 - [ ] Remove chezmoi from machines: `brew uninstall chezmoi` / `apt remove chezmoi`
-- [ ] Narrow fleet.toml tier recipients to correct machine subsets
+- [ ] Narrow fleet.toml tier recipients — key mapping at `docs/age_key_mapping.md` (4/5 confirmed, Shannon repurposed — drop both unconfirmed keys)
 - [ ] Update hemma to use `nit update` (already configured as primary, verify)
 - [ ] Set up publish trigger for public dotfiles repo (`semikolon/dotfiles`)
 - [ ] Fleet migration: install nit on remote machines, run `nit bootstrap`
