@@ -83,6 +83,7 @@ chezmoi init --apply             # restore chezmoi state
 # - File counts: 590 plain, 10 templates, 4 secrets, 19 scripts, 6 symlinks
 # - Prefix resolution: dot_zshrc → .zshrc, private_dot_secrets → .secrets, etc.
 # - Template paths: dot_zshenv.tmpl → templates/.zshenv.tmpl
+# - If the repo uses sccache, `home/dot_cargo/config.toml` is present as a plain file and shell init files do NOT carry `RUSTC_WRAPPER=...`
 # - Trigger names and OS/role filters look correct
 # - No unexpected files in any category
 ```
@@ -180,6 +181,7 @@ nitgit add .local/bin/
 nitgit add .Brewfile .gemrc .vimrc .ackrc
 nitgit add .commit-template.txt
 nitgit add .graphiti/
+nitgit add .cargo/config.toml 2>/dev/null || true
 # Check: nitgit status to see if any plain files were missed
 
 # ── Move templates (physically) ──
@@ -191,6 +193,9 @@ mkdir -p ~/dotfiles/templates/.graphiti
 # home/dot_zprofile.tmpl → dotfiles/templates/.zprofile.tmpl
 # home/private_dot_graphiti/redis.conf.tmpl → dotfiles/templates/.graphiti/redis.conf.tmpl
 # home/private_Library/LaunchAgents/*.tmpl → dotfiles/templates/Library/LaunchAgents/*.tmpl
+# If you use sccache, keep that activation as a plain file:
+#   home/dot_cargo/config.toml → tracked plain file ~/.cargo/config.toml
+# not as `RUSTC_WRAPPER=...` inside .zshenv/.zshrc templates.
 # (use migration script's convert_go_to_tera for step 2, but move WITHOUT conversion first)
 cp ~/dotfiles/home/dot_zshenv.tmpl ~/dotfiles/templates/.zshenv.tmpl
 cp ~/dotfiles/home/dot_zprofile.tmpl ~/dotfiles/templates/.zprofile.tmpl
@@ -420,6 +425,7 @@ chezmoi init --apply
 ## Post-Migration Cleanup (separate session)
 
 - [ ] Update CLAUDE.md (global + project) — replace chezmoi references with nit
+- [ ] If using sccache, verify `~/.cargo/config.toml` carries `build.rustc-wrapper` and no shell init file reintroduces `RUSTC_WRAPPER=...`
 - [ ] Remove chezmoi wrappers: `chezmoi-drift-guard`, `chezmoi-auto-apply`, `chezmoi-post-apply`, `chezmoi-git`, `chezmoi-triage`, `chezmoi-re-encrypt`, `chezmoi-update-if-idle`
 - [ ] Remove chezmoi from machines: `brew uninstall chezmoi` / `apt remove chezmoi`
 - [ ] Narrow fleet.toml tier recipients — key mapping at `docs/age_key_mapping.md` (4/5 confirmed, Shannon repurposed — drop both unconfirmed keys)

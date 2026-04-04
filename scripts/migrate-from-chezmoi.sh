@@ -188,6 +188,31 @@ printf "    Symlinks:     %d (convert to real symlinks)\n" "$symlink_count"
 printf "    Metadata:     %d (skip)\n" "${#SKIP_FILES[@]}"
 printf "\n"
 
+# Detect a known bad sccache activation pattern before migration carries it over.
+# On MERIAN, exporting RUSTC_WRAPPER from shell init files broke Cargo builds;
+# ~/.cargo/config.toml with build.rustc-wrapper is the stable path.
+shell_sccache_export=0
+for candidate in \
+    "$CHEZMOI_SOURCE/dot_zshenv.tmpl" \
+    "$CHEZMOI_SOURCE/dot_zshrc" \
+    "$CHEZMOI_SOURCE/dot_zshrc.codex"
+do
+    if [ -f "$candidate" ] && grep -Eq '(^|[[:space:]])(export[[:space:]]+)?RUSTC_WRAPPER=.*sccache' "$candidate"; then
+        shell_sccache_export=1
+        break
+    fi
+done
+
+if [ "$shell_sccache_export" -eq 1 ]; then
+    if [ -f "$CHEZMOI_SOURCE/dot_cargo/config.toml" ]; then
+        info "Detected shell-level sccache activation plus home/dot_cargo/config.toml."
+        printf "  Advisory: prefer Cargo config build.rustc-wrapper over shell-level RUSTC_WRAPPER exports.\n\n"
+    else
+        warn "Detected shell-level sccache activation but no home/dot_cargo/config.toml."
+        printf "  Advisory: migrate sccache activation to home/dot_cargo/config.toml ([build] rustc-wrapper = \".../sccache\") instead of carrying RUSTC_WRAPPER in shell init files.\n\n"
+    fi
+fi
+
 # ─── Phase 2: Resolve chezmoi prefixes ───────────────────────────────────────
 info "Phase 2: Resolving chezmoi naming conventions"
 
