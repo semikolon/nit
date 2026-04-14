@@ -1030,6 +1030,8 @@ printf "  Will create ~/.gitignore with:\n"
 printf "    /* (ignore all top-level non-dot items)\n"
 printf "    !dotfiles/ (whitelist project hub)\n"
 printf "    .cache/, .cargo/, .rustup/ (ignore large dotdirs)\n"
+printf "    .claude/logs|plans|projects|statsig (CC runtime, not config)\n"
+printf "    Library/ ignored EXCEPT Ghostty config (whitelisted)\n"
 printf "    New dotfiles show up as untracked ✓\n\n"
 
 # ─── Phase 6 execute: Create ~/.gitignore ─────────────────────────────────────
@@ -1069,6 +1071,14 @@ if ! $DRY_RUN; then
 .Trash/
 .volta/
 
+# ─── Claude Code runtime (not config) ──────────────────────────
+.claude/logs/
+.claude/plans/
+.claude/projects/
+.claude/todo/
+.claude/history.jsonl
+.claude/statsig/
+
 # ─── Application state (not config) ─────────────────────────────
 .zsh_history
 .zsh_sessions/
@@ -1078,6 +1088,7 @@ if ! $DRY_RUN; then
 .node_repl_history
 .viminfo
 .wget-hsts
+*.bak
 
 # ─── macOS noise ────────────────────────────────────────────────
 .DS_Store
@@ -1095,6 +1106,12 @@ Library/
 Movies/
 Music/
 Pictures/
+
+# ─── Whitelist specific Library items ───────────────────────────
+!Library/Application Support/
+!Library/Application Support/com.mitchellh.ghostty/
+!Library/Application Support/com.mitchellh.ghostty/config
+!Library/Application Support/com.mitchellh.ghostty/tokyo-night-custom.conf
 GITIGNORE_EOF
 
     ok "created $gitignore_path"
@@ -1107,8 +1124,12 @@ if [ -d "$NIT_REPO" ]; then
     warn "bare repo already exists at $NIT_REPO"
 else
     if $DRY_RUN; then
-        dry "git init --bare $NIT_REPO"
-        dry "git --git-dir=$NIT_REPO --work-tree=$HOME add ..."
+        if [ -d "$DOTFILES_DIR/.git" ]; then
+            dry "mv $DOTFILES_DIR/.git $NIT_REPO (preserving git history)"
+        else
+            dry "git init --bare $NIT_REPO (fresh — no existing .git found)"
+        fi
+        dry "configure: core.bare=true, core.worktree=$HOME, excludesFile, showUntrackedFiles=no"
     fi
 fi
 
@@ -1118,20 +1139,28 @@ if ! $DRY_RUN; then
         warn "bare repo already exists at $NIT_REPO — skipping init"
     else
         info "Phase 7 execute: Initializing bare repo"
-
         mkdir -p "$(dirname "$NIT_REPO")"
-        git init --bare "$NIT_REPO"
-        ok "created bare repo at $NIT_REPO"
 
-        # Configure work tree
+        if [ -d "$DOTFILES_DIR/.git" ]; then
+            # Preserve git history by moving the existing repo
+            mv "$DOTFILES_DIR/.git" "$NIT_REPO"
+            ok "moved $DOTFILES_DIR/.git → $NIT_REPO (history preserved)"
+        else
+            # Fresh machine — no existing .git to preserve
+            git init --bare "$NIT_REPO"
+            ok "created fresh bare repo at $NIT_REPO"
+        fi
+
+        # Configure as bare repo with $HOME as work tree
+        git --git-dir="$NIT_REPO" config core.bare true
+        ok "configured core.bare = true"
+
         git --git-dir="$NIT_REPO" --work-tree="$HOME_DIR" config core.worktree "$HOME_DIR"
         ok "configured work-tree = $HOME_DIR"
 
-        # Set core.excludesFile to the home gitignore
         git --git-dir="$NIT_REPO" --work-tree="$HOME_DIR" config core.excludesFile "$HOME_DIR/.gitignore"
         ok "configured core.excludesFile = $HOME_DIR/.gitignore"
 
-        # Don't show untracked files by default (too noisy with $HOME as worktree)
         git --git-dir="$NIT_REPO" --work-tree="$HOME_DIR" config status.showUntrackedFiles no
         ok "configured status.showUntrackedFiles = no"
     fi
