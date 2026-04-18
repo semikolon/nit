@@ -45,13 +45,20 @@ Step-by-step guide for migrating a chezmoi-managed dotfiles repo to nit.
 - nit trigger keeps public repo synced
 - Excludes: `docs/claude/`, `system/` configs with IPs/passwords, security research
 
+## Execution Plan (Apr 18, 2026)
+
+Running migration from MERIAN via `ssh macmini` (tmux for connection safety). Mac Mini is the target machine. All Mac Mini CC sessions closed before executing. MERIAN repos synced to Mac Mini HEAD as of Apr 18.
+
+**Pre-migration session (Apr 14) completed:** Ghostty config tracked, spela LAN-only bind, secret tier reorg (6 keys→tier-all), SSH config fleet-wide, iptables hardened, hemma overlay synced, hs CLI path fix (7 files), repo cleanup (6 repos), knot→overlay, "Fresh provision" directive forged, Mac Mini wedge root cause confirmed (Mos CGEventTap + TCC), chezmoi drift resolved to zero, all docs congruent. Migration script fixed: preserves git history (`mv .git`), ignores CC runtime, whitelists Ghostty.
+
 ## Prerequisites
 
-- [ ] nit installed (`cargo install --git https://github.com/semikolon/nit.git`)
+- [x] nit installed (`cargo install --path .` on Mac Mini, v0.1.0, Apr 14)
 - [ ] All concurrent CC/editor sessions closed (prevents mid-migration file edits — `.claude/` files will change)
-- [ ] Working tree clean: `cd ~/dotfiles && git status` shows no uncommitted changes
-- [ ] Remote up to date: `git push`
-- [ ] Backup comfort: verify you can access the remote repo if something goes wrong
+- [x] Working tree clean: `cd ~/dotfiles && git status` shows no uncommitted changes (verified Apr 18)
+- [x] Remote up to date: `git push` (verified Apr 18)
+- [x] Backup comfort: `chezmoi-final` tag pushed to remote (Apr 14)
+- [x] MERIAN repos synced to Mac Mini HEAD (Apr 18)
 - [ ] **Audit untracked dependencies**: Any dotfiles manager only deploys what it tracks. Scripts, LaunchAgents, cron jobs, and symlinks created outside the managed source tree are invisible to migration — they'll keep working on *this* machine but won't exist on a fresh provision. Before migrating, inventory `~/.local/bin/`, `~/Library/LaunchAgents/` (macOS), `~/.config/systemd/user/` (Linux), and any other locations where you've placed ad-hoc scripts or services. Add them to the dotfiles source or document them as external dependencies. *(Audit: `docs/untracked_scripts_audit_2026_03.md` in the dotfiles repo.)*
 - [ ] **Post-chezmoi services to provision**: These were created after the original audit and must be included:
   - `project-registry` — Rust binary ([semikolon/project-registry](https://github.com/semikolon/project-registry)). Build: `cargo install --path .` → `~/.local/bin/project-registry`. LaunchAgent: `com.fredrikbranstrom.project-registry.plist` (30s `refresh-if-stale`). Shared SSoT for project metadata (Redis DB 1).
@@ -59,7 +66,7 @@ Step-by-step guide for migrating a chezmoi-managed dotfiles repo to nit.
   - Ghostty config change: `command` and `shell-integration` lines added (not chezmoi-managed, lives at `~/Library/Application Support/com.mitchellh.ghostty/config`).
   - `.zshrc` alias: `pp` → `~/.local/bin/project-launcher-tui`. Already in chezmoi source (`home/dot_zshrc`).
 
-## Phase 1: Safety Net
+## Phase 1: Safety Net ✅ (Apr 14)
 
 ```bash
 cd ~/dotfiles
