@@ -254,6 +254,16 @@ EOF
 
 ## Phase 6: Restructure — Step 1 (Renames Only)
 
+> **🤖 AUTOMATED (Apr 21, 2026):** This phase is now scripted. Run:
+> ```bash
+> ~/Projects/nit/scripts/migrate-from-chezmoi-restage.sh           # dry-run
+> ~/Projects/nit/scripts/migrate-from-chezmoi-restage.sh --execute # do it
+> ```
+> The script implements all the manual steps below as one big commit
+> (intra-commit rename detection). Reading the manual steps below is
+> still useful to understand WHAT the script does and why. The pre-flight
+> audit's gitignore additions are baked into Phase B of the script.
+>
 > **NOTE (Apr 21, 2026):** Use plain `nit` instead of `nitgit` throughout this phase — see the "Execution Update (Apr 21, 2026)" section above for why. Also: the script's `--execute` mode already did the Go→Tera template conversion in a single pass during Phase 3, so the "two-step" rationale below applies cleanly to plain files (R100 renames) but templates will show as similarity-based renames, not R100. That's expected and fine.
 
 > **🔴 CRITICAL RISKS (Apr 21, 2026)** — discovered during Mac Mini migration prep. Read before staging anything.
