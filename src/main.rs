@@ -55,6 +55,25 @@ enum NitCommand {
         /// Dismiss saved drift (shows diff before removing)
         #[arg(long)]
         dismiss: bool,
+
+        /// Print drift as a unified diff to stdout (read-only).
+        /// Pipe to `git apply` or `patch` against the source template if
+        /// you've reviewed the change and want to apply it manually:
+        ///   nit pick --diff .zshenv | (cd ~/dotfiles && git apply -p1)
+        /// Caveat: only safe to apply when the drift hunks don't touch
+        /// template syntax ({{ ... }} / {% ... %}); see `--edit` for an
+        /// editor-assisted workflow that handles arbitrary templates.
+        #[arg(long)]
+        diff: bool,
+
+        /// Open the template source in $EDITOR with the drift shown
+        /// inline beforehand (in the terminal scrollback). The editor
+        /// edit is on the source TEMPLATE, not the rendered target —
+        /// you incorporate the desired drift into the right
+        /// conditional branch by hand. After saving and exiting the
+        /// editor, run `nit commit` to deploy.
+        #[arg(long)]
+        edit: bool,
     },
 
     /// Render + deploy + git commit + triggers
@@ -185,7 +204,12 @@ fn run_command(cmd: NitCommand, config: &NitConfig) -> Result<(), Box<dyn std::e
     match cmd {
         NitCommand::Add { paths } => cmd_add(&paths, config),
         NitCommand::Apply { file } => cmd_apply(file.as_deref(), config),
-        NitCommand::Pick { file, dismiss } => cmd_pick(file.as_deref(), dismiss, config),
+        NitCommand::Pick {
+            file,
+            dismiss,
+            diff,
+            edit,
+        } => cmd_pick(file.as_deref(), dismiss, diff, edit, config),
         NitCommand::Commit { message } => cmd_commit(message.as_deref(), config),
         NitCommand::Update { safe } => cmd_update(safe, config),
         NitCommand::Status => cmd_status(config),
@@ -544,6 +568,8 @@ fn cmd_apply(file: Option<&str>, config: &NitConfig) -> Result<(), Box<dyn std::
 fn cmd_pick(
     file: Option<&str>,
     dismiss: bool,
+    diff_only: bool,
+    edit: bool,
     config: &NitConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mappings = template::discover_templates(config);
@@ -564,6 +590,78 @@ fn cmd_pick(
         }
         println!();
         println!("Drift removed.");
+        return Ok(());
+    }
+
+    // --diff mode: print drift as unified diff to stdout, no other output.
+    // Read-only — does NOT write ack (the user hasn't reviewed yet, just
+    // extracted the diff). Pipe-friendly for chaining with patch / git apply.
+    if diff_only {
+        let file_arg = file.ok_or("nit pick --diff requires a file argument")?;
+        let rel = resolve_pick_target(file_arg, &mappings);
+        let mapping = mappings
+            .iter()
+            .find(|m| target_rel_path(&m.target) == rel)
+            .ok_or_else(|| format!("no template found for target '{}'", rel))?;
+        let diff = syncbase::read_drift(&rel)
+            .or_else(|| detect_live_drift(mapping, config))
+            .ok_or_else(|| format!("no drift detected for {}", rel))?;
+        // Print raw diff to stdout — no decoration, suitable for piping
+        print!("{}", diff);
+        if !diff.ends_with('\n') {
+            println!();
+        }
+        return Ok(());
+    }
+
+    // --edit mode: print drift to stderr (visible in terminal scrollback),
+    // then spawn $EDITOR on the template SOURCE. User incorporates the
+    // desired drift into the right branch/conditional by hand. After the
+    // editor exits, the user runs `nit commit` to deploy. Writes ack since
+    // the user is actively reviewing.
+    if edit {
+        let file_arg = file.ok_or("nit pick --edit requires a file argument")?;
+        let rel = resolve_pick_target(file_arg, &mappings);
+        let mapping = mappings
+            .iter()
+            .find(|m| target_rel_path(&m.target) == rel)
+            .ok_or_else(|| format!("no template found for target '{}'", rel))?;
+        let drift = syncbase::read_drift(&rel)
+            .or_else(|| detect_live_drift(mapping, config))
+            .ok_or_else(|| format!("no drift detected for {}", rel))?;
+
+        // Show drift on stderr (so it scrolls past as the editor opens)
+        eprintln!();
+        eprintln!("  Drift in {} (rendered target vs current target):", rel);
+        eprintln!(
+            "  Opening template source in $EDITOR. Incorporate desired changes by hand."
+        );
+        eprintln!();
+        for line in drift.lines() {
+            eprintln!("    {}", line);
+        }
+        eprintln!();
+        eprintln!("  Source: {}", mapping.source.display());
+        eprintln!();
+
+        let editor = std::env::var("EDITOR")
+            .or_else(|_| std::env::var("VISUAL"))
+            .unwrap_or_else(|_| "vi".to_string());
+        let status = std::process::Command::new(&editor)
+            .arg(&mapping.source)
+            .status()
+            .map_err(|e| format!("failed to launch editor '{}': {}", editor, e))?;
+        if !status.success() {
+            return Err(format!(
+                "editor '{}' exited with status {}",
+                editor, status
+            )
+            .into());
+        }
+
+        // Write ack — user actively reviewed
+        write_ack_for_mapping(mapping, config);
+        eprintln!("  Edit complete. Run `nit commit` to deploy.");
         return Ok(());
     }
 

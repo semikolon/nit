@@ -694,6 +694,57 @@ chezmoi init --apply
 
 - [ ] **Add `__pycache__/` and `*.pyc` to `~/.gitignore`** (discovered Apr 21, 2026): `~/dotfiles/scripts/__pycache__/ensure_claude_graphiti_mcp.cpython-314.pyc` is pre-existing detritus (Mar 15) — not migration-related but the new gitignore doesn't exclude `__pycache__/`. Either `rm -rf ~/dotfiles/scripts/__pycache__` and add the gitignore line, or just add the exclusion. Trivial fix; lump with any other gitignore tuning.
 
+- [ ] **v2: Drift auto-promotion to source** (deferred design Apr 21, 2026): when target drift is VALUABLE (~50% of cases per spec), the current workflow requires manually editing source. For agents this is fast (paste from diff into source, commit) but two safer-automation enhancements are worth designing and building when the friction emerges:
+
+  **Already shipped Apr 21 (safe ergonomics, no auto-merge)**:
+  - `nit pick --diff <file>` → print drift as unified diff to stdout (read-only, no ack write). Pipe-friendly for `git apply` / `patch` chains.
+  - `nit pick --edit <file>` → print drift to stderr, open template SOURCE in `$EDITOR`. User incorporates desired changes into the right conditional branch by hand. Writes ack (active review). After save+exit, user runs `nit commit`.
+
+  **Deferred — needs intelligent design**:
+
+  - **`nit pick --apply <file>`** (Strategy D from the design discussion): attempt to git-apply the drift diff onto the template source, with re-render verification.
+    ```
+    Algorithm:
+      1. drift_diff = unified_diff(target_rendered, target_current)
+      2. git apply --check drift_diff onto source.tmpl
+         (this naturally fails if the diff hunks touch lines that have
+         template syntax in source but plain text in rendered — because
+         the literal context line in the diff won't match source)
+      3. If --check passes:
+           a. Apply diff to source
+           b. Re-render source → rendered_after
+           c. If rendered_after == target_current: SUCCESS — drift promoted
+           d. Else: revert source change, FAIL (false-clean apply)
+         If --check fails: FAIL — recommend --edit instead
+      4. On success: print "drift promoted to source, run nit commit"
+                     write ack
+    ```
+    **Strengths**: handles plain templates and conditionals where drift falls in
+    the active branch. Verification via re-rendering catches false positives.
+    Refuses to silently break templates whose drift overlaps template syntax.
+
+    **Limitations**: when drift IS in a conditional branch and the user wants the
+    change in OTHER branches too, this command only updates the current-machine
+    branch. User must check other branches manually. Acceptable trade-off — the
+    common case is "drift on this machine, want it on this machine".
+
+  - **`nit pick --apply --with-llm <file>`** (Strategy F, opt-in AI-assisted):
+    when `--apply` fails (template syntax overlap, multi-branch reasoning needed),
+    invoke a local or API LLM with the source template + rendered output + drifted
+    target, asking it to produce the source modification that yields the drifted
+    rendering. Show the proposed source diff, require user confirm before write.
+    Higher quality on complex cases. Requires LLM access. Always opt-in.
+
+  - **`nit pick --copy-to-source <file>`**: degenerate case — for templates that
+    are PURE LITERAL (no `{% %}` / `{{ }}` syntax at all), copy target_current
+    verbatim to source.tmpl. Effectively just file copy with safety check. Could
+    be folded into `--apply` (which handles this case naturally — diff applies
+    cleanly, re-render matches).
+
+  **When to build**: when manual edit-source flow becomes painful in practice. For
+  AI-agent primary use case (paste drift into source via editor), the manual flow
+  is ~30 seconds. Worth measuring real-world friction before adding complexity.
+
 - [x] **✅ FIXED Apr 21, 2026: Per-PPID ack persistence** (was a 🔴 BLOCKER for serious nit usage). The commit ack system originally tied acks to `getppid()`, which broke for any workflow with ephemeral child shells (CC's Bash tool, scripted invocations, CI runs). Each invocation had a different PPID — the ack written on attempt N never persisted to attempt N+1.
 
   **Fix shipped**: replaced raw `getppid()` with `get_session_anchor()` — walks the parent process chain and stops at the first KNOWN_AGENTS process (claude, codex, cursor-agent, aider, opencode, amp) or KNOWN_BOUNDARIES process (ghostty, kitty, alacritty, iTerm, wezterm, warp, tmux, screen, zellij, sshd, login, launchd, systemd, init, cron, crond). Returns the agent's PID OR the topmost shell's PID, whichever is found first. Within one CC conversation, all Bash calls now share the same anchor (the claude process PID).
