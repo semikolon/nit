@@ -694,6 +694,40 @@ chezmoi init --apply
 
 - [ ] **Add `__pycache__/` and `*.pyc` to `~/.gitignore`** (discovered Apr 21, 2026): `~/dotfiles/scripts/__pycache__/ensure_claude_graphiti_mcp.cpython-314.pyc` is pre-existing detritus (Mar 15) — not migration-related but the new gitignore doesn't exclude `__pycache__/`. Either `rm -rf ~/dotfiles/scripts/__pycache__` and add the gitignore line, or just add the exclusion. Trivial fix; lump with any other gitignore tuning.
 
+- [ ] **🔴 BLOCKER for serious nit usage: Per-PPID ack persistence** (discovered Apr 21, 2026 during Mac Mini migration): nit's commit ack system (`syncbase::read_acks(my_ppid)`) ties acks to the parent process ID of the invoking shell. This breaks any workflow where a script (or CC's Bash tool, or any non-interactive caller) runs `nit commit` because each invocation has a different PPID — the ack written on attempt N never persists to attempt N+1.
+
+  **Reproduce**:
+  ```bash
+  # Stage a template source change (or anything that triggers ack flow)
+  nit add dotfiles/templates/.zshenv.tmpl
+  nit commit -m "test"  # writes ack, blocks
+  nit commit -m "test"  # NEW PPID, "first commit attempt — ack written, re-run"
+  nit commit -m "test"  # NEW PPID, same loop
+  ```
+
+  **Workaround used during migration**: bypass nit's commit subcommand, use raw git: `git --git-dir=$NIT_REPO --work-tree=$HOME commit -m "..."`. Side effect: skips nit's drift validation entirely.
+
+  **Suggested fix paths** (need product decision):
+  - **Option A — durable ack on disk**: persist acks in `~/.local/state/nit/acks/<digest>` keyed by template+content hash, not PPID. Survives restarts, multiple invocations. Risk: easier to bypass safety checks accidentally.
+  - **Option B — TTY-bound ack**: tie ack to the controlling TTY (stable across child processes of the same terminal). Doesn't help non-interactive callers but better than PPID.
+  - **Option C — `--ack-and-commit` flag**: bypass the per-invocation gate when the user explicitly requests "I've reviewed; commit". Single-call workflow.
+  - **Option D — `--no-ack-check` for CI/scripts**: explicit opt-out. Simple but easy to misuse.
+
+  **MUST FIX** before nit is usable for any scripted workflow (CI, deploy scripts, this very migration script, etc.). Without it, every script that invokes `nit commit` either loops forever or has to bypass nit's commit subcommand entirely (defeating the purpose of the ack system).
+
+- [ ] **Per-machine binaries strategy** (discovered Apr 21, 2026): The migration revealed many large binaries at `~/.local/bin/` that aren't (and shouldn't be) tracked by nit: `mise` (66M), `mcp-agent-mail` (49M), `am` (49M), `fabric` (41M), `uv` (39M), `dcg` (14M), `project-launcher-tui` (7.8M), `project-registry` (1.7M), `system-sentinel` (1.4M), `ccsearch` (2.5M), plus rust hook binaries (`narrate-client`, `context-nudge`, `skill-preeval`, `tts-cli`, `notification-reader` — built per-machine by `25-build-rust-hooks.sh`).
+
+  **Current state**: gitignored on this machine. On a fresh machine they'd be missing — nothing in nit's deployment chain installs them.
+
+  **Existing install mechanisms** (partial coverage):
+  - `mise` self-installer (handles mise + uv + mise-managed CLI tools)
+  - Homebrew via `~/.Brewfile` (handles brew-installed CLIs)
+  - `25-build-rust-hooks.sh` chezmoi script → migrated to `dotfiles/scripts/25-build-rust-hooks.sh` → triggers.toml entry already exists in nit
+  - Cargo / `cargo install --git` for project-launcher, project-registry, system-sentinel
+  - `am`, `dcg`, `mcp-agent-mail` — install paths unknown, need investigation
+
+  **Fix path**: enumerate every binary at `~/.local/bin/` that's larger than ~1MB OR that's a Mach-O executable, document its install method, ensure it's covered by SOME automation (mise toml, Brewfile entry, dotfiles/scripts/install-*.sh trigger). Test on a fresh machine. **Lower priority than the PPID ack issue** — these binaries can be re-installed by hand if missing on a new fleet machine; the PPID issue makes nit itself unusable in scripts.
+
 - [ ] **Add `build_ontology` trigger to `triggers.toml`** (Apr 20, 2026): `~/.claude/contextual-intelligence/ontology.json` is consumed by `/capture`, `/significance`, and `/total-recap` as pre-command context. Its source-of-truth is two files in the separately-managed graphiti-official fork — NOT in nit's tracked tree. Currently manual rebuild (`python3 ~/.claude/hooks/build_ontology.py`). After nit lands, add a trigger that watches both files and rebuilds on hash change. Proposed stanza (watch paths are `$HOME`-relative — graphiti-official lives under `~/Projects/` which is $HOME-relative, so no absolute paths needed):
   ```toml
   [[trigger]]
