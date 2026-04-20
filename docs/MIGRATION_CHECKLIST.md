@@ -446,6 +446,29 @@ chezmoi init --apply
 - [ ] Fleet migration: install nit on remote machines, run `nit bootstrap`
 - [ ] Remove `chezmoi-final` tag when fully confident (optional — costs nothing to keep)
 - [ ] Evaluate CI runners for nit release builds — Blacksmith (Linux, 3K free min/mo) + GetMac (macOS M4) for cross-compiling fleet binaries. Research: `dotfiles/docs/ci_runner_alternatives_2026_03.md`
+- [ ] **Forward-only sync semantics for append-only runtime data** (Apr 20, 2026): chezmoi's source-wins-on-apply is the wrong model for files primarily *written* by runtime processes rather than *edited* by humans. Today this works only because `chezmoi-auto-apply` is disabled — a stray `chezmoi apply --force <target>` silently overwrites newer runtime state with the older source snapshot, losing content between the last `re-add` and now. Affected files include:
+  - `~/.claude/decisions_graphiti_cache.jsonl` — the JSONL leg of the triple-store (`Graphiti + DECISIONS.md + JSONL`, per global CLAUDE.md § "Knowledge Management System")
+  - `~/.claude/decisions_state.json` — derived recent-decisions cache
+  - `~/.claude/logs/ruby_conversations.jsonl` (currently gitignored but conceptually same class)
+  - Future: any tier-2 analyses, session retrospectives, or other runtime-accumulated logs that deserve permanence
+
+  **Proposed systemic solution for nit** — extend the per-file classification system with a new class:
+  ```toml
+  # In triggers.toml / fleet.toml / a new sync.toml — whatever fits nit's model
+  [[sync]]
+  path = ".claude/decisions_graphiti_cache.jsonl"
+  direction = "forward_only"  # target → source, never source → target (except bootstrap)
+  ```
+  Semantics:
+  - **Bootstrap** (fresh machine, target doesn't exist): source → target, so the historical snapshot arrives with the dotfiles.
+  - **Steady state** (target exists): `nit update` leaves the target untouched. Runtime appends freely.
+  - **Flush**: a user-invoked (or watcher-driven) `nit sync` copies target → source, commits (optionally pushes). Conflicts can't happen because target is always ahead.
+  - **Safety**: `nit apply --force` on a `forward_only` file is either a no-op or refuses — removes the "silent overwrite" failure mode entirely. This is the "auto-resolving gates over blocking gates" principle from global CLAUDE.md applied to sync: the gate resolves by *declining to destroy data*, not by prompting.
+
+  **Fully-automated flavor** (optional v2): a fswatch-style watcher, debounced ~1 min, runs `nit sync --forward-only-paths` whenever any forward-only target changes. Closes the "I forgot to re-add for a month" failure mode. Batches appends to reduce commit churn. Pairs naturally with nit's trigger system.
+
+  **Interim during migration**: just don't deploy these files via `nit update`. Keep them tracked in the bare repo, let `nit commit <path>` capture runtime state when the user chooses. Adds discipline but removes the overwrite risk.
+
 - [ ] **Add `build_ontology` trigger to `triggers.toml`** (Apr 20, 2026): `~/.claude/contextual-intelligence/ontology.json` is consumed by `/capture`, `/significance`, and `/total-recap` as pre-command context. Its source-of-truth is two files in the separately-managed graphiti-official fork — NOT in nit's tracked tree. Currently manual rebuild (`python3 ~/.claude/hooks/build_ontology.py`). After nit lands, add a trigger that watches both files and rebuilds on hash change. Proposed stanza (watch paths are `$HOME`-relative — graphiti-official lives under `~/Projects/` which is $HOME-relative, so no absolute paths needed):
   ```toml
   [[trigger]]
