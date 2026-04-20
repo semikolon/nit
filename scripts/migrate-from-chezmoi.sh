@@ -1038,7 +1038,7 @@ fi
 info "Phase 6: ~/.gitignore (blacklist strategy)"
 
 printf "  Will create ~/.gitignore with:\n"
-printf "    /* (ignore all top-level non-dot items)\n"
+printf "    /[!.]* (ignore all top-level NON-DOT items — keeps .claude, .config, etc. visible)\n"
 printf "    !dotfiles/ (whitelist project hub)\n"
 printf "    .cache/, .cargo/, .rustup/ (ignore large dotdirs)\n"
 printf "    .claude/logs|plans|projects|statsig (CC runtime, not config)\n"
@@ -1056,8 +1056,13 @@ if ! $DRY_RUN; then
 # New dotfiles (.foorc) show up as untracked automatically.
 # Non-dot top-level dirs (Projects/, Documents/) are ignored.
 
-# ─── Ignore all top-level non-dot items ──────────────────────────
-/*
+# ─── Ignore all top-level NON-DOT items ──────────────────────────
+# CRITICAL: must be /[!.]* not /* — the latter blanket-ignores every
+# dot-prefixed dir at $HOME (.claude, .config, .codex, .hammerspoon,
+# .ssh, .local, .git-templates, .graphiti, even .zshrc), making it
+# impossible to track ANY chezmoi-deployed dotfile without an explicit
+# `!.X` whitelist for each.
+/[!.]*
 
 # ─── Whitelist the project hub ───────────────────────────────────
 !dotfiles/
