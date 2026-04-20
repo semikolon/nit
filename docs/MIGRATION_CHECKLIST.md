@@ -51,6 +51,96 @@ Running migration from MERIAN via `ssh macmini` (tmux for connection safety). Ma
 
 **Pre-migration session (Apr 14) completed:** Ghostty config tracked, spela LAN-only bind, secret tier reorg (6 keys→tier-all), SSH config fleet-wide, iptables hardened, hemma overlay synced, hs CLI path fix (7 files), repo cleanup (6 repos), knot→overlay, "Fresh provision" directive forged, Mac Mini wedge root cause confirmed (Mos CGEventTap + TCC), chezmoi drift resolved to zero, all docs congruent. Migration script fixed: preserves git history (`mv .git`), ignores CC runtime, whitelists Ghostty.
 
+## Execution Update (Apr 21, 2026 — about to run)
+
+**Plan change**: User returned from travel without running the migration on MERIAN. Running directly **from Mac Mini** instead. The current prep CC session (`d10658c7-4d43-4ba7-965c-1d5a75128ec6`) will be quit before `--execute`, then resumed via `claude --resume d10658c7-4d43-4ba7-965c-1d5a75128ec6` to do the manual restructure with full context. **If resume fails for any reason**, this section + the immediate-post-script steps below are sufficient to continue from a fresh session.
+
+### State snapshot at script-run time
+
+- **HEAD**: `b5b0217` on `master` — `feat(tier0): pyleak integration + Q2/Q3 minimal prompt tweaks + docs congruence`
+- **Tags pushed to origin**: `chezmoi-final` (`0a188ec`, Apr 14, now 115 commits stale) + **`pre-nit`** (`b5b0217`, Apr 21, fresh rollback bookmark)
+- **chezmoi LaunchAgents**: both `.plist.disabled` and absent from `launchctl list` ✓ — no background writers
+- **chezmoi status**: only 2 run-script triggers pending (`25-build-rust-hooks.sh`, `darwin/30-reload-launchagents.sh`) — NOT target drift, safe to ignore
+- **Active CC sessions**: just the prep session (PID 49807, will be quit before `--execute`)
+- **`~/.local/share/nit/`**, **`~/.config/nit/`**: don't exist yet (clean slate for Phases 7+8) ✓
+- **Age key**: present at `~/.config/chezmoi/key.txt` (manual copy needed post-script — script does NOT copy it)
+
+**Dry run actuals (vs Apr 14 estimates earlier in this doc)**:
+
+| | Doc says | Actual (Apr 21 dry run) |
+|---|---|---|
+| Plain files | 590 | **675** |
+| Templates | 10 | **11** |
+| Secrets | 4 | 4 |
+| Trigger scripts | 19 | **18** |
+| Symlinks | 6 | 6 |
+
+Deltas come from Apr 14–20 work (Tier 0 dedup, pyleak integration, Ruby identity-bleed fix, daemon reliability fixes, SuperWhisper settings JSON, etc.). All in chezmoi source — migrates cleanly.
+
+### Discoveries that supersede instructions further down this doc
+
+1. **`nitgit` alias is NOT needed.** nit's CLI uses `clap::external_subcommand` (`nit/src/main.rs:111`) — any unrecognized subcommand falls through to git with the bare strategy hardcoded (`nit/src/git.rs:92`). After Phase 7 of the script creates the bare repo, just use `nit rm -r --cached dotfiles/home/`, `nit add .zshrc`, `nit commit -m "..."`, `nit log`, `nit push -u origin nit` — all work directly. **Skip every `alias nitgit=...` instruction in Phases 6–12 below; substitute `nit` for `nitgit` throughout.**
+
+2. **Hostname won't auto-match `macmini`.** Mac Mini's hostname is `Fredriks-Mac-Mini`; the script's case-insensitive substring matcher fails because of the hyphens (`"macmini" not in "fredriks-mac-mini"`). Script falls back to literal hostname and warns. **Manual fix required**: edit `~/.config/nit/local.toml` and change `machine = "Fredriks-Mac-Mini"` → `machine = "macmini"`.
+
+3. **Script does Go→Tera conversion in a SINGLE pass** (during Phase 3 file copy), not the two-step "rename then convert" the doc's Phases 6–7 below describe. Plain files (the bulk) are still R100 renames since they're never modified; only templates lose perfect rename detection. Acceptable cost — Go→Tera diffs are mostly token swaps (`.chezmoi.X` → `X`), so similarity stays well above git's 50% threshold.
+
+4. **Tier recipients are wide-open by default**. Generated `fleet.toml` puts ALL age recipients in EVERY tier. Not exploitable today (we trust our own machines) but defeats the tier model. Narrowing per `docs/age_key_mapping.md` is in the post-migration cleanup list — do it before adding any new fleet machine.
+
+### Immediate post-script steps (in this exact order)
+
+If resume succeeds, the prep session walks through these. If resume fails, do them by hand:
+
+1. **Read script stderr / exit code.** If non-zero, STOP and consult before doing anything else.
+2. **Sanity-check generated files**:
+   ```bash
+   cat ~/dotfiles/fleet.toml
+   cat ~/dotfiles/triggers.toml
+   cat ~/.config/nit/local.toml
+   cat ~/.gitignore
+   ```
+3. **Verify bare repo intact**:
+   ```bash
+   git --git-dir=$HOME/.local/share/nit/repo.git rev-parse HEAD
+   # Expected: b5b02178c41095f112320f9e90fd99fef32b555c (or wherever HEAD was when script ran)
+   ```
+4. **Copy age key** (script does NOT do this):
+   ```bash
+   cp ~/.config/chezmoi/key.txt ~/.config/nit/age-key.txt
+   chmod 600 ~/.config/nit/age-key.txt
+   ```
+5. **Fix machine name in local.toml**:
+   ```bash
+   sed -i.bak 's/machine = "Fredriks-Mac-Mini"/machine = "macmini"/' ~/.config/nit/local.toml
+   cat ~/.config/nit/local.toml  # verify
+   ```
+6. **First nit health check**:
+   ```bash
+   nit status
+   # Expected: config loads cleanly, bare repo found, no errors
+   ```
+7. **Verify hook symlinks survived intact** (script rm+ln'd them — should still point to `narrate-client`):
+   ```bash
+   ls -la ~/.claude/hooks/{stop,session_start,session_end,notification}.sh ~/.claude/agents.md ~/.codex/AGENTS.md
+   ```
+8. **Then proceed with Phase 6 (manual restructure) below** — but use plain `nit` everywhere the doc says `nitgit`.
+
+### Rollback if anything goes wrong before push
+
+```bash
+# Restore the git repo to ~/dotfiles/
+mv ~/.local/share/nit/repo.git ~/dotfiles/.git
+cd ~/dotfiles
+git config core.bare false
+git config --unset core.worktree
+git config --unset core.excludesFile
+git config --unset status.showUntrackedFiles
+git checkout master       # back to b5b0217 (pre-nit tag)
+chezmoi init --apply      # restore chezmoi state
+```
+
+The `pre-nit` tag is the current-state bookmark; `chezmoi-final` is the older Apr 14 fallback if `pre-nit` is somehow corrupted.
+
 ## Prerequisites
 
 - [x] nit installed (`cargo install --path .` on Mac Mini, v0.1.0, Apr 14)
@@ -163,6 +253,8 @@ EOF
 ```
 
 ## Phase 6: Restructure — Step 1 (Renames Only)
+
+> **NOTE (Apr 21, 2026):** Use plain `nit` instead of `nitgit` throughout this phase — see the "Execution Update (Apr 21, 2026)" section above for why. Also: the script's `--execute` mode already did the Go→Tera template conversion in a single pass during Phase 3, so the "two-step" rationale below applies cleanly to plain files (R100 renames) but templates will show as similarity-based renames, not R100. That's expected and fine.
 
 The key insight: **plain files don't physically move.** `~/.zshrc` already exists
 (chezmoi deployed it). We just change what git tracks. Templates, secrets, and
