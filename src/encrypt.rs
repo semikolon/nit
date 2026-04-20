@@ -102,7 +102,12 @@ pub fn decrypt_file(
         )
     })?;
 
-    let decryptor = age::Decryptor::new_buffered(&ciphertext[..])
+    // Auto-detect armor: chezmoi (and `age -a` / `age --armor`) writes
+    // ASCII-armored age files starting with `-----BEGIN AGE ENCRYPTED FILE-----`.
+    // age::Decryptor::new_buffered expects BINARY format. Wrap with
+    // ArmoredReader which transparently handles both armored and binary input.
+    let armored = age::armor::ArmoredReader::new(&ciphertext[..]);
+    let decryptor = age::Decryptor::new_buffered(armored)
         .map_err(|e| format!("cannot create decryptor: {}", e))?;
 
     let identity_refs: Vec<&dyn age::Identity> = identities.iter().map(|i| i.as_ref()).collect();

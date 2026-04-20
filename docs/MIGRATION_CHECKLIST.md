@@ -648,7 +648,13 @@ chezmoi init --apply
 
   **Interim during migration**: just don't deploy these files via `nit update`. Keep them tracked in the bare repo, let `nit commit <path>` capture runtime state when the user chooses. Adds discipline but removes the overwrite risk.
 
-- [ ] **Add `os` field per machine in `fleet.toml`** (discovered Apr 21, 2026): Without explicit `os = "darwin"` / `os = "linux"` per machine, nit's trigger filter drops 7 darwin-only triggers on macmini (it sees only 3 of ~10 applicable) and 8 linux-only triggers on darwin/shannon/turing. Add to each `[machines.X]` block:
+- [x] **✅ DONE Apr 21, 2026: Narrow tier recipients in `fleet.toml`** + rekey: per `docs/age_key_mapping.md`, dropped both unconfirmed Shannon-candidate keys, scoped each tier to its actual access set (tier-all=4, tier-servers=2, tier-mac=2, tier-edge=1). Required two nit fixes en route: (a) age crate `armor` feature wasn't enabled — chezmoi writes ASCII-armored .age files but nit's `Decryptor::new_buffered` expected binary input, failing with "Header is invalid"; fixed by enabling the armor feature + wrapping with `age::armor::ArmoredReader::new(...)` for transparent format detection. (b) `nit rekey` then succeeded and re-encrypted all 4 tiers with narrowed recipients. Verified: all 4 tiers still decrypt to identical plaintext byte counts. Add Shannon's verified key when it's powered on next.
+
+- [x] **✅ DONE Apr 21, 2026: Recover 9 templates + 399 system files** silently dropped from migration commit by `Library/`/`.graphiti/` blanket gitignore matching identically-named subpaths under `dotfiles/`. Fixed gitignore with `!dotfiles/templates/**` + `!dotfiles/system/**`. The lost files were 8 LaunchAgent plist templates, 1 graphiti redis.conf template, ~390 fonts, and ~10 keyboard layout files — all project sources, not runtime state.
+
+- [x] **✅ DONE Apr 21, 2026: `build-ontology` trigger registered** (per Apr 20 plan). New `scripts/darwin/build-ontology.sh` wrapper invokes `~/.claude/hooks/build_ontology.py` (uses hooks venv if present). triggers.toml entry watches `Projects/graphiti-official/mcp_server/{custom_entities.py,graphiti_mcp_server.py}` for changes. Verified: nit list now shows 11 triggers (was 10).
+
+- [x] **✅ DONE Apr 21, 2026: Add `os` field per machine in `fleet.toml`** (informational). nit reads the OS from runtime via `current_os()` (the macos→darwin normalization), but other tools (hemma) may consume the field. Now annotated:
   ```toml
   [machines.macmini]
   ssh_host = "macmini"
