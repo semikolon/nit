@@ -694,26 +694,15 @@ chezmoi init --apply
 
 - [ ] **Add `__pycache__/` and `*.pyc` to `~/.gitignore`** (discovered Apr 21, 2026): `~/dotfiles/scripts/__pycache__/ensure_claude_graphiti_mcp.cpython-314.pyc` is pre-existing detritus (Mar 15) — not migration-related but the new gitignore doesn't exclude `__pycache__/`. Either `rm -rf ~/dotfiles/scripts/__pycache__` and add the gitignore line, or just add the exclusion. Trivial fix; lump with any other gitignore tuning.
 
-- [ ] **🔴 BLOCKER for serious nit usage: Per-PPID ack persistence** (discovered Apr 21, 2026 during Mac Mini migration): nit's commit ack system (`syncbase::read_acks(my_ppid)`) ties acks to the parent process ID of the invoking shell. This breaks any workflow where a script (or CC's Bash tool, or any non-interactive caller) runs `nit commit` because each invocation has a different PPID — the ack written on attempt N never persists to attempt N+1.
+- [x] **✅ FIXED Apr 21, 2026: Per-PPID ack persistence** (was a 🔴 BLOCKER for serious nit usage). The commit ack system originally tied acks to `getppid()`, which broke for any workflow with ephemeral child shells (CC's Bash tool, scripted invocations, CI runs). Each invocation had a different PPID — the ack written on attempt N never persisted to attempt N+1.
 
-  **Reproduce**:
-  ```bash
-  # Stage a template source change (or anything that triggers ack flow)
-  nit add dotfiles/templates/.zshenv.tmpl
-  nit commit -m "test"  # writes ack, blocks
-  nit commit -m "test"  # NEW PPID, "first commit attempt — ack written, re-run"
-  nit commit -m "test"  # NEW PPID, same loop
-  ```
+  **Fix shipped**: replaced raw `getppid()` with `get_session_anchor()` — walks the parent process chain and stops at the first KNOWN_AGENTS process (claude, codex, cursor-agent, aider, opencode, amp) or KNOWN_BOUNDARIES process (ghostty, kitty, alacritty, iTerm, wezterm, warp, tmux, screen, zellij, sshd, login, launchd, systemd, init, cron, crond). Returns the agent's PID OR the topmost shell's PID, whichever is found first. Within one CC conversation, all Bash calls now share the same anchor (the claude process PID).
 
-  **Workaround used during migration**: bypass nit's commit subcommand, use raw git: `git --git-dir=$NIT_REPO --work-tree=$HOME commit -m "..."`. Side effect: skips nit's drift validation entirely.
+  **Cross-session ack reuse simultaneously removed** — the original "Option A" optimization defended none of the named contamination incidents (sccache, Flux client revert, CLAUDE.md re-add overwrite are all defended by source-wins + no-auto-merge), and per-agent accountability is cleaner. See `dotfiles/.claude/specs/nit/design.md` § "Why no cross-session ack reuse" for the full rationale.
 
-  **Suggested fix paths** (need product decision):
-  - **Option A — durable ack on disk**: persist acks in `~/.local/state/nit/acks/<digest>` keyed by template+content hash, not PPID. Survives restarts, multiple invocations. Risk: easier to bypass safety checks accidentally.
-  - **Option B — TTY-bound ack**: tie ack to the controlling TTY (stable across child processes of the same terminal). Doesn't help non-interactive callers but better than PPID.
-  - **Option C — `--ack-and-commit` flag**: bypass the per-invocation gate when the user explicitly requests "I've reviewed; commit". Single-call workflow.
-  - **Option D — `--no-ack-check` for CI/scripts**: explicit opt-out. Simple but easy to misuse.
+  **Verified**: this CC session triggered `nit pick`, ack landed at `<claude-pid>.json` not `<ephemeral-bash-pid>.json`. All Bash calls in the same conversation now find each other's acks correctly.
 
-  **MUST FIX** before nit is usable for any scripted workflow (CI, deploy scripts, this very migration script, etc.). Without it, every script that invokes `nit commit` either loops forever or has to bypass nit's commit subcommand entirely (defeating the purpose of the ack system).
+  **Long-term improvement** (separate work item): convince agentic harnesses to set a standard `AGENT_SESSION_ID` env var so the KNOWN_AGENTS heuristic isn't needed. Until then, the list is extensible — one entry per harness.
 
 - [ ] **Per-machine binaries strategy** (discovered Apr 21, 2026): The migration revealed many large binaries at `~/.local/bin/` that aren't (and shouldn't be) tracked by nit: `mise` (66M), `mcp-agent-mail` (49M), `am` (49M), `fabric` (41M), `uv` (39M), `dcg` (14M), `project-launcher-tui` (7.8M), `project-registry` (1.7M), `system-sentinel` (1.4M), `ccsearch` (2.5M), plus rust hook binaries (`narrate-client`, `context-nudge`, `skill-preeval`, `tts-cli`, `notification-reader` — built per-machine by `25-build-rust-hooks.sh`).
 

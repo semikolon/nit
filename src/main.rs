@@ -724,10 +724,16 @@ fn cmd_commit(message: Option<&str>, config: &NitConfig) -> Result<(), Box<dyn s
     }
 
     // 3. For each staged template source, apply 4-cell ack validation
-    let my_ppid = syncbase::get_ppid();
-    let my_acks = syncbase::read_acks(my_ppid);
+    //
+    // Acks are keyed by SESSION ANCHOR (not raw PPID) — see syncbase::
+    // get_session_anchor for the walk-up rationale. This makes one CC
+    // conversation = one stable identity across all of CC's per-Bash-call
+    // ephemeral shells. Same for Codex sessions, terminal shell sessions, etc.
+    let my_anchor = syncbase::get_session_anchor();
+    let my_acks = syncbase::read_acks(my_anchor);
 
-    // Prune dead acks first
+    // Prune dead-anchor ack files (pure housekeeping, no longer load-bearing
+    // since cross-session ack reuse was removed — only own-anchor acks count).
     syncbase::prune_dead_acks();
 
     let mut blocked = false;
@@ -778,44 +784,30 @@ fn cmd_commit(message: Option<&str>, config: &NitConfig) -> Result<(), Box<dyn s
                 }
             }
         } else {
-            // No ack for my PPID — scan cross-session acks
-            let cross_match = syncbase::find_cross_session_ack(
-                &rel,
-                &current_target_hash,
-                &current_rendered_hash,
-            );
-
-            if let Some(other_ppid) = cross_match {
-                // Option A: proceed in one run — another session reviewed identical state
-                eprintln!(
-                    "nit: {} — reviewed by session {} with matching state, proceeding",
-                    rel, other_ppid
-                );
-                // Show drift inline as informational note
-                if let Some(drift) = detect_live_drift(mapping, config) {
-                    eprintln!("nit: note — drift in {}:", rel);
-                    for line in drift.lines() {
-                        eprintln!("    {}", line);
-                    }
+            // No ack for my session anchor → show drift inline, write ack, refuse.
+            //
+            // Cross-session ack reuse was removed (Apr 21, 2026). Rationale: the
+            // committing agent should ALWAYS have witnessed the drift themselves.
+            // Output-scrolling-past in another session's review doesn't equal
+            // the committer's deliberate awareness. The "first commit fails,
+            // second proceeds" pattern structurally enforces that this agent
+            // engaged with the drift before persisting it. See spec design.md
+            // § "Why no cross-session ack reuse" for the full rationale.
+            eprintln!("nit: {} — no prior review found, showing drift:", rel);
+            if let Some(drift) = detect_live_drift(mapping, config) {
+                for line in drift.lines() {
+                    eprintln!("    {}", line);
                 }
             } else {
-                // No matching cross-session ack → show drift inline, write ack, refuse
-                eprintln!("nit: {} — no prior review found, showing drift:", rel);
-                if let Some(drift) = detect_live_drift(mapping, config) {
-                    for line in drift.lines() {
-                        eprintln!("    {}", line);
-                    }
-                } else {
-                    eprintln!("    (no drift detected)");
-                }
-                // Write ack so second run proceeds
-                syncbase::write_ack(&rel, &current_target_hash, &current_rendered_hash);
-                blocked = true;
-                block_reasons.push(format!(
-                    "{}: first commit attempt — ack written, re-run nit commit to proceed",
-                    rel
-                ));
+                eprintln!("    (no drift detected)");
             }
+            // Write ack so second commit (same session anchor) proceeds.
+            syncbase::write_ack(&rel, &current_target_hash, &current_rendered_hash);
+            blocked = true;
+            block_reasons.push(format!(
+                "{}: first commit attempt — ack written, re-run nit commit to proceed",
+                rel
+            ));
         }
     }
 

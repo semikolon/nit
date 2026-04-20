@@ -143,7 +143,9 @@ pub struct AckEntry {
     pub timestamp: String,
 }
 
-/// Get the parent PID of the current process.
+/// Get the parent PID of the current process (raw getppid syscall).
+/// This is the IMMEDIATE parent — for stable session identity across
+/// ephemeral shells (e.g., CC's Bash tool), use `get_session_anchor()`.
 pub fn get_ppid() -> u32 {
     #[cfg(unix)]
     {
@@ -162,6 +164,129 @@ unsafe extern "C" {
     fn getppid() -> i32;
 }
 
+/// Process name patterns that, when found in the parent chain, mark the
+/// SESSION anchor — the agent IS the session. Match is on the basename
+/// of the parent's `comm` (case-insensitive substring).
+///
+/// Add new agentic engineering harnesses here as they emerge. Long-term,
+/// each agent should expose a stable `AGENT_SESSION_ID` env var so this
+/// list isn't needed.
+const KNOWN_AGENTS: &[&str] = &[
+    "claude",       // Anthropic Claude Code
+    "codex",        // OpenAI Codex CLI
+    "cursor-agent", // Cursor agent mode
+    "aider",        // Aider AI pair programmer
+    "opencode",     // OpenCode
+    "amp",          // Sourcegraph Amp
+];
+
+/// Process name patterns that mark the OUTER boundary — terminal emulators,
+/// shell launchers, init systems. Walking up STOPS at these; the PID just
+/// BELOW the boundary is the session anchor (the topmost shell in the
+/// session). Match on basename of `comm` (case-insensitive substring).
+const KNOWN_BOUNDARIES: &[&str] = &[
+    // Terminal emulators
+    "ghostty", "kitty", "alacritty", "iterm2", "iterm",
+    "wezterm", "terminal", "warp",
+    // Multiplexers / session managers
+    "tmux", "screen", "zellij",
+    // Remote / login / init
+    "sshd", "login", "launchd", "systemd", "init",
+    // Cron / job runners (each invocation = new session)
+    "cron", "crond",
+];
+
+/// Find the most stable ancestor of the current process — the "session anchor".
+///
+/// **Why this exists:** the spec defines "session" as a stable agent identity
+/// (one Claude Code conversation, one shell session, one cron run), not an
+/// ephemeral shell. CC's Bash tool spawns a fresh `zsh -c "..."` per command,
+/// so `getppid()` returns a different value EACH `nit` invocation within the
+/// same conversation. Per-PPID acks then become per-Bash-call acks, breaking
+/// the per-session semantic. This function walks up the parent chain to find
+/// the actual session anchor.
+///
+/// **Walk semantics:**
+/// - Stop ABOVE on `KNOWN_AGENTS`: the agent process IS the session anchor →
+///   return its PID. (Example: walking from nit → bash → claude. claude is
+///   the agent → return claude's PID. Stable across all of CC's Bash calls.)
+/// - Stop BELOW on `KNOWN_BOUNDARIES`: terminal/init is outside the session →
+///   return the PID just below the boundary (the topmost shell). (Example:
+///   walking from nit → zsh → ghostty. ghostty is the boundary → return zsh's
+///   PID. Stable across all commands in that shell.)
+/// - Fallback to direct PPID if no anchor found in 16 hops.
+pub fn get_session_anchor() -> u32 {
+    let mut current = std::process::id();
+
+    // Cap walk depth to avoid pathological process trees
+    for _ in 0..16 {
+        let parent = ppid_of(current);
+        if parent <= 1 || parent == current {
+            // Hit init/launchd/orphan or self-loop — current is the deepest
+            // reasonable anchor.
+            return current;
+        }
+        let parent_comm_basename = comm_basename(parent).to_lowercase();
+        if parent_comm_basename.is_empty() {
+            // ps lookup failed — fall back to direct PPID
+            return get_ppid();
+        }
+
+        // STOP ABOVE: the agent process IS the session anchor
+        if KNOWN_AGENTS
+            .iter()
+            .any(|a| parent_comm_basename.contains(a))
+        {
+            return parent;
+        }
+        // STOP BELOW: terminal/launcher boundary; we are the topmost shell
+        if KNOWN_BOUNDARIES
+            .iter()
+            .any(|b| parent_comm_basename.contains(b))
+        {
+            return current;
+        }
+
+        current = parent;
+    }
+
+    // Walk depth exhausted: deepest reached is our best guess
+    current
+}
+
+/// Look up the parent PID of an arbitrary PID via `ps`. Returns 0 on failure.
+fn ppid_of(pid: u32) -> u32 {
+    if pid == std::process::id() {
+        return get_ppid();
+    }
+    let output = std::process::Command::new("ps")
+        .args(["-o", "ppid=", "-p", &pid.to_string()])
+        .output();
+    match output {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse()
+            .unwrap_or(0),
+        _ => 0,
+    }
+}
+
+/// Look up the basename of `comm` for a PID via `ps`. Returns "" on failure.
+/// `ps -o comm=` returns the full path on macOS; we basename it for matching.
+fn comm_basename(pid: u32) -> String {
+    let output = std::process::Command::new("ps")
+        .args(["-o", "comm=", "-p", &pid.to_string()])
+        .output();
+    let raw = match output {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().to_string(),
+        _ => return String::new(),
+    };
+    // Some macOS shells appear as `-zsh` or `-/bin/zsh` (login shell). Strip
+    // any leading `-` before basename.
+    let raw = raw.trim_start_matches('-');
+    raw.rsplit('/').next().unwrap_or("").to_string()
+}
+
 /// Path to a specific PPID's ack file.
 pub fn ack_file_path(ppid: u32) -> PathBuf {
     acks_dir().join(format!("{}.json", ppid))
@@ -176,11 +301,11 @@ pub fn read_acks(ppid: u32) -> HashMap<String, AckEntry> {
     }
 }
 
-/// Write an ack entry for the current PPID.
-/// Reads existing acks, adds/updates the entry, writes atomically.
+/// Write an ack entry for the current SESSION ANCHOR (not raw PPID).
+/// Reads existing acks for this anchor, adds/updates the entry, writes atomically.
 pub fn write_ack(target_rel: &str, target_hash: &str, rendered_hash: &str) {
-    let ppid = get_ppid();
-    write_ack_for_ppid(ppid, target_rel, target_hash, rendered_hash);
+    let anchor = get_session_anchor();
+    write_ack_for_ppid(anchor, target_rel, target_hash, rendered_hash);
 }
 
 /// Write an ack entry for a specific PPID (testable).
@@ -198,37 +323,40 @@ pub fn write_ack_for_ppid(ppid: u32, target_rel: &str, target_hash: &str, render
     atomic_write(&ack_file_path(ppid), &json);
 }
 
-/// Scan all ack files for a matching entry (cross-session ack).
-/// Returns the PPID that has a matching ack, or None.
-pub fn find_cross_session_ack(
-    target_rel: &str,
-    target_hash: &str,
-    rendered_hash: &str,
-) -> Option<u32> {
-    let dir = acks_dir();
-    if !dir.exists() {
-        return None;
-    }
+// NOTE (Apr 21, 2026): `find_cross_session_ack` was removed.
+//
+// The original v5 design (Mar 24, 2026) included cross-session ack reuse:
+// when committing a template source, if no own-session ack existed, scan
+// ALL session ack files and proceed if any matched the current state.
+// Rationale at the time: "same safety, less friction" (tasks.md:276) —
+// avoid forcing the second-call dance when another session had already
+// reviewed identical state.
+//
+// Why removed:
+// 1. The named contamination incidents (sccache, Flux client, CLAUDE.md
+//    revert) are defended by source-wins + no-auto-merge, NOT by acks.
+//    Cross-session reuse wasn't load-bearing for any incident.
+// 2. The "two pairs of eyes" framing relied on the committer engaging with
+//    drift output, which is structurally weaker than the explicit two-call
+//    pattern (especially for AI agents who batch-scroll output).
+// 3. Per-agent accountability is cleaner: the committing agent ALWAYS
+//    reviewed first.
+// 4. With session-anchor walk-up (replacing raw PPID), within one CC
+//    conversation all Bash calls share an anchor — the two-call dance is
+//    one-call from the user's POV (call 1 writes ack, call 2 commits).
+// 5. Multi-session friction (genuinely distinct sessions wanting to commit
+//    overlapping templates) is bounded: one extra `nit commit` per agent.
+//    Acceptable cost for the conceptual cleanup.
+//
+// If real-world friction at fleet scale becomes painful, re-add behind an
+// explicit opt-in flag (`--accept-cross-session-ack` or equivalent) — never
+// implicit.
 
-    let entries = fs::read_dir(&dir).ok()?;
-    for entry in entries.filter_map(|e| e.ok()) {
-        let name = entry.file_name().to_string_lossy().to_string();
-        if let Some(ppid_str) = name.strip_suffix(".json")
-            && let Ok(ppid) = ppid_str.parse::<u32>()
-        {
-            let acks = read_acks(ppid);
-            if let Some(ack) = acks.get(target_rel)
-                && ack.target_hash == target_hash
-                && ack.rendered_hash == rendered_hash
-            {
-                return Some(ppid);
-            }
-        }
-    }
-    None
-}
-
-/// Prune ack files for dead PIDs (process no longer running).
+/// Prune ack files whose anchor PID is no longer running.
+///
+/// Pure housekeeping — with cross-session ack reuse removed, dead-anchor acks
+/// are unreachable cruft (only the OWN anchor's ack file is read at commit
+/// time). Aggressive pruning is safe and keeps the directory tidy.
 pub fn prune_dead_acks() {
     let dir = acks_dir();
     if !dir.exists() {
