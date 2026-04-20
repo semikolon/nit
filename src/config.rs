@@ -186,7 +186,7 @@ impl NitConfig {
 
     /// Get triggers applicable to this machine (filtered by os/role)
     pub fn applicable_triggers(&self) -> Vec<&TriggerDef> {
-        let os = std::env::consts::OS;
+        let os = current_os();
         self.triggers
             .iter()
             .filter(|t| {
@@ -205,6 +205,20 @@ impl NitConfig {
                 true
             })
             .collect()
+    }
+}
+
+/// Normalized OS name for filter comparisons and template rendering.
+/// Rust's `std::env::consts::OS` returns "macos" on macOS, but the broader
+/// ecosystem (Unix uname, chezmoi, shell convention) uses "darwin" for the
+/// same OS. Templates and trigger files use "darwin"; this helper makes
+/// nit match that convention so `[trigger] os = "darwin"` filters work
+/// AND `{% if os == "darwin" %}` template conditionals work consistently
+/// across all of nit, hemma, chezmoi, and shell scripts in the fleet.
+pub fn current_os() -> &'static str {
+    match std::env::consts::OS {
+        "macos" => "darwin",
+        other => other,
     }
 }
 
@@ -821,7 +835,9 @@ role = ["dev"]
         std::fs::write(&local_path, "machine = \"mac-mini\"\n").unwrap();
 
         // Trigger with BOTH os and role filters — must match both
-        let current_os = std::env::consts::OS;
+        // Use normalized OS so the test passes on macOS (where the runtime
+        // constant "macos" is normalized to "darwin" for comparison)
+        let current_os = current_os();
         std::fs::write(
             &triggers_path,
             &format!(

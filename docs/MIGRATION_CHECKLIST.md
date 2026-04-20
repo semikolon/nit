@@ -685,12 +685,17 @@ chezmoi init --apply
   diff <(nit render dotfiles/templates/Library/LaunchAgents/com.fredrikbranstrom.falkordb.plist.tmpl) ~/Library/LaunchAgents/com.fredrikbranstrom.falkordb.plist
   ```
 
-- [ ] **Investigate why tier-servers / tier-mac / tier-edge secrets show ✗** (discovered Apr 21, 2026): Only `tier-all` shows ✓ in `nit list`. Possible causes: (a) `target` paths don't exist (decrypted form not deployed yet), (b) recipient validation — the current machine's age key isn't in the tier's recipient list, (c) tier filter mismatch in fleet.toml. Macmini SHOULD have access to all 4 tiers per the chezmoi tier model (see global CLAUDE.md § "Four-tier secret model"). Check:
-  ```bash
-  ls -la ~/.secrets/tier-*.env  # do all 4 plaintexts exist?
-  age --decrypt -i ~/.config/nit/age-key.txt ~/dotfiles/secrets/tier-servers.env.age | head -1  # can macmini's key decrypt?
-  nit apply --dry-run 2>&1 | grep -A2 tier-  # what does nit say goes wrong?
-  ```
+- [x] **✅ DONE Apr 21, 2026: Add `os` field per machine in `fleet.toml`** (informational — nit reads OS from runtime, hemma may use the field). Added `os = "darwin"` for macmini/merian, `os = "linux"` for darwin/turing/shannon.
+
+- [x] **✅ DONE Apr 21, 2026: Investigate `falkordb.plist.tmpl` ✗ in `nit list`** — root cause: Mac Mini deliberately stops local FalkorDB (Darwin runs it now); the deployed file is renamed to `.plist.disabled` by `dev-db-toggle`. Template rendered to `.plist` so target mismatch. **Fix shipped**: renamed source `templates/Library/LaunchAgents/com.fredrikbranstrom.falkordb.plist.tmpl` → `.plist.disabled.tmpl` (matches the existing `graphiti.plist.disabled.tmpl` convention). nit list now shows ✓.
+
+- [x] **✅ INVESTIGATED Apr 21, 2026: tier-servers / tier-mac / tier-edge ✗ in nit list** (root cause identified, not a real problem). The ✗/✓ marker in `nit list`'s secret section is a NAIVE HEURISTIC: `tier_name.contains(my_role) || tier_name.contains("all")`. Macmini has role=["dev"]; tier names contain "all"/"servers"/"mac"/"edge" but not "dev". So tier-all matches via "all" substring and shows ✓; the others show ✗. **The actual decryption works fine** — verified with `age --decrypt -i ~/.config/nit/age-key.txt`, all 4 tier .age files decrypt correctly and content matches deployed plaintexts byte-for-byte.
+
+  **The marker is misleading**, not load-bearing. v2 polish: replace the heuristic with actual age-key recipient check (parse `~/.config/nit/age-key.txt` → derive public key → check membership in `tier.recipients`). ~30 lines of Rust, low priority.
+
+- [x] **✅ FIXED Apr 21, 2026: macOS → darwin OS normalization** (nit bug discovered during cleanup). `std::env::consts::OS` returns `"macos"` on macOS, but trigger files (and chezmoi/Unix uname/shell scripts everywhere) use `"darwin"`. Result: every `[trigger] os = "darwin"` was filtered out on macmini — `nit list` showed 3 triggers instead of 10. Same bug affected templates: `{% if os == "darwin" %}` blocks were never matched.
+
+  Fix shipped: `crate::config::current_os()` helper normalizes "macos" → "darwin" at all comparison points. Used in `applicable_triggers()` and template rendering. Verified: nit list now shows all 10 expected triggers on macmini.
 
 - [ ] **Add `__pycache__/` and `*.pyc` to `~/.gitignore`** (discovered Apr 21, 2026): `~/dotfiles/scripts/__pycache__/ensure_claude_graphiti_mcp.cpython-314.pyc` is pre-existing detritus (Mar 15) — not migration-related but the new gitignore doesn't exclude `__pycache__/`. Either `rm -rf ~/dotfiles/scripts/__pycache__` and add the gitignore line, or just add the exclusion. Trivial fix; lump with any other gitignore tuning.
 
@@ -730,10 +735,28 @@ chezmoi init --apply
 
   - **`nit pick --apply --with-llm <file>`** (Strategy F, opt-in AI-assisted):
     when `--apply` fails (template syntax overlap, multi-branch reasoning needed),
-    invoke a local or API LLM with the source template + rendered output + drifted
+    invoke a capable LLM with the source template + rendered output + drifted
     target, asking it to produce the source modification that yields the drifted
     rendering. Show the proposed source diff, require user confirm before write.
-    Higher quality on complex cases. Requires LLM access. Always opt-in.
+    Higher quality on complex cases. Always opt-in.
+
+    **Implementation hint**: pipe to `fabric` (already installed in this fleet)
+    with a custom pattern like `promote_template_drift` — fabric handles the
+    LLM provider abstraction (Claude / GPT / Gemini / local). Keeps nit
+    LLM-agnostic and reuses the existing fabric infrastructure rather than
+    embedding a Rust HTTP client per provider.
+    ```bash
+    # Sketch:
+    cat <<EOF | fabric -p promote_template_drift
+    # SOURCE TEMPLATE
+    $(cat dotfiles/templates/.zshenv.tmpl)
+    # RENDERED OUTPUT (what nit produced)
+    $(nit render .zshenv)
+    # DRIFTED TARGET (what's actually on disk)
+    $(cat ~/.zshenv)
+    EOF
+    # Output: proposed source diff, user reviews + confirms
+    ```
 
   - **`nit pick --copy-to-source <file>`**: degenerate case — for templates that
     are PURE LITERAL (no `{% %}` / `{{ }}` syntax at all), copy target_current

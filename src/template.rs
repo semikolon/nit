@@ -125,8 +125,10 @@ pub fn render_template(
     let mut context = Context::new();
 
     // Machine identity
+    // Use crate::config::current_os() to normalize "macos" → "darwin"
+    // (matches chezmoi/Unix uname convention; trigger filters use the same).
     context.insert("hostname", &config.machine_name);
-    context.insert("os", std::env::consts::OS);
+    context.insert("os", crate::config::current_os());
     context.insert("arch", std::env::consts::ARCH);
 
     // Roles as array
@@ -562,7 +564,8 @@ mod tests {
 
         let rendered = render_template(&mapping, &config).unwrap();
         assert!(rendered.contains("host=test-host"));
-        assert!(rendered.contains(&format!("os={}", std::env::consts::OS)));
+        // Templates see the normalized OS name (macos → darwin)
+        assert!(rendered.contains(&format!("os={}", crate::config::current_os())));
         assert!(rendered.contains(&format!("arch={}", std::env::consts::ARCH)));
     }
 
@@ -583,8 +586,8 @@ mod tests {
 
     #[test]
     fn test_render_conditional_blocks() {
-        // Use the actual OS constant value in the template
-        let current_os = std::env::consts::OS;
+        // Use the normalized OS constant (matches what templates see)
+        let current_os = crate::config::current_os();
         let template = format!(
             r#"{{% if os == "{}" %}}matched{{% else %}}other{{% endif %}}"#,
             current_os
