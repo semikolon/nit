@@ -753,14 +753,25 @@ out.append('')
 # Add local machine (not in hemma fleet since it runs locally)
 import socket
 local_name = socket.gethostname().lower().replace(' ', '-').replace(\"'\", '')
+# Strip macOS .local FQDN suffix (socket.gethostname() returns FQDN on macOS)
+if local_name.endswith('.local'):
+    local_name = local_name[:-6]
+# Sanitize remaining dots — TOML treats them as table separators,
+# so 'foo.bar' would become machines['foo']['bar'], not a literal key
+local_name = local_name.replace('.', '-')
 # Simplify common macOS hostname patterns
 for prefix in ['fredriks-', 'my-']:
     if local_name.startswith(prefix):
         local_name = local_name[len(prefix):]
-out.append(f'[machines.{local_name}]')
-out.append('ssh_host = \"localhost\"')
-out.append('role = [\"dev\", \"primary\"]')
-out.append('')
+        break
+# Skip auto-insert if hemma already has this machine (literal or dehyphenated form)
+# Avoids producing duplicate entries when hostname-derived name (mac-mini)
+# differs only in punctuation from the hemma canonical name (macmini)
+if local_name not in machines and local_name.replace('-', '') not in machines:
+    out.append(f'[machines.{local_name}]')
+    out.append('ssh_host = \"localhost\"')
+    out.append('role = [\"dev\", \"primary\"]')
+    out.append('')
 
 for name, data in machines.items():
     out.append(f'[machines.{name}]')
