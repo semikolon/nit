@@ -446,3 +446,15 @@ chezmoi init --apply
 - [ ] Fleet migration: install nit on remote machines, run `nit bootstrap`
 - [ ] Remove `chezmoi-final` tag when fully confident (optional — costs nothing to keep)
 - [ ] Evaluate CI runners for nit release builds — Blacksmith (Linux, 3K free min/mo) + GetMac (macOS M4) for cross-compiling fleet binaries. Research: `dotfiles/docs/ci_runner_alternatives_2026_03.md`
+- [ ] **Add `build_ontology` trigger to `triggers.toml`** (Apr 20, 2026): `~/.claude/contextual-intelligence/ontology.json` is consumed by `/capture`, `/significance`, and `/total-recap` as pre-command context. Its source-of-truth is two files in the separately-managed graphiti-official fork — NOT in nit's tracked tree. Currently manual rebuild (`python3 ~/.claude/hooks/build_ontology.py`). After nit lands, add a trigger that watches both files and rebuilds on hash change. Proposed stanza (watch paths are `$HOME`-relative — graphiti-official lives under `~/Projects/` which is $HOME-relative, so no absolute paths needed):
+  ```toml
+  [[trigger]]
+  name = "build-ontology"
+  script = "scripts/darwin/build-ontology.sh"   # or a direct python3 invocation
+  watch = [
+    "Projects/graphiti-official/mcp_server/custom_entities.py",
+    "Projects/graphiti-official/mcp_server/graphiti_mcp_server.py",
+  ]
+  os = "darwin"  # only needed where Claude Code runs
+  ```
+  The wrapper script just runs `python3 ~/.claude/hooks/build_ontology.py`. The script is safe to run repeatedly — idempotent, ~150ms, refreshes both `ontology.json` and `entity_types_fallback.json`. Context + design rationale: `dotfiles/docs/household_cognitive_infrastructure_plan_2026_04_20.md` § "Actions — landed today" (entity-type additions) and the follow-up note about manual rebuild.
