@@ -256,6 +256,37 @@ EOF
 
 > **NOTE (Apr 21, 2026):** Use plain `nit` instead of `nitgit` throughout this phase — see the "Execution Update (Apr 21, 2026)" section above for why. Also: the script's `--execute` mode already did the Go→Tera template conversion in a single pass during Phase 3, so the "two-step" rationale below applies cleanly to plain files (R100 renames) but templates will show as similarity-based renames, not R100. That's expected and fine.
 
+> **🔴 CRITICAL RISKS (Apr 21, 2026)** — discovered during Mac Mini migration prep. Read before staging anything.
+>
+> 1. **Three file classes, not two.** Beyond (a) chezmoi source under `home/dot_*` and (b) moved templates/secrets/scripts, there's (c) **the dotfiles repo's OWN state files** — `~/dotfiles/.claude/{plans,specs,session_reports}/`, `~/dotfiles/docs/`, `~/dotfiles/hemma/`, `~/dotfiles/system/`, `~/dotfiles/scripts/` (pre-existing utility scripts), `~/dotfiles/tests/`, etc. These were tracked at root-level paths (`.claude/...`, `docs/...`) relative to the OLD work tree (`~/dotfiles/`). After the bare-repo move with `core.worktree=$HOME`, these tracked paths now resolve to `~/.claude/...` instead of `~/dotfiles/.claude/...` (which is where the files actually live). Phase 6 must **untrack at the bare path AND restage at `dotfiles/<X>` paths** for each top-level dir under `~/dotfiles/` that isn't `home/`. Pre-flight to enumerate the surface:
+>    ```bash
+>    nit ls-tree HEAD --name-only | awk -F/ '{print $1}' | sort -u
+>    ```
+>
+> 2. **`/*` gitignore blocks non-dot tracked paths.** The script's `~/.gitignore` whitelists only `dotfiles/`, `bin/`, and specific Ghostty paths under `Library/`. But chezmoi tracked some non-dot paths (e.g. `home/private_Documents/superwhisper/settings/settings.json` → would restage at `~/Documents/superwhisper/...`) — **blocked by gitignore**. Pre-flight to find them:
+>    ```bash
+>    nit ls-tree HEAD --name-only | grep -v '^\.' | awk -F/ '{print $1}' | sort -u
+>    ```
+>    Whitelist (e.g. add `!Documents/superwhisper/` to `~/.gitignore`) or accept loss.
+>
+> 3. **Rename detection is intra-commit only.** If you `nit rm --cached old` in commit A and `nit add new` in commit B, **no rename is detected** → `git log --follow` breaks for that file. All untrack+restage pairs MUST land in the SAME commit per file class. One big commit is safer than splitting.
+>
+> 4. **`diff.renameLimit` default is 1000 — the bare repo has 1640+ tracked files.** Bump it BEFORE the commit to avoid silent rename-detection skip:
+>    ```bash
+>    nit config diff.renameLimit 5000
+>    nit config merge.renameLimit 5000
+>    ```
+>
+> 5. **Symlink mode change**: 6 hook symlinks (`stop.sh`, `notification.sh`, `session_start.sh`, `session_end.sh`, `~/.codex/AGENTS.md`, `~/.claude/agents.md`) were tracked as regular files containing the target string (e.g. `narrate-client`). New state has them as real symlinks (mode 120000). Same blob content but different mode → rename detection may miss; history reachable via blob hash but `git log --follow` may break for these 6.
+>
+> **Recommended single-commit sequence** (within ONE commit, in this order):
+> 1. `nit rm -r --cached home/` (untrack 590+ chezmoi source files)
+> 2. `nit rm --cached .chezmoiroot .chezmoiignore .chezmoi.toml.tmpl .chezmoi-commit-message.tmpl 2>/dev/null` (untrack chezmoi metadata)
+> 3. For each non-`home/` top-level tracked dir at `~/dotfiles/<X>/` (use the pre-flight enumeration to find them — likely `.claude`, `docs`, `hemma`, `scripts`, `system`, `tests`): `nit rm -r --cached <X>` then `nit add dotfiles/<X>`
+> 4. Stage plain files at $HOME paths: `nit add .zshrc .config .claude .codex .hammerspoon .ssh/config .git-templates .local/bin .Brewfile .gemrc .vimrc .ackrc .commit-template.txt .graphiti .bashrc .bash_profile .profile` (adjust list using dry-run output)
+> 5. Stage moved files + new configs: `nit add dotfiles/templates dotfiles/secrets dotfiles/scripts dotfiles/fleet.toml dotfiles/triggers.toml`
+> 6. Single commit. Then verify rename detection: `nit log --stat HEAD~1..HEAD | grep -c "^ rename"` — should show many R lines.
+
 The key insight: **plain files don't physically move.** `~/.zshrc` already exists
 (chezmoi deployed it). We just change what git tracks. Templates, secrets, and
 scripts DO physically move to new locations within `~/dotfiles/`.
@@ -560,6 +591,52 @@ chezmoi init --apply
   **Fully-automated flavor** (optional v2): a fswatch-style watcher, debounced ~1 min, runs `nit sync --forward-only-paths` whenever any forward-only target changes. Closes the "I forgot to re-add for a month" failure mode. Batches appends to reduce commit churn. Pairs naturally with nit's trigger system.
 
   **Interim during migration**: just don't deploy these files via `nit update`. Keep them tracked in the bare repo, let `nit commit <path>` capture runtime state when the user chooses. Adds discipline but removes the overwrite risk.
+
+- [ ] **Add `os` field per machine in `fleet.toml`** (discovered Apr 21, 2026): Without explicit `os = "darwin"` / `os = "linux"` per machine, nit's trigger filter drops 7 darwin-only triggers on macmini (it sees only 3 of ~10 applicable) and 8 linux-only triggers on darwin/shannon/turing. Add to each `[machines.X]` block:
+  ```toml
+  [machines.macmini]
+  ssh_host = "macmini"
+  os = "darwin"           # add
+  role = ["dev"]
+
+  [machines.darwin]
+  ssh_host = "darwin"
+  os = "linux"            # add — Dell Optiplex running Ubuntu, name notwithstanding
+  role = ["server", "router"]
+  critical = true
+
+  [machines.merian]
+  ssh_host = "mbp"
+  os = "darwin"           # add — MacBook Pro 2014, Big Sur
+  role = ["laptop"]
+
+  [machines.turing]
+  ssh_host = "turing"
+  os = "linux"            # add — Raspberry Pi 3B+, Debian Trixie
+  role = ["iot"]
+
+  [machines.shannon]
+  ssh_host = "shannon"
+  os = "linux"            # add — Rock Pi 4B SE, Armbian Trixie (cold spare)
+  role = ["router"]
+  critical = true
+  ```
+  Verify after the edit: `nit list` should show all applicable triggers (10 on macmini, ~9 on darwin/shannon, etc.). This is the same mechanism nit uses for `[trigger] os = "darwin"` filtering — without it nit treats every machine as os-agnostic and drops anything with an os filter.
+
+- [ ] **Investigate `falkordb.plist.tmpl` ✗ in `nit list`** (discovered Apr 21, 2026): Of 11 templates, 10 show ✓ (rendered cleanly, target matches) but `Library/LaunchAgents/com.fredrikbranstrom.falkordb.plist.tmpl` shows ✗. Likely either a Tera conversion error in the converted template or a deliberate target mismatch (FalkorDB primary moved to Darwin Mar 2026; the local plist may be intentionally stopped/disabled — see global CLAUDE.md § "Dev databases on Darwin"). Diagnose:
+  ```bash
+  nit apply --dry-run 2>&1 | grep -A3 falkordb
+  diff <(nit render dotfiles/templates/Library/LaunchAgents/com.fredrikbranstrom.falkordb.plist.tmpl) ~/Library/LaunchAgents/com.fredrikbranstrom.falkordb.plist
+  ```
+
+- [ ] **Investigate why tier-servers / tier-mac / tier-edge secrets show ✗** (discovered Apr 21, 2026): Only `tier-all` shows ✓ in `nit list`. Possible causes: (a) `target` paths don't exist (decrypted form not deployed yet), (b) recipient validation — the current machine's age key isn't in the tier's recipient list, (c) tier filter mismatch in fleet.toml. Macmini SHOULD have access to all 4 tiers per the chezmoi tier model (see global CLAUDE.md § "Four-tier secret model"). Check:
+  ```bash
+  ls -la ~/.secrets/tier-*.env  # do all 4 plaintexts exist?
+  age --decrypt -i ~/.config/nit/age-key.txt ~/dotfiles/secrets/tier-servers.env.age | head -1  # can macmini's key decrypt?
+  nit apply --dry-run 2>&1 | grep -A2 tier-  # what does nit say goes wrong?
+  ```
+
+- [ ] **Add `__pycache__/` and `*.pyc` to `~/.gitignore`** (discovered Apr 21, 2026): `~/dotfiles/scripts/__pycache__/ensure_claude_graphiti_mcp.cpython-314.pyc` is pre-existing detritus (Mar 15) — not migration-related but the new gitignore doesn't exclude `__pycache__/`. Either `rm -rf ~/dotfiles/scripts/__pycache__` and add the gitignore line, or just add the exclusion. Trivial fix; lump with any other gitignore tuning.
 
 - [ ] **Add `build_ontology` trigger to `triggers.toml`** (Apr 20, 2026): `~/.claude/contextual-intelligence/ontology.json` is consumed by `/capture`, `/significance`, and `/total-recap` as pre-command context. Its source-of-truth is two files in the separately-managed graphiti-official fork — NOT in nit's tracked tree. Currently manual rebuild (`python3 ~/.claude/hooks/build_ontology.py`). After nit lands, add a trigger that watches both files and rebuilds on hash change. Proposed stanza (watch paths are `$HOME`-relative — graphiti-official lives under `~/Projects/` which is $HOME-relative, so no absolute paths needed):
   ```toml
