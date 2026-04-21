@@ -467,6 +467,142 @@ mod tests {
         }
     }
 
+    // ─── check_trigger: implicit script-hash watch (no `watch =` list) ──
+    // Regression coverage for Apr 21, 2026 fleet-rollout bug: triggers with
+    // empty `watch = []` never fired automatically (install-extra-binaries,
+    // 36-setup-hammerspoon, etc.). Fix: hash the trigger script itself as
+    // an implicit watched file, keyed under "__script__".
+
+    #[test]
+    fn test_check_trigger_no_watch_fires_on_first_apply() {
+        // Trigger has empty watch list and no prior state — should fire
+        // because the trigger script itself is implicitly watched.
+        let dir = TempDir::new().unwrap();
+        let scripts = dir.path().join("scripts");
+        fs::create_dir_all(&scripts).unwrap();
+        fs::write(scripts.join("noop.sh"), "#!/bin/bash\nexit 0\n").unwrap();
+
+        let trigger = TriggerDef {
+            name: "noop".to_string(),
+            script: "scripts/noop.sh".to_string(),
+            watch: vec![], // <-- the bug case
+            os: None,
+            role: None,
+        };
+
+        let state = TriggerState::default(); // no prior state
+
+        match check_trigger(&trigger, &state, dir.path(), dir.path()) {
+            TriggerCheck::Changed(hashes) => {
+                assert!(
+                    hashes.contains_key("__script__"),
+                    "expected __script__ hash in Changed map"
+                );
+            }
+            TriggerCheck::Unchanged => {
+                panic!("expected Changed — empty-watch trigger MUST fire on first apply")
+            }
+        }
+    }
+
+    #[test]
+    fn test_check_trigger_no_watch_unchanged_when_script_stable() {
+        // Trigger with empty watch + script unchanged + matching __script__
+        // hash in state → Unchanged.
+        let dir = TempDir::new().unwrap();
+        let scripts = dir.path().join("scripts");
+        fs::create_dir_all(&scripts).unwrap();
+        let script_path = scripts.join("noop.sh");
+        fs::write(&script_path, "#!/bin/bash\nexit 0\n").unwrap();
+        let script_hash = hash_file(&script_path).unwrap();
+
+        let trigger = TriggerDef {
+            name: "noop".to_string(),
+            script: "scripts/noop.sh".to_string(),
+            watch: vec![],
+            os: None,
+            role: None,
+        };
+
+        let mut state = TriggerState::default();
+        let mut stored = HashMap::new();
+        stored.insert("__script__".to_string(), script_hash);
+        state.trigger_hashes.insert("noop".to_string(), stored);
+
+        match check_trigger(&trigger, &state, dir.path(), dir.path()) {
+            TriggerCheck::Unchanged => {} // correct
+            TriggerCheck::Changed(_) => panic!("expected Unchanged — script content stable"),
+        }
+    }
+
+    #[test]
+    fn test_check_trigger_no_watch_refires_on_script_edit() {
+        // Trigger with empty watch + script EDITED since last apply → Changed.
+        // Models the "edit a trigger script and want it to re-run" workflow.
+        let dir = TempDir::new().unwrap();
+        let scripts = dir.path().join("scripts");
+        fs::create_dir_all(&scripts).unwrap();
+        let script_path = scripts.join("noop.sh");
+        fs::write(&script_path, "#!/bin/bash\nexit 0\n").unwrap();
+
+        let trigger = TriggerDef {
+            name: "noop".to_string(),
+            script: "scripts/noop.sh".to_string(),
+            watch: vec![],
+            os: None,
+            role: None,
+        };
+
+        // State has stale hash from before the script edit
+        let mut state = TriggerState::default();
+        let mut stored = HashMap::new();
+        stored.insert("__script__".to_string(), "stale-hash-from-prior-version".to_string());
+        state.trigger_hashes.insert("noop".to_string(), stored);
+
+        match check_trigger(&trigger, &state, dir.path(), dir.path()) {
+            TriggerCheck::Changed(hashes) => {
+                assert!(hashes.contains_key("__script__"));
+                assert_ne!(hashes["__script__"], "stale-hash-from-prior-version");
+            }
+            TriggerCheck::Unchanged => panic!("expected Changed — script content edited"),
+        }
+    }
+
+    #[test]
+    fn test_check_trigger_with_watch_also_refires_on_script_edit() {
+        // Trigger with watch list + watched files unchanged + script edited
+        // → Changed (script-hash watch is in addition to explicit watch list).
+        let dir = TempDir::new().unwrap();
+        let scripts = dir.path().join("scripts");
+        fs::create_dir_all(&scripts).unwrap();
+        let script_path = scripts.join("install.sh");
+        fs::write(&script_path, "#!/bin/bash\nbrew bundle\n").unwrap();
+        let watch_path = make_temp_file(dir.path(), "Brewfile", "brew 'git'");
+        let watch_hash = hash_file(&watch_path).unwrap();
+
+        let trigger = TriggerDef {
+            name: "install-packages".to_string(),
+            script: "scripts/install.sh".to_string(),
+            watch: vec!["Brewfile".to_string()],
+            os: None,
+            role: None,
+        };
+
+        // State has the CURRENT Brewfile hash but a STALE script hash
+        let mut state = TriggerState::default();
+        let mut stored = HashMap::new();
+        stored.insert("Brewfile".to_string(), watch_hash);
+        stored.insert("__script__".to_string(), "stale-script-hash".to_string());
+        state.trigger_hashes.insert("install-packages".to_string(), stored);
+
+        match check_trigger(&trigger, &state, dir.path(), dir.path()) {
+            TriggerCheck::Changed(_) => {} // correct — script content edited
+            TriggerCheck::Unchanged => {
+                panic!("expected Changed — script edit should re-fire even when watched files stable")
+            }
+        }
+    }
+
     // ─── run_trigger: success ───────────────────────────────────────
 
     #[test]
