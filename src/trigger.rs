@@ -134,6 +134,7 @@ pub fn resolve_watch_globs(watch: &[String], work_tree: &Path) -> Vec<PathBuf> {
 ///   - Triggers with `watch = []` still fire on first apply (no prior state)
 ///     and re-fire when the script content changes.
 ///   - Triggers with watch globs fire when any watched file OR the script changes.
+///
 /// Script hash is keyed under "__script__" to avoid collision with real watch paths.
 pub fn check_trigger(
     trigger: &TriggerDef,
