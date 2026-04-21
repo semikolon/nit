@@ -312,3 +312,155 @@ fn generate_age_key(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use tempfile::TempDir;
+
+    // ─── select_machine_name ────────────────────────────────────────
+
+    #[test]
+    fn test_select_machine_name_no_fleet_toml_falls_back_to_hostname() {
+        let dir = TempDir::new().unwrap();
+        let nonexistent = dir.path().join("missing.toml");
+        let result = select_machine_name(&nonexistent).unwrap();
+        // Should return SOMETHING (hostname) — exact value depends on system
+        assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn test_select_machine_name_empty_fleet_errors() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("fleet.toml");
+        fs::write(
+            &path,
+            r#"[secrets]
+source_dir = "~/dotfiles/secrets"
+[secrets.tiers.tier-all]
+recipients = []
+target = "~/.secrets/tier-all.env"
+[templates]
+source_dir = "~/dotfiles/templates"
+"#,
+        )
+        .unwrap();
+
+        let err = select_machine_name(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("no machines defined"),
+            "expected 'no machines defined' error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_select_machine_name_substring_match() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("fleet.toml");
+        // Use a machine name that's likely to substring-match the test runner's hostname.
+        // The hostname() helper returns SOMETHING, so we make the machine name a substring
+        // of common hostname patterns OR use the actual hostname.
+        let hostname = hostname::get().unwrap().to_string_lossy().to_string();
+        let machine = if hostname.is_empty() {
+            "test-machine".to_string()
+        } else {
+            // Lowercase — case-insensitive match should hit
+            hostname.to_lowercase()
+        };
+        let toml = format!(
+            r#"[machines."{}"]
+ssh_host = "{}"
+os = "linux"
+role = ["test"]
+
+[secrets]
+source_dir = "~/dotfiles/secrets"
+[templates]
+source_dir = "~/dotfiles/templates"
+"#,
+            machine, machine
+        );
+        fs::write(&path, toml).unwrap();
+
+        let result = select_machine_name(&path).unwrap();
+        assert_eq!(result.to_lowercase(), machine.to_lowercase());
+    }
+
+    #[test]
+    fn test_select_machine_name_no_match_errors() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("fleet.toml");
+        // Machine name unlikely to substring-match any real hostname
+        fs::write(
+            &path,
+            r#"[machines.zzz-very-unlikely-hostname-zzz]
+ssh_host = "zzz"
+os = "linux"
+role = ["test"]
+
+[secrets]
+source_dir = "~/dotfiles/secrets"
+[templates]
+source_dir = "~/dotfiles/templates"
+"#,
+        )
+        .unwrap();
+
+        let err = select_machine_name(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("cannot auto-select"),
+            "expected 'cannot auto-select' error, got: {}",
+            err
+        );
+    }
+
+    // ─── generate_age_key ───────────────────────────────────────────
+
+    #[test]
+    fn test_generate_age_key_writes_file() {
+        let dir = TempDir::new().unwrap();
+        let key_path = dir.path().join("age-key.txt");
+
+        generate_age_key(&key_path).unwrap();
+
+        assert!(key_path.exists(), "key file must exist");
+        let content = fs::read_to_string(&key_path).unwrap();
+        assert!(content.contains("# created:"), "expected created timestamp");
+        assert!(content.contains("# public key:"), "expected pubkey comment");
+        assert!(
+            content.contains("AGE-SECRET-KEY-"),
+            "expected secret key marker"
+        );
+    }
+
+    #[test]
+    fn test_generate_age_key_permissions_0600() {
+        let dir = TempDir::new().unwrap();
+        let key_path = dir.path().join("age-key.txt");
+
+        generate_age_key(&key_path).unwrap();
+
+        let meta = fs::metadata(&key_path).unwrap();
+        let mode = meta.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "age key file must be 0600 (owner-only)");
+    }
+
+    #[test]
+    fn test_generate_age_key_unique_per_call() {
+        let dir = TempDir::new().unwrap();
+        let path1 = dir.path().join("k1.txt");
+        let path2 = dir.path().join("k2.txt");
+
+        generate_age_key(&path1).unwrap();
+        generate_age_key(&path2).unwrap();
+
+        let c1 = fs::read_to_string(&path1).unwrap();
+        let c2 = fs::read_to_string(&path2).unwrap();
+        // Extract the public key line from each
+        let pk1 = c1.lines().find(|l| l.starts_with("# public key:")).unwrap();
+        let pk2 = c2.lines().find(|l| l.starts_with("# public key:")).unwrap();
+        assert_ne!(pk1, pk2, "two generated keys must have different pubkeys");
+    }
+}
