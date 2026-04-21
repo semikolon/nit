@@ -784,18 +784,33 @@ chezmoi init --apply
 
   **Long-term improvement** (separate work item): convince agentic harnesses to set a standard `AGENT_SESSION_ID` env var so the KNOWN_AGENTS heuristic isn't needed. Until then, the list is extensible — one entry per harness.
 
-- [ ] **Per-machine binaries strategy** (discovered Apr 21, 2026): The migration revealed many large binaries at `~/.local/bin/` that aren't (and shouldn't be) tracked by nit: `mise` (66M), `mcp-agent-mail` (49M), `am` (49M), `fabric` (41M), `uv` (39M), `dcg` (14M), `project-launcher-tui` (7.8M), `project-registry` (1.7M), `system-sentinel` (1.4M), `ccsearch` (2.5M), plus rust hook binaries (`narrate-client`, `context-nudge`, `skill-preeval`, `tts-cli`, `notification-reader` — built per-machine by `25-build-rust-hooks.sh`).
+- [ ] **Per-machine binaries strategy** (audit Apr 21, 2026): The migration revealed many large binaries at `~/.local/bin/` that aren't (and shouldn't be) tracked by nit. Audit results:
 
-  **Current state**: gitignored on this machine. On a fresh machine they'd be missing — nothing in nit's deployment chain installs them.
+  | Binary | Size | Source / Install method | Covered? |
+  |---|---|---|---|
+  | mise | 66M | mise.run/install.sh self-installer | ⚠️ bootstrap script needed (chicken-and-egg: mise installs itself) |
+  | uv | 39M | `mise install` (mise tool) | ✅ via mise toml |
+  | fabric | 41M | `go install github.com/danielmiessler/fabric/cmd/fabric@latest` | ❌ not in Brewfile or anywhere |
+  | mcp-agent-mail | 49M | `cargo install mcp-agent-mail` (or similar; v0.2.3) | ❌ |
+  | am | 49M | `am 0.2.3` (likely `cargo install`; antigravity-related?) | ❌ |
+  | dcg | 14M | destructive command guard (per CLAUDE.md `~/.local/bin/dcg`) | ❌ |
+  | ccsearch | 2.5M | CC session search tool (Go binary) | ❌ |
+  | project-launcher-tui | 7.8M | `cd ~/.local/src/project-launcher && go build -ldflags="-s -w" -o ~/.local/bin/project-launcher-tui .` | ❌ install script needed |
+  | project-registry | 1.7M | `cargo install --git https://github.com/semikolon/project-registry` | ❌ |
+  | system-sentinel | 1.4M | Tauri app, `cargo install` from semikolon/system-sentinel | ❌ |
+  | notification-reader | 2.1M | dotfiles/scripts/25-build-rust-hooks.sh | ✅ (trigger) |
+  | tts-cli | 1.0M | dotfiles/scripts/25-build-rust-hooks.sh | ✅ (trigger) |
+  | narrate-client, context-nudge, skill-preeval | various | dotfiles/scripts/25-build-rust-hooks.sh | ✅ (trigger) |
 
-  **Existing install mechanisms** (partial coverage):
-  - `mise` self-installer (handles mise + uv + mise-managed CLI tools)
-  - Homebrew via `~/.Brewfile` (handles brew-installed CLIs)
-  - `25-build-rust-hooks.sh` chezmoi script → migrated to `dotfiles/scripts/25-build-rust-hooks.sh` → triggers.toml entry already exists in nit
-  - Cargo / `cargo install --git` for project-launcher, project-registry, system-sentinel
-  - `am`, `dcg`, `mcp-agent-mail` — install paths unknown, need investigation
+  **8 of 13 binaries have NO install automation** on a fresh machine. They'd need to be hand-installed. Doable but tedious.
 
-  **Fix path**: enumerate every binary at `~/.local/bin/` that's larger than ~1MB OR that's a Mach-O executable, document its install method, ensure it's covered by SOME automation (mise toml, Brewfile entry, dotfiles/scripts/install-*.sh trigger). Test on a fresh machine. **Lower priority than the PPID ack issue** — these binaries can be re-installed by hand if missing on a new fleet machine; the PPID issue makes nit itself unusable in scripts.
+  **Suggested fix path** (separate work item, not blocking nit):
+  1. Add `fabric` and `mcp-agent-mail` to Brewfile (if available via brew tap) OR write a `dotfiles/scripts/install-extra-binaries.sh` trigger that runs `cargo install` / `go install` for each.
+  2. Write `dotfiles/scripts/install-mise.sh` bootstrap trigger that runs the mise installer if mise is missing.
+  3. Investigate `am`, `dcg`, `ccsearch` install paths — they're locally compiled per CLAUDE.md notes (codex-related?). Document install method in CLAUDE.md or add scripts.
+  4. Test on a fresh machine (probably a new VM or the next time we provision a fleet machine).
+
+  **Defer rationale**: lower priority than nit core fixes. These binaries can be re-installed by hand if missing on a new fleet machine. Document install paths now, automate when next provisioning. **Mac Mini, Darwin, Merian — all have these binaries today**; the gap is for any FUTURE fresh provision.
 
 - [ ] **Add `build_ontology` trigger to `triggers.toml`** (Apr 20, 2026): `~/.claude/contextual-intelligence/ontology.json` is consumed by `/capture`, `/significance`, and `/total-recap` as pre-command context. Its source-of-truth is two files in the separately-managed graphiti-official fork — NOT in nit's tracked tree. Currently manual rebuild (`python3 ~/.claude/hooks/build_ontology.py`). After nit lands, add a trigger that watches both files and rebuilds on hash change. Proposed stanza (watch paths are `$HOME`-relative — graphiti-official lives under `~/Projects/` which is $HOME-relative, so no absolute paths needed):
   ```toml
