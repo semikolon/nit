@@ -21,8 +21,18 @@ pub struct TemplateMapping {
     pub rel_source: PathBuf,
 }
 
-/// Discover all templates and build source→target and target→source mappings
+/// Discover all templates and build source→target and target→source mappings.
+/// Wraps `discover_templates_with_os` with the current machine's OS (via
+/// `current_os()` normalization). For tests, use `discover_templates_with_os`
+/// directly with an explicit OS so results are deterministic across CI runners.
 pub fn discover_templates(config: &NitConfig) -> Vec<TemplateMapping> {
+    discover_templates_with_os(config, crate::config::current_os())
+}
+
+/// Core template discovery with explicit OS — allows tests to force
+/// `"darwin"` so `Library/LaunchAgents/` paths materialize regardless of
+/// the CI runner's actual OS.
+pub fn discover_templates_with_os(config: &NitConfig, current_os: &str) -> Vec<TemplateMapping> {
     let templates_dir = &config.templates_dir;
     let home = dirs::home_dir().expect("cannot determine home directory");
 
@@ -30,7 +40,6 @@ pub fn discover_templates(config: &NitConfig) -> Vec<TemplateMapping> {
         return Vec::new();
     }
 
-    let current_os = crate::config::current_os();
     let mut mappings = Vec::new();
 
     for entry in WalkDir::new(templates_dir)
@@ -290,7 +299,7 @@ mod tests {
             project_dir: dir.path().to_path_buf(),
         };
 
-        let mappings = discover_templates(&config);
+        let mappings = discover_templates_with_os(&config, "darwin");
         assert_eq!(mappings.len(), 2);
 
         let targets: Vec<PathBuf> = mappings.iter().map(|m| m.target.clone()).collect();
@@ -358,7 +367,7 @@ mod tests {
         std::fs::create_dir_all(&templates_dir).unwrap();
 
         let config = test_config(templates_dir, dir.path().to_path_buf());
-        let mappings = discover_templates(&config);
+        let mappings = discover_templates_with_os(&config, "darwin");
         assert!(mappings.is_empty());
     }
 
@@ -368,7 +377,7 @@ mod tests {
         let templates_dir = dir.path().join("templates"); // not created
 
         let config = test_config(templates_dir, dir.path().to_path_buf());
-        let mappings = discover_templates(&config);
+        let mappings = discover_templates_with_os(&config, "darwin");
         assert!(mappings.is_empty());
     }
 
@@ -385,7 +394,7 @@ mod tests {
 
         let home = dirs::home_dir().unwrap();
         let config = test_config(templates_dir, dir.path().to_path_buf());
-        let mappings = discover_templates(&config);
+        let mappings = discover_templates_with_os(&config, "darwin");
         assert_eq!(mappings.len(), 1);
         assert_eq!(
             mappings[0].target,
@@ -407,7 +416,7 @@ mod tests {
 
         let home = dirs::home_dir().unwrap();
         let config = test_config(templates_dir, dir.path().to_path_buf());
-        let mappings = discover_templates(&config);
+        let mappings = discover_templates_with_os(&config, "darwin");
         assert_eq!(mappings.len(), 1);
         assert_eq!(
             mappings[0].target,
@@ -430,7 +439,7 @@ mod tests {
         std::fs::write(templates_dir.join(".zshrc.tmpl"), "# shell").unwrap();
 
         let config = test_config(templates_dir, dir.path().to_path_buf());
-        let mappings = discover_templates(&config);
+        let mappings = discover_templates_with_os(&config, "darwin");
         assert_eq!(mappings.len(), 1);
         assert!(mappings[0].source.to_string_lossy().contains(".zshrc.tmpl"));
     }
@@ -495,7 +504,7 @@ mod tests {
         }
 
         let config = test_config(templates_dir, dir.path().to_path_buf());
-        let mappings = discover_templates(&config);
+        let mappings = discover_templates_with_os(&config, "darwin");
         assert_eq!(mappings.len(), 3);
 
         // All targets should be unique
@@ -522,7 +531,7 @@ mod tests {
         .unwrap();
 
         let config = test_config(templates_dir, dir.path().to_path_buf());
-        let mappings = discover_templates(&config);
+        let mappings = discover_templates_with_os(&config, "darwin");
         assert_eq!(mappings.len(), 1);
         assert_eq!(
             mappings[0].rel_source,
