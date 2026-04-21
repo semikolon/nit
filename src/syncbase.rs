@@ -186,14 +186,27 @@ const KNOWN_AGENTS: &[&str] = &[
 /// session). Match on basename of `comm` (case-insensitive substring).
 const KNOWN_BOUNDARIES: &[&str] = &[
     // Terminal emulators
-    "ghostty", "kitty", "alacritty", "iterm2", "iterm",
-    "wezterm", "terminal", "warp",
+    "ghostty",
+    "kitty",
+    "alacritty",
+    "iterm2",
+    "iterm",
+    "wezterm",
+    "terminal",
+    "warp",
     // Multiplexers / session managers
-    "tmux", "screen", "zellij",
+    "tmux",
+    "screen",
+    "zellij",
     // Remote / login / init
-    "sshd", "login", "launchd", "systemd", "init",
+    "sshd",
+    "login",
+    "launchd",
+    "systemd",
+    "init",
     // Cron / job runners (each invocation = new session)
-    "cron", "crond",
+    "cron",
+    "crond",
 ];
 
 /// Find the most stable ancestor of the current process — the "session anchor".

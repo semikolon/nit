@@ -633,9 +633,7 @@ fn cmd_pick(
         // Show drift on stderr (so it scrolls past as the editor opens)
         eprintln!();
         eprintln!("  Drift in {} (rendered target vs current target):", rel);
-        eprintln!(
-            "  Opening template source in $EDITOR. Incorporate desired changes by hand."
-        );
+        eprintln!("  Opening template source in $EDITOR. Incorporate desired changes by hand.");
         eprintln!();
         for line in drift.lines() {
             eprintln!("    {}", line);
@@ -652,11 +650,7 @@ fn cmd_pick(
             .status()
             .map_err(|e| format!("failed to launch editor '{}': {}", editor, e))?;
         if !status.success() {
-            return Err(format!(
-                "editor '{}' exited with status {}",
-                editor, status
-            )
-            .into());
+            return Err(format!("editor '{}' exited with status {}", editor, status).into());
         }
 
         // Write ack — user actively reviewed

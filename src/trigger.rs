@@ -556,7 +556,10 @@ mod tests {
         // State has stale hash from before the script edit
         let mut state = TriggerState::default();
         let mut stored = HashMap::new();
-        stored.insert("__script__".to_string(), "stale-hash-from-prior-version".to_string());
+        stored.insert(
+            "__script__".to_string(),
+            "stale-hash-from-prior-version".to_string(),
+        );
         state.trigger_hashes.insert("noop".to_string(), stored);
 
         match check_trigger(&trigger, &state, dir.path(), dir.path()) {
@@ -593,12 +596,16 @@ mod tests {
         let mut stored = HashMap::new();
         stored.insert("Brewfile".to_string(), watch_hash);
         stored.insert("__script__".to_string(), "stale-script-hash".to_string());
-        state.trigger_hashes.insert("install-packages".to_string(), stored);
+        state
+            .trigger_hashes
+            .insert("install-packages".to_string(), stored);
 
         match check_trigger(&trigger, &state, dir.path(), dir.path()) {
             TriggerCheck::Changed(_) => {} // correct — script content edited
             TriggerCheck::Unchanged => {
-                panic!("expected Changed — script edit should re-fire even when watched files stable")
+                panic!(
+                    "expected Changed — script edit should re-fire even when watched files stable"
+                )
             }
         }
     }
