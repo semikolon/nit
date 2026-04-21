@@ -129,12 +129,39 @@ pub fn resolve_watch_globs(watch: &[String], work_tree: &Path) -> Vec<PathBuf> {
 
 /// Hash all watched files and compare to stored state.
 /// Returns Changed(new_hashes) if any file hash differs or is new, Unchanged otherwise.
-pub fn check_trigger(trigger: &TriggerDef, state: &TriggerState, work_tree: &Path) -> TriggerCheck {
+///
+/// The trigger SCRIPT itself is always implicitly watched. This means:
+///   - Triggers with `watch = []` still fire on first apply (no prior state)
+///     and re-fire when the script content changes.
+///   - Triggers with watch globs fire when any watched file OR the script changes.
+/// Script hash is keyed under "__script__" to avoid collision with real watch paths.
+pub fn check_trigger(
+    trigger: &TriggerDef,
+    state: &TriggerState,
+    work_tree: &Path,
+    project_dir: &Path,
+) -> TriggerCheck {
     let resolved = resolve_watch_globs(&trigger.watch, work_tree);
     let stored = state.trigger_hashes.get(&trigger.name);
 
     let mut new_hashes = HashMap::new();
     let mut changed = false;
+
+    // Implicit watch: the trigger script's own content. Without this, triggers
+    // with no `watch = []` would never fire (empty resolved list → unchanged).
+    let script_path = project_dir.join(&trigger.script);
+    if let Ok(hash) = hash_file(&script_path) {
+        let key = "__script__".to_string();
+        if let Some(prev) = stored.and_then(|s| s.get(&key)) {
+            if *prev != hash {
+                changed = true;
+            }
+        } else {
+            // New trigger or first run — counts as changed
+            changed = true;
+        }
+        new_hashes.insert(key, hash);
+    }
 
     for path in &resolved {
         // Use path relative to work_tree as key
@@ -171,11 +198,6 @@ pub fn check_trigger(trigger: &TriggerDef, state: &TriggerState, work_tree: &Pat
                 break;
             }
         }
-    }
-
-    // No prior state at all for this trigger → changed
-    if stored.is_none() && !new_hashes.is_empty() {
-        changed = true;
     }
 
     if changed {
@@ -270,7 +292,7 @@ pub fn run_applicable_triggers(
             continue;
         }
 
-        match check_trigger(trigger, state, &work_tree) {
+        match check_trigger(trigger, state, &work_tree, &config.project_dir) {
             TriggerCheck::Changed(new_hashes) => {
                 match run_trigger(trigger, &config.project_dir, log_dir) {
                     Ok(result) => {
@@ -384,7 +406,7 @@ mod tests {
         old.insert("config.toml".to_string(), "oldhash".to_string());
         state.trigger_hashes.insert("test".to_string(), old);
 
-        match check_trigger(&trigger, &state, dir.path()) {
+        match check_trigger(&trigger, &state, dir.path(), dir.path()) {
             TriggerCheck::Changed(hashes) => {
                 assert!(hashes.contains_key("config.toml"));
                 assert_ne!(hashes["config.toml"], "oldhash");
@@ -414,7 +436,7 @@ mod tests {
         stored.insert("config.toml".to_string(), current_hash);
         state.trigger_hashes.insert("test".to_string(), stored);
 
-        match check_trigger(&trigger, &state, dir.path()) {
+        match check_trigger(&trigger, &state, dir.path(), dir.path()) {
             TriggerCheck::Unchanged => {} // correct
             TriggerCheck::Changed(_) => panic!("expected Unchanged"),
         }
@@ -437,7 +459,7 @@ mod tests {
 
         let state = TriggerState::default(); // empty — no prior state
 
-        match check_trigger(&trigger, &state, dir.path()) {
+        match check_trigger(&trigger, &state, dir.path(), dir.path()) {
             TriggerCheck::Changed(hashes) => {
                 assert!(hashes.contains_key("Brewfile"));
             }
