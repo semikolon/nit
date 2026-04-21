@@ -51,6 +51,20 @@ pub fn run_bootstrap(url: &str) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("nit: checking out files to {}...", home.display());
     git::exec_git_with(&GitStrategy::Bare, &["checkout", "--force"])?;
 
+    // Step 2a: Set master to track origin/master with merge (not rebase) semantics.
+    // Without this, the first `nit update` (which calls `git pull`) fails with
+    // "no tracking information" or "cannot pull with rebase: unstaged changes"
+    // when the work tree has any local edits. Merge mode is more forgiving for
+    // dotfiles workflow where target files routinely diverge slightly from HEAD.
+    let _ = git::exec_git_with(
+        &GitStrategy::Bare,
+        &["branch", "--set-upstream-to=origin/master", "master"],
+    );
+    let _ = git::exec_git_with(
+        &GitStrategy::Bare,
+        &["config", "branch.master.rebase", "false"],
+    );
+
     // Step 3: Create ~/.gitignore if it doesn't exist
     let gitignore = home.join(".gitignore");
     if !gitignore.exists() {
