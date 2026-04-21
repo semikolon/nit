@@ -30,6 +30,7 @@ pub fn discover_templates(config: &NitConfig) -> Vec<TemplateMapping> {
         return Vec::new();
     }
 
+    let current_os = crate::config::current_os();
     let mut mappings = Vec::new();
 
     for entry in WalkDir::new(templates_dir)
@@ -49,6 +50,13 @@ pub fn discover_templates(config: &NitConfig) -> Vec<TemplateMapping> {
             let rel_str = rel.to_string_lossy();
             // Remove .tmpl extension
             if let Some(target_rel) = rel_str.strip_suffix(".tmpl") {
+                // OS-aware path filter: Library/LaunchAgents/ is darwin-only
+                // (launchd-specific). Skip on non-darwin hosts so Linux fleet
+                // machines don't accumulate cruft plists they can never use.
+                if is_os_specific_path_skipped(target_rel, current_os) {
+                    continue;
+                }
+
                 let target = home.join(target_rel);
                 mappings.push(TemplateMapping {
                     source: source.clone(),
@@ -60,6 +68,29 @@ pub fn discover_templates(config: &NitConfig) -> Vec<TemplateMapping> {
     }
 
     mappings
+}
+
+/// OS-specific path filter for template deployment.
+///
+/// Some target paths are meaningful only on specific OSes:
+///   - `Library/LaunchAgents/` — macOS only (launchd domain)
+///   - `Library/Application Support/` — macOS only
+///
+/// Returns true if the target path should be SKIPPED for the current OS.
+/// Pure function — testable independently.
+pub fn is_os_specific_path_skipped(target_rel: &str, current_os: &str) -> bool {
+    // Normalize to forward slashes for cross-platform path matching
+    let path = target_rel.replace('\\', "/");
+
+    // Darwin-specific paths
+    let darwin_only = path.starts_with("Library/LaunchAgents/")
+        || path.starts_with("Library/Application Support/");
+
+    if darwin_only && current_os != "darwin" {
+        return true;
+    }
+
+    false
 }
 
 /// Build a reverse lookup: target path → template source path
@@ -826,5 +857,63 @@ mod tests {
         let path = PathBuf::from("config.toml");
         let comment = warning_comment(&path).unwrap();
         assert!(comment.contains("config.toml"));
+    }
+
+    // ─── is_os_specific_path_skipped ─────────────────────────────────
+
+    #[test]
+    fn test_os_skip_launchagents_on_linux() {
+        // macOS LaunchAgents path should be skipped on Linux
+        assert!(is_os_specific_path_skipped(
+            "Library/LaunchAgents/com.foo.plist",
+            "linux"
+        ));
+    }
+
+    #[test]
+    fn test_os_skip_launchagents_deployed_on_darwin() {
+        // Same path should NOT be skipped on darwin (macOS)
+        assert!(!is_os_specific_path_skipped(
+            "Library/LaunchAgents/com.foo.plist",
+            "darwin"
+        ));
+    }
+
+    #[test]
+    fn test_os_skip_application_support_on_linux() {
+        assert!(is_os_specific_path_skipped(
+            "Library/Application Support/foo/config",
+            "linux"
+        ));
+        assert!(!is_os_specific_path_skipped(
+            "Library/Application Support/foo/config",
+            "darwin"
+        ));
+    }
+
+    #[test]
+    fn test_os_skip_crossplatform_paths_never_skipped() {
+        // Generic dotfiles should NEVER be skipped — they apply to all OSes
+        assert!(!is_os_specific_path_skipped(".zshenv", "linux"));
+        assert!(!is_os_specific_path_skipped(".zshenv", "darwin"));
+        assert!(!is_os_specific_path_skipped(".cargo/config.toml", "linux"));
+        assert!(!is_os_specific_path_skipped(".cargo/config.toml", "darwin"));
+        assert!(!is_os_specific_path_skipped(
+            ".graphiti/redis.conf",
+            "linux"
+        ));
+    }
+
+    #[test]
+    fn test_os_skip_library_fonts_not_filtered() {
+        // Only LaunchAgents + Application Support are darwin-only.
+        // Library/Fonts might be relevant on Linux (remapped to usr/local/share/fonts
+        // via hemma overlay, but nit itself doesn't deploy fonts that way).
+        // Leave Library/Fonts alone — if someone adds a template there, it'll
+        // deploy everywhere until explicitly filtered.
+        assert!(!is_os_specific_path_skipped(
+            "Library/Fonts/foo.ttf",
+            "linux"
+        ));
     }
 }
