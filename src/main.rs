@@ -1338,15 +1338,16 @@ fn cmd_list(config: &NitConfig) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!("\nSecrets ({} tiers):", config.fleet.secrets.tiers.len());
+    // Determine this machine's age public key from the local identity file.
+    // Used for the actual recipient-membership check below (replaces the old
+    // heuristic that just substring-matched tier name against machine role).
+    let identity_path = config::expand_tilde(&config.local.identity);
+    let my_pubkey = read_identity_pubkey(&identity_path);
     for (name, tier) in &config.fleet.secrets.tiers {
-        let can_decrypt = if config.machine.role.iter().any(|r| {
-            // Simple heuristic: tier name contains role name
-            name.contains(r)
-        }) || name.contains("all")
-        {
-            "\u{2713}"
-        } else {
-            "\u{2717}"
+        let can_decrypt = match &my_pubkey {
+            Some(pk) if tier.recipients.iter().any(|r| r == pk) => "\u{2713}",
+            Some(_) => "\u{2717}",
+            None => "?",
         };
         println!(
             "  {} {} → {} ({} recipients)",
@@ -1356,6 +1357,26 @@ fn cmd_list(config: &NitConfig) -> Result<(), Box<dyn std::error::Error>> {
             tier.recipients.len()
         );
     }
+    if my_pubkey.is_none() {
+        eprintln!(
+            "nit: warning: could not read identity at {} — secret status shows '?'",
+            identity_path.display()
+        );
+    }
 
     Ok(())
+}
+
+/// Extract the age public key from an identity (key.txt) file.
+/// Looks for the `# public key: ageXXX...` comment line that age writes when
+/// generating identities. Returns None if the file is missing or malformed.
+fn read_identity_pubkey(identity_path: &Path) -> Option<String> {
+    let content = std::fs::read_to_string(identity_path).ok()?;
+    for line in content.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("# public key:") {
+            return Some(rest.trim().to_string());
+        }
+    }
+    None
 }
