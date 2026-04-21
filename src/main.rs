@@ -10,6 +10,7 @@ mod encrypt;
 mod git;
 mod permissions;
 mod pick;
+mod sync_status;
 mod syncbase;
 mod template;
 mod trigger;
@@ -998,11 +999,61 @@ fn cmd_commit(message: Option<&str>, config: &NitConfig) -> Result<(), Box<dyn s
 
 fn cmd_update(safe: bool, config: &NitConfig) -> Result<(), Box<dyn std::error::Error>> {
     let strategy = config.git_strategy();
+    let machine_name = config.machine_name.clone();
+
+    // Carry forward last_success_at from prior status so it survives failures.
+    let prior = sync_status::load_status();
+    let prior_success = prior
+        .as_ref()
+        .and_then(|s| s.last_success_at.clone())
+        .or_else(|| {
+            prior.as_ref().and_then(|s| {
+                matches!(s.result, sync_status::SyncResult::Ok).then(|| s.completed_at.clone())
+            })
+        });
+
+    let mut status = sync_status::SyncStatus::new(machine_name.clone());
+    status.last_success_at = prior_success;
+
+    // 0. PRE-PULL DRIFT CHECK — sacred: never clobber local state.
+    // If any tracked file is modified/deleted, ABORT and write status. Untracked
+    // files are fine (gitignored or genuinely new — won't be touched by pull).
+    let porcelain = git::git_output_with(strategy, &["status", "--porcelain"]).unwrap_or_default();
+    let drift = sync_status::detect_pre_pull_drift(&porcelain);
+    if !drift.is_empty() {
+        status.result = sync_status::SyncResult::AbortedDrift;
+        status.drift_files = drift.clone();
+        status.completed_at = chrono::Utc::now().to_rfc3339();
+        sync_status::save_status(&status);
+
+        eprintln!(
+            "nit update: ABORTED — pre-pull drift detected ({} file(s)):",
+            drift.len()
+        );
+        for line in &drift {
+            eprintln!("  {}", line);
+        }
+        eprintln!();
+        eprintln!("Local edits would be at risk if pull merged. Resolve manually:");
+        eprintln!(
+            "  - Discard:  git --git-dir={} --work-tree=$HOME checkout -- <file>",
+            git::bare_git_dir().display()
+        );
+        eprintln!("  - Stage:    nit add <file> && nit commit -m \"...\"");
+        eprintln!("  - Inspect:  nit diff <file>");
+        eprintln!();
+        eprintln!("Status written: ~/.local/share/nit/last-sync.json");
+        return Err("aborted: pre-pull drift detected".into());
+    }
 
     // 1. git pull
     eprintln!("nit: pulling latest...");
     let pull_status = git::exec_git_with(strategy, &["pull"])?;
     if !pull_status.success() {
+        status.result = sync_status::SyncResult::PullFailed;
+        status.errors.push("git pull failed".to_string());
+        status.completed_at = chrono::Utc::now().to_rfc3339();
+        sync_status::save_status(&status);
         return Err("git pull failed".into());
     }
 
@@ -1099,7 +1150,27 @@ fn cmd_update(safe: bool, config: &NitConfig) -> Result<(), Box<dyn std::error::
         }
     }
 
-    // 5. No commit
+    // 5. Write final sync status (no git commit — we're pulling others' changes).
+    status.templates_deployed = deployed_count;
+    status.templates_skipped_drift = skipped_count;
+    for tr in &trigger_results {
+        match &tr.status {
+            trigger::RunStatus::Success => status.triggers_succeeded += 1,
+            trigger::RunStatus::Failed(_) => status.triggers_failed += 1,
+            trigger::RunStatus::Skipped(_) => {}
+        }
+    }
+    status.result = if status.triggers_failed > 0 {
+        sync_status::SyncResult::TriggersFailed
+    } else {
+        sync_status::SyncResult::Ok
+    };
+    status.completed_at = chrono::Utc::now().to_rfc3339();
+    if matches!(status.result, sync_status::SyncResult::Ok) {
+        status.last_success_at = Some(status.completed_at.clone());
+    }
+    sync_status::save_status(&status);
+
     eprintln!(
         "nit update: {} deployed, {} skipped (drift)",
         deployed_count, skipped_count
@@ -1142,6 +1213,11 @@ fn cmd_status(config: &NitConfig) -> Result<(), Box<dyn std::error::Error>> {
         "nit: {} templates ({} drifted), {} triggers | git: {} staged, {} modified, {} untracked",
         template_count, drift_count, trigger_count, staged, modified, untracked
     );
+
+    // Last-sync health summary (from ~/.local/share/nit/last-sync.json).
+    if let Some(last) = sync_status::load_status() {
+        println!("{}", sync_status::one_line_summary(&last));
+    }
 
     Ok(())
 }
