@@ -85,11 +85,13 @@ HEAD_HASH=$(git --git-dir="$NIT_REPO" rev-parse HEAD 2>/dev/null) || { err "bare
 CURRENT_BRANCH=$(git --git-dir="$NIT_REPO" branch --show-current)
 [[ "$CURRENT_BRANCH" == "nit" ]] || { warn "expected branch 'nit', currently on '$CURRENT_BRANCH'"; }
 
-# Move cwd OUTSIDE the bare repo's work tree ($HOME) so git operations
-# don't get implicit pathspec filtering. From inside ~/dotfiles/ cwd,
-# `git ls-tree HEAD` returns 0 entries because it filters to "tree under
-# current subpath" which is empty in the new layout.
-cd /
+# Move cwd to $HOME (the bare repo's work tree root). Two reasons:
+# 1. `git ls-tree HEAD` from a subpath of the work tree (like ~/dotfiles/)
+#    silently returns 0 entries — it filters to "tree under current subpath",
+#    which is empty in the new layout. From $HOME (work tree root) it works.
+# 2. `nit add .claude` (relative path) needs cwd inside the work tree —
+#    from /, git refuses with "/.claude is outside repository".
+cd "$HOME_DIR"
 
 # ─── Mode banner ──────────────────────────────────────────────────────
 if $DRY_RUN; then
@@ -153,10 +155,14 @@ PHASE_B_PATTERNS=(
     "dotfiles/.zshenv"
     "dotfiles/.zshrc"
     ""
-    "# Whitelist non-dot \$HOME paths chezmoi tracked (overrides /[!.]*)"
+    "# SuperWhisper settings whitelist — FINE-GRAINED."
+    "# A blanket \"!Documents/superwhisper/\" un-ignores 13K recordings (44MB)."
+    "# Need to re-ignore superwhisper contents and only allow settings/."
     "!Documents/"
     "Documents/*"
     "!Documents/superwhisper/"
+    "Documents/superwhisper/*"
+    "!Documents/superwhisper/settings/"
 )
 
 if grep -qF "Phase B (chezmoi vestiges)" "$GITIGNORE"; then
