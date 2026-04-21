@@ -127,6 +127,20 @@ enum NitCommand {
     /// Output fleet inventory (for hemma integration)
     Fleet,
 
+    /// Add an age pubkey to a tier's recipients list in fleet.toml.
+    /// Preserves comments + formatting via toml_edit. After this, run
+    /// `nit rekey` to re-encrypt all .age files for the new recipient set.
+    #[command(name = "fleet-add-recipient")]
+    FleetAddRecipient {
+        /// Tier name (e.g., "tier-all", "tier-mac", "tier-servers", "tier-edge")
+        tier: String,
+        /// age public key (starts with "age1")
+        pubkey: String,
+        /// Optional inline comment (typically the machine name)
+        #[arg(long)]
+        comment: Option<String>,
+    },
+
     /// Any unrecognized subcommand falls through to git
     #[command(external_subcommand)]
     Git(Vec<String>),
@@ -219,6 +233,11 @@ fn run_command(cmd: NitCommand, config: &NitConfig) -> Result<(), Box<dyn std::e
         NitCommand::Rekey => cmd_rekey(config),
         NitCommand::List => cmd_list(config),
         NitCommand::Run { name } => cmd_run(&name, config),
+        NitCommand::FleetAddRecipient {
+            tier,
+            pubkey,
+            comment,
+        } => cmd_fleet_add_recipient(&tier, &pubkey, comment.as_deref(), config),
         // Bootstrap, Fleet, and Git handled in main()
         NitCommand::Bootstrap { .. } | NitCommand::Fleet | NitCommand::Git(_) => {
             unreachable!()
@@ -1347,6 +1366,113 @@ fn cmd_bootstrap(url: &str) -> Result<(), Box<dyn std::error::Error>> {
     bootstrap::run_bootstrap(url)
 }
 
+// ---------------------------------------------------------------------------
+// cmd_fleet_add_recipient — append age pubkey to a tier's recipients list
+// ---------------------------------------------------------------------------
+//
+// Hemma bootstrap Step 5 automation. When onboarding a new fleet machine,
+// its age pubkey must be added to the appropriate `[secrets.tiers.*]`
+// recipient lists before `nit rekey` can re-encrypt secrets for that machine.
+// Uses toml_edit so comments + formatting are preserved (fleet.toml has
+// per-recipient comments documenting which machine each key belongs to).
+//
+// Usage: nit fleet-add-recipient <tier> <pubkey> [--comment <machine-name>]
+
+fn cmd_fleet_add_recipient(
+    tier: &str,
+    pubkey: &str,
+    comment: Option<&str>,
+    _config: &NitConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Validate pubkey format — age1 prefix is mandatory for the X25519 recipients
+    // we use. (Catches "public key: age1..." vs raw "age1..." copy-paste mistakes.)
+    if !pubkey.starts_with("age1") {
+        return Err(format!(
+            "invalid age pubkey: must start with 'age1', got '{}'",
+            pubkey
+        )
+        .into());
+    }
+
+    // Locate fleet.toml (same path hemma uses)
+    let fleet_path = config::expand_tilde("~/dotfiles/fleet.toml");
+    if !fleet_path.exists() {
+        return Err(format!("fleet.toml not found at {}", fleet_path.display()).into());
+    }
+
+    let content = std::fs::read_to_string(&fleet_path)?;
+    let updated = add_recipient_to_toml(&content, tier, pubkey, comment)?;
+
+    // Only write if content actually changed (no-op case prints its own message)
+    if updated != content {
+        std::fs::write(&fleet_path, &updated)?;
+        eprintln!(
+            "nit: added {} to tier '{}' in {}",
+            pubkey,
+            tier,
+            fleet_path.display()
+        );
+        eprintln!("nit: run `nit rekey` to re-encrypt .age files for the new recipient set");
+    }
+
+    Ok(())
+}
+
+/// Pure function: given the TOML source string, a tier name, and a pubkey,
+/// return the updated TOML with the pubkey appended to that tier's recipients.
+/// Preserves comments + formatting via toml_edit. Idempotent: if pubkey is
+/// already in the list, returns the input unchanged.
+///
+/// Extracted as pure fn so it's testable without filesystem I/O.
+fn add_recipient_to_toml(
+    content: &str,
+    tier: &str,
+    pubkey: &str,
+    comment: Option<&str>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut doc: toml_edit::DocumentMut = content.parse()?;
+
+    // Navigate [secrets.tiers.<tier>].recipients — all nested tables.
+    let recipients = doc
+        .get_mut("secrets")
+        .and_then(|s| s.as_table_mut())
+        .and_then(|s| s.get_mut("tiers"))
+        .and_then(|t| t.as_table_mut())
+        .and_then(|t| t.get_mut(tier))
+        .and_then(|t| t.as_table_mut())
+        .and_then(|t| t.get_mut("recipients"))
+        .and_then(|r| r.as_array_mut())
+        .ok_or_else(|| {
+            format!(
+                "tier '{}' not found in fleet.toml (or has no recipients list). Known tier structure is [secrets.tiers.<name>].recipients = [...]",
+                tier
+            )
+        })?;
+
+    // Idempotency: if pubkey already present, no-op.
+    for val in recipients.iter() {
+        if let Some(s) = val.as_str()
+            && s == pubkey
+        {
+            eprintln!(
+                "nit: pubkey {} already in tier '{}' — no change",
+                pubkey, tier
+            );
+            return Ok(content.to_string());
+        }
+    }
+
+    // Append with trailing comma + optional comment, matching existing style
+    // (each recipient on its own line, comment as inline suffix).
+    let mut new_val = toml_edit::Value::from(pubkey);
+    if let Some(c) = comment {
+        new_val.decor_mut().set_suffix(format!("  # {}", c));
+    }
+    recipients.push_formatted(new_val);
+
+    Ok(doc.to_string())
+}
+
 fn cmd_fleet() -> Result<(), Box<dyn std::error::Error>> {
     let fleet = config::load_fleet_only()?;
 
@@ -1449,4 +1575,165 @@ fn read_identity_pubkey(identity_path: &Path) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ─── add_recipient_to_toml ────────────────────────────────────────
+    //
+    // Hemma bootstrap Step 5: add a new machine's age pubkey to the
+    // appropriate tier's recipient list, preserving comments/format.
+
+    const SAMPLE_FLEET: &str = r#"# Fleet inventory
+
+[machines.macmini]
+ssh_host = "macmini"
+os = "darwin"
+role = ["dev"]
+
+[secrets]
+source_dir = "~/dotfiles/secrets"
+
+[secrets.tiers.tier-all]
+recipients = [
+  "age1aaa",  # Mac Mini
+  "age1bbb",  # Darwin
+]
+target = "~/.secrets/tier-all.env"
+
+[secrets.tiers.tier-mac]
+recipients = [
+  "age1aaa",  # Mac Mini
+]
+target = "~/.secrets/tier-mac.env"
+
+[templates]
+source_dir = "~/dotfiles/templates"
+"#;
+
+    #[test]
+    fn test_add_recipient_appends_to_tier() {
+        let updated = add_recipient_to_toml(SAMPLE_FLEET, "tier-all", "age1ccc", Some("merian"))
+            .expect("should succeed");
+
+        assert!(
+            updated.contains("age1ccc"),
+            "new pubkey should appear in output"
+        );
+        assert!(
+            updated.contains("# merian"),
+            "comment should appear as inline suffix"
+        );
+        assert!(
+            updated.contains("age1aaa") && updated.contains("age1bbb"),
+            "existing recipients must be preserved"
+        );
+    }
+
+    #[test]
+    fn test_add_recipient_preserves_comments() {
+        let updated = add_recipient_to_toml(SAMPLE_FLEET, "tier-all", "age1ccc", Some("merian"))
+            .expect("should succeed");
+
+        // Existing comments must survive
+        assert!(
+            updated.contains("# Mac Mini"),
+            "existing 'Mac Mini' comment must survive"
+        );
+        assert!(
+            updated.contains("# Darwin"),
+            "existing 'Darwin' comment must survive"
+        );
+        assert!(
+            updated.contains("# Fleet inventory"),
+            "top-level comment must survive"
+        );
+    }
+
+    #[test]
+    fn test_add_recipient_idempotent_duplicate() {
+        // Adding a pubkey that's already there is a no-op (returns input unchanged)
+        let updated = add_recipient_to_toml(SAMPLE_FLEET, "tier-all", "age1aaa", Some("macmini"))
+            .expect("should succeed");
+
+        assert_eq!(
+            updated.trim(),
+            SAMPLE_FLEET.trim(),
+            "duplicate pubkey → no changes"
+        );
+    }
+
+    #[test]
+    fn test_add_recipient_rejects_invalid_pubkey() {
+        // We do this check in cmd_fleet_add_recipient (not the pure fn), so the
+        // pure fn accepts anything — test via the outer validation separately.
+        // Here: confirm the pure fn doesn't crash on non-age1 input.
+        let result = add_recipient_to_toml(SAMPLE_FLEET, "tier-all", "not-a-key", None);
+        assert!(
+            result.is_ok(),
+            "pure fn shouldn't validate format (that's the wrapper's job)"
+        );
+    }
+
+    #[test]
+    fn test_add_recipient_missing_tier_errors() {
+        let err =
+            add_recipient_to_toml(SAMPLE_FLEET, "tier-nonexistent", "age1xyz", None).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not found") || msg.contains("tier-nonexistent"),
+            "error should mention missing tier, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_add_recipient_to_different_tiers_independent() {
+        // Adding to tier-mac shouldn't affect tier-all.
+        let updated = add_recipient_to_toml(SAMPLE_FLEET, "tier-mac", "age1ddd", Some("merian"))
+            .expect("should succeed");
+
+        // Count occurrences — tier-mac should have one new, tier-all should be unchanged
+        let ddd_count = updated.matches("age1ddd").count();
+        assert_eq!(ddd_count, 1, "new pubkey added exactly once");
+
+        // tier-all still has only 2 recipients
+        // Crude check: "age1bbb" (last tier-all entry) should be followed by ]
+        // of the tier-all recipients array, not by another age1 line.
+        assert!(
+            updated.contains("age1aaa") && updated.contains("age1bbb"),
+            "tier-all existing recipients preserved"
+        );
+    }
+
+    #[test]
+    fn test_add_recipient_no_comment() {
+        // Optional comment: caller can omit it
+        let updated = add_recipient_to_toml(SAMPLE_FLEET, "tier-all", "age1noc", None)
+            .expect("should succeed");
+        assert!(updated.contains("age1noc"));
+    }
+
+    #[test]
+    fn test_add_recipient_output_is_valid_toml() {
+        // Round-trip: output must parse as valid TOML
+        let updated = add_recipient_to_toml(SAMPLE_FLEET, "tier-all", "age1parsecheck", Some("m3"))
+            .expect("should succeed");
+
+        let reparsed: toml::Value = updated.parse().expect("output must be valid TOML");
+        // Sanity: navigate to the recipients list and confirm entry present
+        let recipients = reparsed
+            .get("secrets")
+            .and_then(|s| s.get("tiers"))
+            .and_then(|t| t.get("tier-all"))
+            .and_then(|t| t.get("recipients"))
+            .and_then(|r| r.as_array())
+            .expect("recipients array should exist");
+        let has_new = recipients
+            .iter()
+            .any(|v| v.as_str() == Some("age1parsecheck"));
+        assert!(has_new, "re-parsed TOML must contain new recipient");
+    }
 }

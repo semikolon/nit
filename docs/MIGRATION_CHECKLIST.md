@@ -622,7 +622,16 @@ chezmoi init --apply
 - [ ] Narrow fleet.toml tier recipients — key mapping at `docs/age_key_mapping.md` (4/5 confirmed, Shannon repurposed — drop both unconfirmed keys)
 - [ ] Update hemma to use `nit update` (already configured as primary, verify)
 - [ ] Set up publish trigger for public dotfiles repo (`semikolon/dotfiles`)
-- [ ] Fleet migration: install nit on remote machines, run `nit bootstrap`
+- [x] Fleet migration: install nit on remote machines, run `nit bootstrap`
+  - [x] MERIAN migrated (Apr 21, 2026): `cargo install --git ... --root ~/.local`, `nit bootstrap git@github.com:semikolon/dotfiles.git`, 12 templates rendered, 5 triggers fired cleanly on first pass, additional 7 after script-hash auto-watch fix
+  - [x] Darwin migrated (Apr 21, 2026): same procedure, sccache 0.14.0 installed, sluss build succeeded after cargo-config template deployment, all services preserved through bootstrap (kamal-proxy, brf-auto, FalkorDB, Redis, Temporal, ntfy)
+  - [ ] Turing — deferred (unplugged weeks; when plugged in: reactivation per dotfiles/TODO.md § Phase 1.6)
+  - [ ] Shannon — deferred (cold spare; when powered up: same procedure + add age pubkey to fleet.toml tier-edge recipients, then `nit rekey`)
+  - Fleet rollout surfaced 4 additional nit bugs (all fixed + pushed): Tera leftovers in 15 trigger scripts, no-watch trigger script-hash auto-watch, bootstrap upstream tracking + merge mode, LaunchAgent PATH-based nit binary. Full lesson list: `~/dotfiles/docs/DOTFILES_STRATEGY.md` § "Fleet rollout lessons (Apr 21, 2026)".
+  - chezmoi binary uninstalled fleet-wide (Mac Mini brew, MERIAN direct, Darwin direct). chezmoi-* wrapper scripts untracked via nit. `~/.local/share/chezmoi/` + `~/.config/chezmoi/` purged.
+  - Nightly sync wired: macOS LaunchAgent template at `dotfiles/templates/Library/LaunchAgents/com.fredrikbranstrom.nit-update.plist.tmpl` + Linux cron via `dotfiles/scripts/linux/22-setup-nit-update.sh`. Both run `exec nit update` at 03:00 daily with PATH-based binary resolution.
+  - hemma migrated to nit-aware paths (update/status/apply/apply-all/bootstrap recipes). `hemma status` reads per-machine `last-sync.json` via SSH.
+  - **Sacred drift-safety principle shipped** (new AC-9.6 + AC-9.7): `nit update` aborts on work-tree drift + writes `last-sync.json`. Design detail: `dotfiles/.claude/specs/nit/design.md` § "Plain-file drift: abort-and-notify".
 - [ ] Remove `chezmoi-final` tag when fully confident (optional — costs nothing to keep)
 - [ ] Evaluate CI runners for nit release builds — Blacksmith (Linux, 3K free min/mo) + GetMac (macOS M4) for cross-compiling fleet binaries. Research: `dotfiles/docs/ci_runner_alternatives_2026_03.md`
 - [ ] **Forward-only sync semantics for append-only runtime data** (Apr 20, 2026): chezmoi's source-wins-on-apply is the wrong model for files primarily *written* by runtime processes rather than *edited* by humans. Today this works only because `chezmoi-auto-apply` is disabled — a stray `chezmoi apply --force <target>` silently overwrites newer runtime state with the older source snapshot, losing content between the last `re-add` and now. Affected files include:
