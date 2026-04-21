@@ -24,7 +24,10 @@ use std::process::ExitCode;
 #[command(
     name = "nit",
     about = "AI-era dotfiles manager — git's rivet",
-    version,
+    // Include git SHA from build.rs so `nit --version` shows the installed
+    // commit. The rebuild-nit trigger parses this output to decide whether
+    // to rebuild against the SHA pinned in `dotfiles/.nit-version`.
+    version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("NIT_GIT_SHA"), ")"),
     // Don't error on unknown subcommands — they fall through to git
     allow_external_subcommands = true,
 )]
