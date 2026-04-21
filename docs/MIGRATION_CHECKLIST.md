@@ -825,3 +825,65 @@ chezmoi init --apply
   os = "darwin"  # only needed where Claude Code runs
   ```
   The wrapper script just runs `python3 ~/.claude/hooks/build_ontology.py`. The script is safe to run repeatedly — idempotent, ~150ms, refreshes both `ontology.json` and `entity_types_fallback.json`. Context + design rationale: `dotfiles/docs/household_cognitive_infrastructure_plan_2026_04_20.md` § "Actions — landed today" (entity-type additions) and the follow-up note about manual rebuild.
+
+## Fleet nit rollout mechanism (shipped Apr 21, 2026)
+
+Post-migration open loop: *how does a new nit version reach fleet machines?* Previously manual `cargo install --git ... --root ~/.local` per machine, creating silent version drift. Shipped solution (Apr 21) uses nit's own primitives to solve this.
+
+**Architecture**:
+
+1. **`build.rs`** (in nit) bakes the git SHA into the binary via `NIT_GIT_SHA` env var. Clap's `version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("NIT_GIT_SHA"), ")")` exposes it. `nit --version` → `nit 0.1.0 (f5d69554e8d9d21f091cd78b82e58ccbd41e10c5)`. Falls back to "unknown" when built outside a git checkout (crates.io packaging, tarball builds).
+
+2. **`dotfiles/.nit-version`** (plain file, `$HOME/dotfiles/.nit-version`, nit-tracked): contains the SHA the fleet should run. Comments allowed (first non-blank, non-comment line wins). Git log on this file is the release history.
+
+3. **`dotfiles/scripts/rebuild-nit.sh`** (cross-OS trigger script): reads `.nit-version`, parses installed `nit --version`, compares. If match → skip. If differ (or installed SHA is "unknown") → `cargo install --git https://github.com/semikolon/nit --rev <sha> --root ~/.local --force`. Graceful fallback: skip if cargo missing or `.nit-version` missing.
+
+4. **`triggers.toml`** entry (first in the file so it runs first in the trigger pass):
+
+   ```toml
+   [[trigger]]
+   name = "rebuild-nit"
+   script = "scripts/rebuild-nit.sh"
+   watch = ["dotfiles/.nit-version"]
+   ```
+
+   No OS or role filter — any machine with nit (all of them) and cargo (all dev + router machines) runs it. Non-cargo machines exit 0 gracefully.
+
+**Release flow**:
+
+```
+# 1. Push the new nit commit
+cd ~/Projects/nit && git push origin master
+
+# 2. Bump the fleet pin
+cd ~/dotfiles
+echo "# comment" > .nit-version
+git -C ~/Projects/nit rev-parse HEAD >> .nit-version  # or a specific SHA
+nit add dotfiles/.nit-version
+nit commit -m "release: nit @<short-sha>"
+
+# 3. Each fleet machine catches up on its next `nit update`:
+#    - pull picks up the new .nit-version
+#    - rebuild-nit trigger fires (watched file hash changed)
+#    - cargo install --force brings the binary to the pinned SHA
+#    - NEXT `nit update` uses the new binary
+```
+
+**Sacred drift-safety compliance**:
+
+- nit never silently replaces itself. The `.nit-version` bump is an explicit, reviewable commit — same contract as any other dotfile change.
+- If `cargo install` fails (network, compile, dep conflict), the trigger reports failure via nit's standard `TriggerRunResult::Failed` path. `nit status` / `hemma status` surface it. State is NOT updated on failure, so the retry happens on next cycle.
+- The CURRENT `nit update` cycle continues using the binary it was invoked with. The rebuilt binary takes effect on the NEXT invocation. No mid-execution binary swap.
+
+**Rejected alternatives**:
+
+- **Silent auto-update on every `nit update`** — fails sacred drift-safety. A buggy nit could brick all fleet machines simultaneously; recovery would require SSHing into each and running manual cargo install. The `.nit-version` bump gate makes the user's release action explicit and reversible (`git revert`).
+- **Notify-only** (show a version-drift warning, no install) — leaves actual upgrade manual per-machine. Loses the automation benefit that was the motivating concern.
+- **Semver tags on nit** — extra process (tag management, release branches) without corresponding benefit for a personal fleet. SHA pinning works fine.
+
+**What ships**:
+
+- `nit` commit `f5d6955` (build.rs + SHA-embedded version string)
+- `dotfiles` (`.nit-version` file, `scripts/rebuild-nit.sh`, trigger entry, doc updates)
+- Initial `.nit-version` pin: `f5d69554e8d9d21f091cd78b82e58ccbd41e10c5`
+- Live-verified on Mac Mini: rebuild-nit trigger fired, detected match with pin, skipped. Subsequent `nit apply` confirmed idempotent (trigger shows as Unchanged, no re-fire).
