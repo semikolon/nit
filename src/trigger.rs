@@ -250,6 +250,18 @@ pub fn run_trigger(
 
 // ─── Orchestration ──────────────────────────────────────────────────
 
+/// Prune trigger_hashes entries whose names are no longer in triggers.toml.
+///
+/// Called at the start of each apply cycle so state.json stays in sync with
+/// the current trigger set. Without pruning, removed/renamed triggers leave
+/// dead keys that accumulate over time and muddy state-file diffs.
+pub fn prune_stale_trigger_state(state: &mut TriggerState, current_names: &[&str]) {
+    let current: std::collections::HashSet<&str> = current_names.iter().copied().collect();
+    state
+        .trigger_hashes
+        .retain(|name, _| current.contains(name.as_str()));
+}
+
 /// Run all applicable triggers that have changed watched files.
 /// - skip_drifted: list of relative paths that are drifted — skip triggers watching these
 /// - safe_mode: if true, skip all triggers (dry-run)
@@ -262,6 +274,13 @@ pub fn run_applicable_triggers(
 ) -> Vec<TriggerRunResult> {
     let work_tree = dirs::home_dir().expect("cannot determine home directory");
     let mut results = Vec::new();
+
+    // Prune state entries for triggers that no longer exist in triggers.toml.
+    // Keeps state.json in sync with current config; prevents dead-key accumulation.
+    // Scope: ALL triggers (not just applicable — a Linux trigger removed while
+    // running on macOS should still get pruned from state).
+    let all_names: Vec<&str> = config.triggers.iter().map(|t| t.name.as_str()).collect();
+    prune_stale_trigger_state(state, &all_names);
 
     for trigger in config.applicable_triggers() {
         // Check if any watched file is in the drifted list
@@ -384,6 +403,55 @@ mod tests {
     fn test_hash_file_missing() {
         let result = hash_file(Path::new("/nonexistent/file.txt"));
         assert!(result.is_err());
+    }
+
+    // ─── prune_stale_trigger_state: drops removed-trigger entries ───
+
+    #[test]
+    fn test_prune_stale_trigger_state_removes_absent_names() {
+        let mut state = TriggerState::default();
+        let mut keep = HashMap::new();
+        keep.insert("__script__".to_string(), "abc123".to_string());
+        let mut stale = HashMap::new();
+        stale.insert("__script__".to_string(), "def456".to_string());
+        state
+            .trigger_hashes
+            .insert("still-here".to_string(), keep.clone());
+        state
+            .trigger_hashes
+            .insert("removed-in-v2".to_string(), stale);
+
+        prune_stale_trigger_state(&mut state, &["still-here"]);
+
+        assert_eq!(state.trigger_hashes.len(), 1);
+        assert!(state.trigger_hashes.contains_key("still-here"));
+        assert!(!state.trigger_hashes.contains_key("removed-in-v2"));
+        // Kept entry's hashes are untouched
+        assert_eq!(state.trigger_hashes["still-here"], keep);
+    }
+
+    #[test]
+    fn test_prune_stale_trigger_state_empty_config_drops_all() {
+        let mut state = TriggerState::default();
+        state.trigger_hashes.insert("a".to_string(), HashMap::new());
+        state.trigger_hashes.insert("b".to_string(), HashMap::new());
+
+        prune_stale_trigger_state(&mut state, &[]);
+
+        assert!(state.trigger_hashes.is_empty());
+    }
+
+    #[test]
+    fn test_prune_stale_trigger_state_no_change_when_all_current() {
+        let mut state = TriggerState::default();
+        state.trigger_hashes.insert("a".to_string(), HashMap::new());
+        state.trigger_hashes.insert("b".to_string(), HashMap::new());
+
+        prune_stale_trigger_state(&mut state, &["a", "b", "c"]);
+
+        assert_eq!(state.trigger_hashes.len(), 2);
+        assert!(state.trigger_hashes.contains_key("a"));
+        assert!(state.trigger_hashes.contains_key("b"));
     }
 
     // ─── check_trigger: changed detection ───────────────────────────
