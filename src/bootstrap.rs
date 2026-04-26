@@ -9,12 +9,37 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
 
+/// Normalize a GitHub clone URL to SSH form.
+///
+/// HTTPS GitHub URLs fail non-interactive auth (cron, launchd, no credential
+/// helper) for private repos. SSH is the fleet convention. This helper rewrites
+/// `https://github.com/USER/REPO[.git]` → `git@github.com:USER/REPO[.git]`.
+/// Non-GitHub URLs and already-SSH URLs are returned unchanged.
+pub fn normalize_remote_url(url: &str) -> String {
+    if let Some(rest) = url.strip_prefix("https://github.com/") {
+        format!("git@github.com:{}", rest)
+    } else {
+        url.to_string()
+    }
+}
+
 /// Run the bootstrap process
 pub fn run_bootstrap(url: &str) -> Result<(), Box<dyn std::error::Error>> {
     let home = dirs::home_dir().expect("cannot determine home directory");
     let git_dir = git::bare_git_dir();
     let config_dir = expand_tilde("~/.config/nit");
     let local_toml_path = config_dir.join("local.toml");
+
+    // Normalize HTTPS GitHub URLs to SSH (fleet convention — HTTPS auth fails
+    // non-interactively for private repos)
+    let normalized_url = normalize_remote_url(url);
+    if normalized_url != url {
+        eprintln!(
+            "nit: normalized clone URL → {} (SSH preferred for non-interactive auth)",
+            normalized_url
+        );
+    }
+    let url = normalized_url.as_str();
 
     // Step 1: Clone as bare repo (or skip if already exists)
     if git_dir.exists() {
@@ -462,5 +487,57 @@ source_dir = "~/dotfiles/templates"
         let pk1 = c1.lines().find(|l| l.starts_with("# public key:")).unwrap();
         let pk2 = c2.lines().find(|l| l.starts_with("# public key:")).unwrap();
         assert_ne!(pk1, pk2, "two generated keys must have different pubkeys");
+    }
+
+    // ─── normalize_remote_url ──────────────────────────────────────
+
+    #[test]
+    fn https_github_with_dot_git_converted_to_ssh() {
+        assert_eq!(
+            normalize_remote_url("https://github.com/semikolon/dotfiles.git"),
+            "git@github.com:semikolon/dotfiles.git"
+        );
+    }
+
+    #[test]
+    fn https_github_without_dot_git_converted_to_ssh() {
+        assert_eq!(
+            normalize_remote_url("https://github.com/semikolon/dotfiles"),
+            "git@github.com:semikolon/dotfiles"
+        );
+    }
+
+    #[test]
+    fn https_github_subdir_path_preserved() {
+        // The user/repo path is preserved verbatim — multiple slashes pass through
+        assert_eq!(
+            normalize_remote_url("https://github.com/org/sub/repo.git"),
+            "git@github.com:org/sub/repo.git"
+        );
+    }
+
+    #[test]
+    fn ssh_github_unchanged() {
+        let ssh = "git@github.com:semikolon/dotfiles.git";
+        assert_eq!(normalize_remote_url(ssh), ssh);
+    }
+
+    #[test]
+    fn https_gitlab_unchanged() {
+        // Conservative: only github.com is normalized; other hosts left alone
+        let url = "https://gitlab.com/example/repo.git";
+        assert_eq!(normalize_remote_url(url), url);
+    }
+
+    #[test]
+    fn https_self_hosted_github_unchanged() {
+        // Enterprise/self-hosted GitHub gets a different prefix → not converted
+        let url = "https://github.example.com/org/repo.git";
+        assert_eq!(normalize_remote_url(url), url);
+    }
+
+    #[test]
+    fn empty_url_unchanged() {
+        assert_eq!(normalize_remote_url(""), "");
     }
 }
