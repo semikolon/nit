@@ -135,6 +135,27 @@ enum NitCommand {
         args: Vec<String>,
     },
 
+    /// Move / rename tracked files (passthrough to `git mv`).
+    Mv {
+        /// Args passed through to `git mv` (e.g. `old/path new/path`)
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// Remove tracked files (passthrough to `git rm`).
+    Rm {
+        /// Args passed through to `git rm` (e.g. `--cached file`, `-rf dir`)
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// Show a specific commit / object (passthrough to `git show`).
+    Show {
+        /// Args passed through to `git show` (e.g. `HEAD`, `<commit-sha>`, `--stat HEAD`)
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
     /// Clone bare repo + configure + initial deploy
     Bootstrap {
         /// Repository URL to clone
@@ -277,6 +298,9 @@ fn run_command(cmd: NitCommand, config: &NitConfig) -> Result<(), Box<dyn std::e
         NitCommand::Push { args } => cmd_passthrough("push", &args, config),
         NitCommand::Log { args } => cmd_passthrough("log", &args, config),
         NitCommand::Diff { args } => cmd_passthrough("diff", &args, config),
+        NitCommand::Mv { args } => cmd_passthrough("mv", &args, config),
+        NitCommand::Rm { args } => cmd_passthrough("rm", &args, config),
+        NitCommand::Show { args } => cmd_passthrough("show", &args, config),
         NitCommand::Encrypt { file } => cmd_encrypt(&file, config),
         NitCommand::Decrypt { file } => cmd_decrypt(&file, config),
         NitCommand::Rekey => cmd_rekey(config),
