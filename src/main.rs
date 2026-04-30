@@ -95,7 +95,14 @@ enum NitCommand {
     },
 
     /// One-line summary: template drift, triggers, git status
-    Status,
+    Status {
+        /// Also list untracked files (heavy scan — bare repo defaults to
+        /// status.showuntrackedfiles=no because $HOME-as-work-tree would
+        /// produce thousands of paths). Useful when you want to know what's
+        /// stage-able beyond already-tracked files.
+        #[arg(long)]
+        show_untracked: bool,
+    },
 
     /// Clone bare repo + configure + initial deploy
     Bootstrap {
@@ -207,7 +214,9 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            match cmd_status(&config) {
+            // Default-no-args path uses the lightweight summary (matches
+            // pre-flag behavior — `nit` alone stays terse and fast).
+            match cmd_status(&config, false) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("nit: {e}");
@@ -230,7 +239,7 @@ fn run_command(cmd: NitCommand, config: &NitConfig) -> Result<(), Box<dyn std::e
         } => cmd_pick(file.as_deref(), dismiss, diff, edit, config),
         NitCommand::Commit { message } => cmd_commit(message.as_deref(), config),
         NitCommand::Update { safe } => cmd_update(safe, config),
-        NitCommand::Status => cmd_status(config),
+        NitCommand::Status { show_untracked } => cmd_status(config, show_untracked),
         NitCommand::Encrypt { file } => cmd_encrypt(&file, config),
         NitCommand::Decrypt { file } => cmd_decrypt(&file, config),
         NitCommand::Rekey => cmd_rekey(config),
@@ -254,6 +263,29 @@ fn run_command(cmd: NitCommand, config: &NitConfig) -> Result<(), Box<dyn std::e
 
 /// Resolve a path string to an absolute PathBuf
 fn resolve_path(path_str: &str) -> PathBuf {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
+    resolve_path_with(path_str, &cwd, &home)
+}
+
+/// Path-resolution core, parameterized for testing.
+///
+/// nit's git work-tree IS `$HOME`, so a relative path that the user types may
+/// be intended either cwd-relative (the default git/CLI convention) or
+/// `$HOME`-relative (the work-tree convention). Pure cwd-relative resolution
+/// breaks the common workflow of running `nit add .claude/CLAUDE.md` from a
+/// subdirectory like `~/dotfiles` (cwd-relative would resolve to the
+/// nonexistent `~/dotfiles/.claude/CLAUDE.md`).
+///
+/// Resolution order:
+///   1. Tilde-expansion (`~/foo`) — explicit home-relative
+///   2. Absolute path — passthrough
+///   3. Relative + cwd-relative form exists on disk — prefer cwd
+///   4. Relative + cwd-relative missing + `$HOME`-relative form exists — fall
+///      back to `$HOME`-relative (rescues the common subdir workflow)
+///   5. Relative + neither exists — return cwd-relative form so any
+///      downstream "no such file" error is contextual to the user's invocation
+fn resolve_path_with(path_str: &str, cwd: &Path, home: &Path) -> PathBuf {
     let path = Path::new(path_str);
 
     // Handle tilde
@@ -261,14 +293,22 @@ fn resolve_path(path_str: &str) -> PathBuf {
         return config::expand_tilde(path_str);
     }
 
-    // Handle relative paths
-    if path.is_relative()
-        && let Ok(cwd) = std::env::current_dir()
-    {
-        return cwd.join(path);
+    // Absolute path: passthrough
+    if path.is_absolute() {
+        return path.to_path_buf();
     }
 
-    path.to_path_buf()
+    // Relative: try cwd first, fall back to $HOME if cwd-form doesn't exist.
+    let cwd_relative = cwd.join(path);
+    if cwd_relative.exists() {
+        return cwd_relative;
+    }
+    let home_relative = home.join(path);
+    if home_relative.exists() {
+        return home_relative;
+    }
+    // Neither exists — return cwd-relative form for contextual error message.
+    cwd_relative
 }
 
 /// Compute the relative target path (strip $HOME prefix) used as key in sync-base/acks.
@@ -1205,7 +1245,10 @@ fn cmd_update(safe: bool, config: &NitConfig) -> Result<(), Box<dyn std::error::
 // cmd_status — One-line summary with drift count
 // ---------------------------------------------------------------------------
 
-fn cmd_status(config: &NitConfig) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_status(
+    config: &NitConfig,
+    show_untracked: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let strategy = config.git_strategy();
 
     // Template drift count
@@ -1213,8 +1256,25 @@ fn cmd_status(config: &NitConfig) -> Result<(), Box<dyn std::error::Error>> {
     let template_count = mappings.len();
     let drift_count = syncbase::list_drifted_files().len();
 
-    // Git status summary
-    let git_status = git::git_output_with(strategy, &["status", "--porcelain"]).unwrap_or_default();
+    // Git status summary.
+    //
+    // Bare repo has `status.showuntrackedfiles=no` set by bootstrap (intentional —
+    // `$HOME`-as-work-tree would otherwise spew thousands of "untracked" paths from
+    // unrelated home subdirectories). When --show-untracked is passed we override
+    // for THIS invocation only via `-c status.showUntrackedFiles=normal` + the
+    // `--untracked-files=normal` flag on the porcelain call, which together force
+    // git to enumerate untracked entries respecting `.gitignore` / `info/exclude`.
+    let mut args: Vec<&str> = Vec::new();
+    if show_untracked {
+        args.push("-c");
+        args.push("status.showUntrackedFiles=normal");
+    }
+    args.push("status");
+    args.push("--porcelain");
+    if show_untracked {
+        args.push("--untracked-files=normal");
+    }
+    let git_status = git::git_output_with(strategy, &args).unwrap_or_default();
     let modified = git_status
         .lines()
         .filter(|l| l.starts_with(" M") || l.starts_with("M "))
@@ -1239,6 +1299,19 @@ fn cmd_status(config: &NitConfig) -> Result<(), Box<dyn std::error::Error>> {
     // Last-sync health summary (from ~/.local/share/nit/last-sync.json).
     if let Some(last) = sync_status::load_status() {
         println!("{}", sync_status::one_line_summary(&last));
+    }
+
+    // Heavy-scan detail: print the untracked paths so the user knows what's
+    // stage-able. Hint to `nit add <path>` so the next step is obvious.
+    if show_untracked && untracked > 0 {
+        println!();
+        println!("Untracked (run `nit add <path>` to track):");
+        for line in git_status.lines().filter(|l| l.starts_with("??")) {
+            // Porcelain `?? <path>` — slice off the "?? " prefix.
+            if let Some(rest) = line.strip_prefix("?? ") {
+                println!("  {}", rest);
+            }
+        }
     }
 
     Ok(())
@@ -1738,5 +1811,96 @@ source_dir = "~/dotfiles/templates"
             .iter()
             .any(|v| v.as_str() == Some("age1parsecheck"));
         assert!(has_new, "re-parsed TOML must contain new recipient");
+    }
+
+    // ─── resolve_path_with ──────────────────────────────────────────────
+    //
+    // nit's work-tree is $HOME. Relative paths that the user types from a
+    // subdirectory (e.g., `nit add .claude/CLAUDE.md` from ~/dotfiles) should
+    // fall back to $HOME-relative resolution if the cwd-relative form doesn't
+    // exist. Tests use tempfile::tempdir() to isolate cwd + home so they
+    // don't depend on real filesystem state.
+
+    #[test]
+    fn test_resolve_path_absolute_passthrough() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().join("cwd");
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+
+        let result = resolve_path_with("/etc/passwd", &cwd, &home);
+        assert_eq!(result, PathBuf::from("/etc/passwd"));
+    }
+
+    #[test]
+    fn test_resolve_path_cwd_relative_existing_prefers_cwd() {
+        // When the cwd-relative form exists, use it (don't surprise-jump to home).
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().join("Projects/foo");
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        // Create file in BOTH locations to make sure cwd is preferred.
+        std::fs::write(cwd.join("bar.txt"), b"cwd").unwrap();
+        std::fs::write(home.join("bar.txt"), b"home").unwrap();
+
+        let result = resolve_path_with("bar.txt", &cwd, &home);
+        assert_eq!(
+            result,
+            cwd.join("bar.txt"),
+            "cwd-relative existing must take precedence over home-relative"
+        );
+    }
+
+    #[test]
+    fn test_resolve_path_falls_back_to_home_when_cwd_missing() {
+        // The bug-fix case: from ~/dotfiles, `nit add .claude/CLAUDE.md`
+        // should resolve to ~/.claude/CLAUDE.md (not ~/dotfiles/.claude/CLAUDE.md).
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().join("dotfiles");
+        let home = tmp.path().to_path_buf();
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        std::fs::write(home.join(".claude/CLAUDE.md"), b"").unwrap();
+
+        let result = resolve_path_with(".claude/CLAUDE.md", &cwd, &home);
+        assert_eq!(
+            result,
+            home.join(".claude/CLAUDE.md"),
+            "must fall back to home-relative when cwd-relative is missing"
+        );
+    }
+
+    #[test]
+    fn test_resolve_path_returns_cwd_form_when_neither_exists() {
+        // When the user typos a path, the error should be contextual to the
+        // invocation (cwd-relative form), not jumped to a home path the user
+        // never thought of.
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().join("cwd");
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+
+        let result = resolve_path_with("nonexistent.txt", &cwd, &home);
+        assert_eq!(
+            result,
+            cwd.join("nonexistent.txt"),
+            "missing-everywhere must return cwd-relative for contextual error"
+        );
+    }
+
+    #[test]
+    fn test_resolve_path_dotted_subdir_from_home_works() {
+        // Sanity: when running from $HOME itself, cwd-relative === home-relative,
+        // both work, cwd-form wins.
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_path_buf();
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        std::fs::write(home.join(".claude/CLAUDE.md"), b"").unwrap();
+
+        let result = resolve_path_with(".claude/CLAUDE.md", &home, &home);
+        assert_eq!(result, home.join(".claude/CLAUDE.md"));
     }
 }
