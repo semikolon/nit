@@ -2,7 +2,7 @@
 
 **Status**: TENTATIVE — needs human review before any action.
 **Scope**: nit has NO dedicated CC session dir (project work happens from dotfiles sessions). Searched dotfiles sessions for nit-specific work since 2026-01-29.
-**Cross-references**: `~/dotfiles/docs/cc_session_audit_master_2026_04_29.md` (cross-project synthesis); `~/Projects/nit/docs/MIGRATION_CHECKLIST.md` (operational); `~/dotfiles/.claude/specs/nit/{requirements,design,tasks}.md` (canonical spec).
+**Cross-references**: `~/dotfiles/docs/reflections/2026-04-29-audit-master.md` (cross-project synthesis); `~/Projects/nit/docs/MIGRATION_CHECKLIST.md` (operational); `~/dotfiles/.claude/specs/nit/{requirements,design,tasks}.md` (canonical spec).
 
 ## Hanging sessions
 
