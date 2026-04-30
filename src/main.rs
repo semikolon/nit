@@ -102,6 +102,37 @@ enum NitCommand {
         /// stage-able beyond already-tracked files.
         #[arg(long)]
         show_untracked: bool,
+
+        /// Show staged + modified file paths after the summary line (paths
+        /// only; untracked is gated separately by --show-untracked because
+        /// it requires a heavy scan). Without this flag, status stays the
+        /// terse summary that hemma's status aggregator depends on.
+        #[arg(short, long)]
+        verbose: bool,
+    },
+
+    /// Push to remote (passthrough — saves typing
+    /// `git --git-dir=$HOME/.local/share/nit/repo.git --work-tree=$HOME push`,
+    /// the classic escape-hatch signature flagged by the global
+    /// "Aesthetic-as-decision" directive).
+    Push {
+        /// Args passed through to `git push` (e.g. `--force-with-lease`, `origin master`)
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// Log (passthrough to `git log` against the nit-managed bare repo).
+    Log {
+        /// Args passed through to `git log` (e.g. `--oneline -10`, `master..HEAD`)
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// Diff (passthrough to `git diff` against the nit-managed bare repo).
+    Diff {
+        /// Args passed through to `git diff` (e.g. `--stat`, `HEAD~1`, `--cached`)
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
     },
 
     /// Clone bare repo + configure + initial deploy
@@ -216,7 +247,7 @@ fn main() -> ExitCode {
             };
             // Default-no-args path uses the lightweight summary (matches
             // pre-flag behavior — `nit` alone stays terse and fast).
-            match cmd_status(&config, false) {
+            match cmd_status(&config, false, false) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("nit: {e}");
@@ -239,7 +270,13 @@ fn run_command(cmd: NitCommand, config: &NitConfig) -> Result<(), Box<dyn std::e
         } => cmd_pick(file.as_deref(), dismiss, diff, edit, config),
         NitCommand::Commit { message } => cmd_commit(message.as_deref(), config),
         NitCommand::Update { safe } => cmd_update(safe, config),
-        NitCommand::Status { show_untracked } => cmd_status(config, show_untracked),
+        NitCommand::Status {
+            show_untracked,
+            verbose,
+        } => cmd_status(config, show_untracked, verbose),
+        NitCommand::Push { args } => cmd_passthrough("push", &args, &config),
+        NitCommand::Log { args } => cmd_passthrough("log", &args, &config),
+        NitCommand::Diff { args } => cmd_passthrough("diff", &args, &config),
         NitCommand::Encrypt { file } => cmd_encrypt(&file, config),
         NitCommand::Decrypt { file } => cmd_decrypt(&file, config),
         NitCommand::Rekey => cmd_rekey(config),
@@ -1248,6 +1285,7 @@ fn cmd_update(safe: bool, config: &NitConfig) -> Result<(), Box<dyn std::error::
 fn cmd_status(
     config: &NitConfig,
     show_untracked: bool,
+    verbose: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let strategy = config.git_strategy();
 
@@ -1301,6 +1339,44 @@ fn cmd_status(
         println!("{}", sync_status::one_line_summary(&last));
     }
 
+    // Verbose: list staged + modified paths after the summary. Untracked is
+    // gated separately by --show-untracked because it requires the heavy
+    // scan override; -v alone keeps the call fast.
+    if verbose {
+        // Anything not a space and not a `?` in the first column is staged
+        // (porcelain v1: M /A /D /R /C / first chars). Print the porcelain
+        // line so the prefix is visible — matches what users expect from
+        // having reached for `git status --short` in the past.
+        let staged_lines: Vec<&str> = git_status
+            .lines()
+            .filter(|l| {
+                let first = l.chars().next().unwrap_or(' ');
+                first != ' ' && first != '?'
+            })
+            .collect();
+        if !staged_lines.is_empty() {
+            println!();
+            println!("Staged:");
+            for line in &staged_lines {
+                println!("  {}", line);
+            }
+        }
+
+        // Unstaged-modified: second column is M / D / etc., first column is space.
+        let modified_lines: Vec<&str> = git_status
+            .lines()
+            .filter(|l| l.starts_with(" "))
+            .filter(|l| !l.starts_with("  ") && !l.starts_with("??"))
+            .collect();
+        if !modified_lines.is_empty() {
+            println!();
+            println!("Modified (run `nit add <path>` to stage):");
+            for line in &modified_lines {
+                println!("  {}", line);
+            }
+        }
+    }
+
     // Heavy-scan detail: print the untracked paths so the user knows what's
     // stage-able. Hint to `nit add <path>` so the next step is obvious.
     if show_untracked && untracked > 0 {
@@ -1314,6 +1390,34 @@ fn cmd_status(
         }
     }
 
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// cmd_passthrough — Generic pass-through for git subcommands without nit equivalents
+// ---------------------------------------------------------------------------
+//
+// Why this exists: nit wraps a bare git repo at ~/.local/share/nit/repo.git
+// with $HOME as work-tree. Any raw `git <cmd>` against this repo requires
+// `--git-dir=$HOME/.local/share/nit/repo.git --work-tree=$HOME` — a long
+// flag pair that the global "Aesthetic-as-decision" directive flags as a
+// classic escape-hatch signature. Every absent subcommand becomes friction
+// that pushes users (and AI agents) toward the raw-git escape hatch.
+//
+// This helper takes a git subcommand name + trailing args and runs it via
+// the strategy-aware exec wrapper, with stdout/stderr streaming to the
+// terminal so pagers (for log/diff) and remote prompts (for push) work
+// naturally.
+
+fn cmd_passthrough(
+    subcmd: &str,
+    args: &[String],
+    config: &NitConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let strategy = config.git_strategy();
+    let mut all_args: Vec<&str> = vec![subcmd];
+    all_args.extend(args.iter().map(|s| s.as_str()));
+    git::exec_git_with(strategy, &all_args)?;
     Ok(())
 }
 
