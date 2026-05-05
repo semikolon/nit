@@ -21,6 +21,37 @@ pub enum DeployStatus {
     Deployed,
     Skipped(String),
     Error(String),
+    /// Target file diverges from source-decrypt — almost always means the user
+    /// vim-edited the target and forgot `nit encrypt`. Apply was aborted to
+    /// prevent silent overwrite of unflushed manual edits.
+    /// See: `~/.claude/CLAUDE.md` § "Secrets editing — `nit encrypt` is part of
+    /// the same edit, not a follow-up step" (May 4, 2026 MANDATORY directive).
+    DriftDetected {
+        target_bytes: usize,
+        source_bytes: usize,
+    },
+}
+
+/// Check whether deploying the source-decrypt would clobber a target with
+/// unflushed manual edits. Returns Some if the target file exists AND its
+/// content differs from `plaintext`. Returns None if no drift (target is
+/// missing OR contents already match — the deploy is safe / is a no-op).
+///
+/// Note: we don't use mtime as a signal — both vim-edits-without-encrypt
+/// AND legitimate forward deploys (post-pull, post-rekey) can produce
+/// "source-decrypt != target". The user must resolve the ambiguity.
+fn check_target_drift(plaintext: &[u8], target_path: &Path) -> Option<(usize, usize)> {
+    if !target_path.exists() {
+        return None;
+    }
+    let target_content = match fs::read(target_path) {
+        Ok(c) => c,
+        Err(_) => return None,
+    };
+    if target_content == plaintext {
+        return None;
+    }
+    Some((target_content.len(), plaintext.len()))
 }
 
 /// Encrypt a plaintext file to one or more age recipients, writing to output_path.
@@ -186,7 +217,14 @@ pub fn rekey_file(
 /// Deploy secrets from the configured secrets directory to their target paths.
 /// For each tier, checks if this machine's public key is among the recipients.
 /// Returns results for each tier.
-pub fn deploy_secrets(config: &NitConfig) -> Result<Vec<SecretResult>, Box<dyn std::error::Error>> {
+///
+/// `force_drift_override = true` skips the drift-check that protects against
+/// silent overwrites of unflushed manual edits. Use only when the user has
+/// explicitly confirmed they want to discard target-side changes.
+pub fn deploy_secrets(
+    config: &NitConfig,
+    force_drift_override: bool,
+) -> Result<Vec<SecretResult>, Box<dyn std::error::Error>> {
     let identity_path = expand_tilde(&config.local.identity);
     let secrets_dir = &config.secrets_dir;
 
@@ -226,22 +264,61 @@ pub fn deploy_secrets(config: &NitConfig) -> Result<Vec<SecretResult>, Box<dyn s
             continue;
         }
 
-        // Decrypt and deploy
-        match decrypt_to_target(&encrypted_path, &target_path, &identity_path) {
-            Ok(()) => {
-                results.push(SecretResult {
-                    tier: tier_name.clone(),
-                    target: target_path.display().to_string(),
-                    status: DeployStatus::Deployed,
-                });
-            }
+        // Drift check: decrypt source, compare to existing target. Skip the
+        // deploy if they diverge unless --force-drift was passed (the user is
+        // explicitly confirming they want to clobber unflushed edits).
+        let plaintext = match decrypt_file(&encrypted_path, &identity_path) {
+            Ok(s) => s,
             Err(e) => {
                 results.push(SecretResult {
                     tier: tier_name.clone(),
                     target: target_path.display().to_string(),
                     status: DeployStatus::Error(e.to_string()),
                 });
+                continue;
             }
+        };
+
+        if !force_drift_override {
+            if let Some((target_bytes, source_bytes)) =
+                check_target_drift(plaintext.as_bytes(), &target_path)
+            {
+                results.push(SecretResult {
+                    tier: tier_name.clone(),
+                    target: target_path.display().to_string(),
+                    status: DeployStatus::DriftDetected {
+                        target_bytes,
+                        source_bytes,
+                    },
+                });
+                continue;
+            }
+        }
+
+        // Deploy: write plaintext atomically to target with 0600 perms.
+        if let Some(parent) = target_path.parent() {
+            if let Err(e) = fs::create_dir_all(parent) {
+                results.push(SecretResult {
+                    tier: tier_name.clone(),
+                    target: target_path.display().to_string(),
+                    status: DeployStatus::Error(format!("mkdir parent: {}", e)),
+                });
+                continue;
+            }
+        }
+        match fs::write(&target_path, plaintext.as_bytes())
+            .and_then(|()| fs::set_permissions(&target_path, fs::Permissions::from_mode(0o600)))
+        {
+            Ok(()) => results.push(SecretResult {
+                tier: tier_name.clone(),
+                target: target_path.display().to_string(),
+                status: DeployStatus::Deployed,
+            }),
+            Err(e) => results.push(SecretResult {
+                tier: tier_name.clone(),
+                target: target_path.display().to_string(),
+                status: DeployStatus::Error(e.to_string()),
+            }),
         }
     }
 
@@ -453,7 +530,7 @@ mod tests {
             )],
         );
 
-        let results = deploy_secrets(&config).unwrap();
+        let results = deploy_secrets(&config, false).unwrap();
         assert_eq!(results.len(), 1);
         assert!(matches!(results[0].status, DeployStatus::Deployed));
         assert_eq!(
@@ -484,7 +561,7 @@ mod tests {
             )],
         );
 
-        let results = deploy_secrets(&config).unwrap();
+        let results = deploy_secrets(&config, false).unwrap();
         assert_eq!(results.len(), 1);
         assert!(matches!(results[0].status, DeployStatus::Skipped(_)));
         assert!(!target_path.exists());
@@ -512,9 +589,104 @@ mod tests {
             )],
         );
 
-        let results = deploy_secrets(&config).unwrap();
+        let results = deploy_secrets(&config, false).unwrap();
         assert_eq!(results.len(), 1);
         assert!(matches!(results[0].status, DeployStatus::Error(_)));
+    }
+
+    /// Anchoring scenario for the May 5, 2026 drift-detection feature: target
+    /// has unflushed manual edits, source-decrypt diverges. `deploy_secrets`
+    /// must NOT clobber it (must report DriftDetected). Then `--force-drift`
+    /// (force_drift_override=true) bypasses the check and deploys.
+    #[test]
+    fn deploy_secrets_aborts_on_target_drift_then_force_proceeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let (pubkey, identity_path) = setup_keypair(dir.path());
+
+        // Create a source: encrypt "ORIGINAL" → tier-all.env.age
+        let secrets_dir = dir.path().join("secrets");
+        fs::create_dir(&secrets_dir).unwrap();
+        let plaintext_path = dir.path().join("plaintext.tmp");
+        let encrypted_path = secrets_dir.join("tier-all.env.age");
+        fs::write(&plaintext_path, "ORIGINAL=value\n").unwrap();
+        encrypt_file(&plaintext_path, &[pubkey.clone()], &encrypted_path).unwrap();
+
+        // Simulate vim-edit-without-encrypt: target has different content
+        let target_path = dir.path().join("deployed/tier-all.env");
+        fs::create_dir_all(target_path.parent().unwrap()).unwrap();
+        fs::write(&target_path, "VIM_EDITED=newvalue\n").unwrap();
+
+        let config = build_test_config(
+            dir.path(),
+            &identity_path,
+            &secrets_dir,
+            &[(
+                "tier-all",
+                &[pubkey.as_str()],
+                target_path.to_str().unwrap(),
+            )],
+        );
+
+        // No-force: drift detected, target preserved
+        let results = deploy_secrets(&config, false).unwrap();
+        assert_eq!(results.len(), 1);
+        match &results[0].status {
+            DeployStatus::DriftDetected {
+                target_bytes,
+                source_bytes,
+            } => {
+                assert_eq!(*target_bytes, "VIM_EDITED=newvalue\n".len());
+                assert_eq!(*source_bytes, "ORIGINAL=value\n".len());
+            }
+            other => panic!("expected DriftDetected, got {:?}", other),
+        }
+        assert_eq!(
+            fs::read_to_string(&target_path).unwrap(),
+            "VIM_EDITED=newvalue\n",
+            "target must NOT have been clobbered when drift detected without --force"
+        );
+
+        // With force_drift_override=true, deploy proceeds (clobbers target)
+        let results = deploy_secrets(&config, true).unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(matches!(results[0].status, DeployStatus::Deployed));
+        assert_eq!(
+            fs::read_to_string(&target_path).unwrap(),
+            "ORIGINAL=value\n",
+            "target SHOULD have been clobbered when force_drift_override=true"
+        );
+    }
+
+    /// Drift check is content-based, not mtime-based: identical content → no drift,
+    /// even if target was touched after source (e.g., previous successful deploy).
+    #[test]
+    fn deploy_secrets_no_drift_when_target_matches_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let (pubkey, identity_path) = setup_keypair(dir.path());
+
+        let secrets_dir = dir.path().join("secrets");
+        fs::create_dir(&secrets_dir).unwrap();
+        let plaintext_path = dir.path().join("plaintext.tmp");
+        let encrypted_path = secrets_dir.join("tier-all.env.age");
+        fs::write(&plaintext_path, "X=1\n").unwrap();
+        encrypt_file(&plaintext_path, &[pubkey.clone()], &encrypted_path).unwrap();
+
+        // Pre-populate target with IDENTICAL content
+        let target_path = dir.path().join("deployed/tier-all.env");
+        fs::create_dir_all(target_path.parent().unwrap()).unwrap();
+        fs::write(&target_path, "X=1\n").unwrap();
+
+        let config = build_test_config(
+            dir.path(),
+            &identity_path,
+            &secrets_dir,
+            &[("tier-all", &[pubkey.as_str()], target_path.to_str().unwrap())],
+        );
+
+        let results = deploy_secrets(&config, false).unwrap();
+        assert_eq!(results.len(), 1);
+        // Re-deploy of identical content is reported as Deployed (idempotent).
+        assert!(matches!(results[0].status, DeployStatus::Deployed));
     }
 
     #[test]

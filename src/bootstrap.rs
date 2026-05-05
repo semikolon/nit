@@ -192,8 +192,9 @@ strategy = "bare"
         }
     }
 
-    // Deploy secrets
-    match crate::encrypt::deploy_secrets(&config) {
+    // Deploy secrets (bootstrap context: target shouldn't exist yet, so drift-check is a no-op;
+    // pass false because if a drift is somehow there, the user should resolve before bootstrap proceeds)
+    match crate::encrypt::deploy_secrets(&config, false) {
         Ok(results) => {
             for r in &results {
                 match &r.status {
@@ -205,6 +206,13 @@ strategy = "bare"
                     }
                     crate::encrypt::DeployStatus::Error(e) => {
                         eprintln!("  ✗ secret: {} ({})", r.tier, e);
+                    }
+                    crate::encrypt::DeployStatus::DriftDetected { target_bytes, source_bytes } => {
+                        eprintln!(
+                            "  ⚠ secret: {} DRIFT (target {}B, source-decrypt {}B) — \
+                             unflushed manual edit; run `nit encrypt {}` or `nit apply --force-drift`",
+                            r.tier, target_bytes, source_bytes, r.target
+                        );
                     }
                 }
             }

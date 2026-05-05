@@ -49,6 +49,12 @@ enum NitCommand {
     Apply {
         /// Specific file to apply (default: all)
         file: Option<String>,
+        /// Override the secrets drift check — clobber unflushed manual edits
+        /// to ~/.secrets/tier-*.env. Only use when you've consciously decided
+        /// to discard the target-side changes (e.g., the edit was a mistake
+        /// or has already been incorporated by other means).
+        #[arg(long)]
+        force_drift: bool,
     },
 
     /// Proactive drift review ("nitpick" your templates)
@@ -282,7 +288,7 @@ fn main() -> ExitCode {
 fn run_command(cmd: NitCommand, config: &NitConfig) -> Result<(), Box<dyn std::error::Error>> {
     match cmd {
         NitCommand::Add { paths } => cmd_add(&paths, config),
-        NitCommand::Apply { file } => cmd_apply(file.as_deref(), config),
+        NitCommand::Apply { file, force_drift } => cmd_apply(file.as_deref(), force_drift, config),
         NitCommand::Pick {
             file,
             dismiss,
@@ -538,9 +544,20 @@ fn write_ack_for_mapping(mapping: &template::TemplateMapping, config: &NitConfig
 
 // ---------------------------------------------------------------------------
 // T-5: cmd_apply — Render + deploy (NO commit)
+//
+// Note on the `force_drift` parameter: when false (default), `deploy_secrets`
+// aborts the deploy of any tier-*.env file whose target diverges from the
+// source-decrypt — protecting against the silent-overwrite failure mode
+// documented in `~/.claude/CLAUDE.md` § "Secrets editing — `nit encrypt` is
+// part of the same edit, not a follow-up step" (May 4, 2026 MANDATORY).
+// When true, drift is logged and the deploy proceeds anyway.
 // ---------------------------------------------------------------------------
 
-fn cmd_apply(file: Option<&str>, config: &NitConfig) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_apply(
+    file: Option<&str>,
+    force_drift: bool,
+    config: &NitConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
     let mappings = template::discover_templates(config);
     let mappings_to_process: Vec<&template::TemplateMapping> = if let Some(file_filter) = file {
         let filter_path = resolve_path(file_filter);
@@ -622,8 +639,9 @@ fn cmd_apply(file: Option<&str>, config: &NitConfig) -> Result<(), Box<dyn std::
         syncbase::write_ack(&rel, &target_hash, &rendered_hash);
     }
 
-    // 7. Decrypt secrets
-    match encrypt::deploy_secrets(config) {
+    // 7. Decrypt secrets (with drift-check unless --force-drift)
+    let mut secrets_drift_count = 0usize;
+    match encrypt::deploy_secrets(config, force_drift) {
         Ok(results) => {
             for r in &results {
                 match &r.status {
@@ -636,12 +654,34 @@ fn cmd_apply(file: Option<&str>, config: &NitConfig) -> Result<(), Box<dyn std::
                     encrypt::DeployStatus::Error(e) => {
                         eprintln!("nit: secret {} ERROR: {}", r.tier, e);
                     }
+                    encrypt::DeployStatus::DriftDetected {
+                        target_bytes,
+                        source_bytes,
+                    } => {
+                        secrets_drift_count += 1;
+                        eprintln!(
+                            "nit: secret {} DRIFT: {} (target {}B, source-decrypt {}B) — \
+                             target diverges from source. The target was likely vim-edited \
+                             without `nit encrypt`. Apply was skipped to prevent silent overwrite. \
+                             Resolve with one of:\n  \
+                             nit encrypt {}    # flush target → source (preserve target edits)\n  \
+                             nit apply --force-drift   # overwrite target with source (discard target edits)",
+                            r.tier, r.target, target_bytes, source_bytes, r.target
+                        );
+                    }
                 }
             }
         }
         Err(e) => {
             eprintln!("nit: warning: secret deployment failed: {}", e);
         }
+    }
+    if secrets_drift_count > 0 {
+        return Err(format!(
+            "{} secret tier(s) have unflushed target edits — apply aborted to prevent data loss",
+            secrets_drift_count
+        )
+        .into());
     }
 
     // 8. Run applicable triggers (skip drifted files)
@@ -1072,8 +1112,8 @@ fn cmd_commit(message: Option<&str>, config: &NitConfig) -> Result<(), Box<dyn s
         syncbase::write_sync_base(&rel, &rendered_with_comment);
     }
 
-    // Decrypt secrets
-    if let Err(e) = encrypt::deploy_secrets(config) {
+    // Decrypt secrets (drift-check enforced — commit path has no force escape)
+    if let Err(e) = encrypt::deploy_secrets(config, false) {
         eprintln!("nit: warning: secret deployment failed: {}", e);
     }
 
@@ -1225,8 +1265,10 @@ fn cmd_update(safe: bool, config: &NitConfig) -> Result<(), Box<dyn std::error::
         }
     }
 
-    // 3. Decrypt secrets
-    match encrypt::deploy_secrets(config) {
+    // 3. Decrypt secrets (drift-check enforced — `nit update` runs nightly via cron;
+    // unflushed target edits surface as a hard failure rather than silently disappearing)
+    let mut secrets_drift_count = 0usize;
+    match encrypt::deploy_secrets(config, false) {
         Ok(results) => {
             for r in &results {
                 match &r.status {
@@ -1239,12 +1281,31 @@ fn cmd_update(safe: bool, config: &NitConfig) -> Result<(), Box<dyn std::error::
                     encrypt::DeployStatus::Error(e) => {
                         eprintln!("nit: secret {} ERROR: {}", r.tier, e);
                     }
+                    encrypt::DeployStatus::DriftDetected {
+                        target_bytes,
+                        source_bytes,
+                    } => {
+                        secrets_drift_count += 1;
+                        eprintln!(
+                            "nit: secret {} DRIFT: {} (target {}B, source-decrypt {}B) — \
+                             unflushed manual edit detected. Run `nit encrypt {}` to flush \
+                             or `nit apply --force-drift` to discard target edits.",
+                            r.tier, r.target, target_bytes, source_bytes, r.target
+                        );
+                    }
                 }
             }
         }
         Err(e) => {
             eprintln!("nit: warning: secret deployment failed: {}", e);
         }
+    }
+    if secrets_drift_count > 0 {
+        return Err(format!(
+            "{} secret tier(s) have unflushed target edits — update aborted",
+            secrets_drift_count
+        )
+        .into());
     }
 
     // 4. Run triggers (skip drifted files; --safe skips all)
