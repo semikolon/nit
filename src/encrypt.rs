@@ -156,6 +156,12 @@ pub fn decrypt_file(
 
 /// Decrypt an age-encrypted file and write the plaintext to a target path
 /// with 0600 permissions. Creates parent directories if needed.
+///
+/// Currently called only by tests — `deploy_secrets` inlines the equivalent
+/// logic so it can interpose the drift check between decrypt and write.
+/// Kept as a `pub` API for callers that want plain decrypt-and-write without
+/// drift-check semantics.
+#[allow(dead_code)]
 pub fn decrypt_to_target(
     encrypted_path: &Path,
     target_path: &Path,
@@ -279,32 +285,31 @@ pub fn deploy_secrets(
             }
         };
 
-        if !force_drift_override {
-            if let Some((target_bytes, source_bytes)) =
+        if !force_drift_override
+            && let Some((target_bytes, source_bytes)) =
                 check_target_drift(plaintext.as_bytes(), &target_path)
-            {
-                results.push(SecretResult {
-                    tier: tier_name.clone(),
-                    target: target_path.display().to_string(),
-                    status: DeployStatus::DriftDetected {
-                        target_bytes,
-                        source_bytes,
-                    },
-                });
-                continue;
-            }
+        {
+            results.push(SecretResult {
+                tier: tier_name.clone(),
+                target: target_path.display().to_string(),
+                status: DeployStatus::DriftDetected {
+                    target_bytes,
+                    source_bytes,
+                },
+            });
+            continue;
         }
 
         // Deploy: write plaintext atomically to target with 0600 perms.
-        if let Some(parent) = target_path.parent() {
-            if let Err(e) = fs::create_dir_all(parent) {
-                results.push(SecretResult {
-                    tier: tier_name.clone(),
-                    target: target_path.display().to_string(),
-                    status: DeployStatus::Error(format!("mkdir parent: {}", e)),
-                });
-                continue;
-            }
+        if let Some(parent) = target_path.parent()
+            && let Err(e) = fs::create_dir_all(parent)
+        {
+            results.push(SecretResult {
+                tier: tier_name.clone(),
+                target: target_path.display().to_string(),
+                status: DeployStatus::Error(format!("mkdir parent: {}", e)),
+            });
+            continue;
         }
         match fs::write(&target_path, plaintext.as_bytes())
             .and_then(|()| fs::set_permissions(&target_path, fs::Permissions::from_mode(0o600)))
@@ -680,7 +685,11 @@ mod tests {
             dir.path(),
             &identity_path,
             &secrets_dir,
-            &[("tier-all", &[pubkey.as_str()], target_path.to_str().unwrap())],
+            &[(
+                "tier-all",
+                &[pubkey.as_str()],
+                target_path.to_str().unwrap(),
+            )],
         );
 
         let results = deploy_secrets(&config, false).unwrap();

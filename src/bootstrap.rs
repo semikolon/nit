@@ -207,7 +207,10 @@ strategy = "bare"
                     crate::encrypt::DeployStatus::Error(e) => {
                         eprintln!("  ✗ secret: {} ({})", r.tier, e);
                     }
-                    crate::encrypt::DeployStatus::DriftDetected { target_bytes, source_bytes } => {
+                    crate::encrypt::DeployStatus::DriftDetected {
+                        target_bytes,
+                        source_bytes,
+                    } => {
                         eprintln!(
                             "  ⚠ secret: {} DRIFT (target {}B, source-decrypt {}B) — \
                              unflushed manual edit; run `nit encrypt {}` or `nit apply --force-drift`",
