@@ -162,6 +162,15 @@ enum NitCommand {
         args: Vec<String>,
     },
 
+    /// Unstage tracked files (passthrough to `git reset`).
+    /// Most common: `nit reset <path>` to unstage a path. WARNING: `--hard`
+    /// drops working-tree changes — use only when you know what you're doing.
+    Reset {
+        /// Args passed through to `git reset` (e.g. `<path>`, `HEAD <path>`)
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
     /// Clone bare repo + configure + initial deploy
     Bootstrap {
         /// Repository URL to clone
@@ -307,6 +316,7 @@ fn run_command(cmd: NitCommand, config: &NitConfig) -> Result<(), Box<dyn std::e
         NitCommand::Mv { args } => cmd_passthrough("mv", &args, config),
         NitCommand::Rm { args } => cmd_passthrough("rm", &args, config),
         NitCommand::Show { args } => cmd_passthrough("show", &args, config),
+        NitCommand::Reset { args } => cmd_passthrough("reset", &args, config),
         NitCommand::Encrypt { file } => cmd_encrypt(&file, config),
         NitCommand::Decrypt { file } => cmd_decrypt(&file, config),
         NitCommand::Rekey => cmd_rekey(config),
