@@ -111,6 +111,23 @@ pub fn dismiss_drift(target_rel: &str) -> Result<String, Box<dyn std::error::Err
     Ok(diff)
 }
 
+/// Clear a drift artifact if present. Idempotent, infallible — no error if
+/// absent (unlike `dismiss_drift`, which is the explicit user-facing
+/// `nit pick --dismiss` and reports the discarded diff).
+///
+/// This is the missing lifecycle pair for `save_drift`: a drift artifact
+/// must be removed the moment the drift is *resolved*. Before this, a
+/// drift fixed via the recommended "edit the template source" path left
+/// its `.diff` orphaned forever — `list_drifted_files()` is presence-based,
+/// so `nit status` reported phantom drift indefinitely (real incident:
+/// `.zshenv.diff` stale from 2026-05-04 to 2026-05-16). Called on every
+/// clean (no-real-drift) deploy in `cmd_apply`/`cmd_update`, so a
+/// resolved drift now self-heals on the next apply/update of that file.
+pub fn clear_drift(target_rel: &str) {
+    let path = drift_dir().join(format!("{}.diff", target_rel));
+    let _ = fs::remove_file(&path);
+}
+
 /// List all files with saved drift (returns relative target paths).
 pub fn list_drifted_files() -> Vec<String> {
     let dir = drift_dir();
@@ -528,6 +545,11 @@ mod tests {
             Ok(diff)
         }
 
+        // Mirrors syncbase::clear_drift — idempotent, infallible.
+        fn clear_drift(&self, rel: &str) {
+            let _ = fs::remove_file(self.drift.join(format!("{}.diff", rel)));
+        }
+
         fn list_drifted(&self) -> Vec<String> {
             let mut files = Vec::new();
             if let Ok(entries) = fs::read_dir(&self.drift) {
@@ -708,6 +730,28 @@ mod tests {
         let env = TestEnv::new();
         let result = env.dismiss_drift(".nonexistent");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_clear_drift_removes_existing() {
+        // The lifecycle-pair fix: a resolved drift's artifact must be
+        // removed so list_drifted_files() can't phantom-report it.
+        let env = TestEnv::new();
+        env.save_drift(".zshenv", "+stale\n");
+        assert_eq!(env.read_drift(".zshenv"), Some("+stale\n".to_string()));
+        env.clear_drift(".zshenv");
+        assert_eq!(env.read_drift(".zshenv"), None);
+        assert!(env.list_drifted().is_empty());
+    }
+
+    #[test]
+    fn test_clear_drift_nonexistent_is_noop() {
+        // Unlike dismiss_drift (errors if absent), clear_drift is
+        // idempotent + infallible — it runs on EVERY clean deploy, the
+        // vast majority of which never had a drift artifact.
+        let env = TestEnv::new();
+        env.clear_drift(".never-existed"); // must not panic / error
+        assert_eq!(env.read_drift(".never-existed"), None);
     }
 
     #[test]

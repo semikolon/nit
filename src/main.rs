@@ -639,6 +639,11 @@ fn cmd_apply(
             // 4. No drift (or no base): deploy rendered, update sync-base
             write_target(&mapping.target, &rendered_with_comment)?;
             syncbase::write_sync_base(&rel, &rendered_with_comment);
+            // No real drift here by definition (target == sync-base). Any
+            // saved .diff for this rel is therefore stale — e.g. a drift
+            // earlier resolved by editing the template source. Clear it so
+            // it can't deadlock `nit status` / phantom-report forever.
+            syncbase::clear_drift(&rel);
         }
 
         deployed_count += 1;
@@ -1271,6 +1276,9 @@ fn cmd_update(safe: bool, config: &NitConfig) -> Result<(), Box<dyn std::error::
             // No drift: deploy rendered, update sync-base
             write_target(&mapping.target, &rendered_with_comment)?;
             syncbase::write_sync_base(&rel, &rendered_with_comment);
+            // Clear any stale .diff (drift resolved out-of-band, e.g. via
+            // template-source edit) so it can't phantom-report forever.
+            syncbase::clear_drift(&rel);
             deployed_count += 1;
         }
     }
