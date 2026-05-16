@@ -171,6 +171,24 @@ enum NitCommand {
         args: Vec<String>,
     },
 
+    /// Inspect HEAD/ref movement history (passthrough to `git reflog`).
+    /// Read-only forensic tool — use for cross-session reconciliation when a
+    /// concurrent agent's commit moved the branch tip unexpectedly.
+    Reflog {
+        /// Args passed through to `git reflog` (e.g. `-15`, `show <ref>`)
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// List/inspect branches (passthrough to `git branch`).
+    /// Common: `nit branch -r --contains <sha>` to confirm a commit reached
+    /// the remote. WARNING: `-D` deletes a branch — use deliberately.
+    Branch {
+        /// Args passed through to `git branch` (e.g. `-r --contains <sha>`, `-a`)
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
     /// Clone bare repo + configure + initial deploy
     Bootstrap {
         /// Repository URL to clone
@@ -317,6 +335,8 @@ fn run_command(cmd: NitCommand, config: &NitConfig) -> Result<(), Box<dyn std::e
         NitCommand::Rm { args } => cmd_passthrough("rm", &args, config),
         NitCommand::Show { args } => cmd_passthrough("show", &args, config),
         NitCommand::Reset { args } => cmd_passthrough("reset", &args, config),
+        NitCommand::Reflog { args } => cmd_passthrough("reflog", &args, config),
+        NitCommand::Branch { args } => cmd_passthrough("branch", &args, config),
         NitCommand::Encrypt { file } => cmd_encrypt(&file, config),
         NitCommand::Decrypt { file } => cmd_decrypt(&file, config),
         NitCommand::Rekey => cmd_rekey(config),
