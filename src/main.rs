@@ -91,6 +91,11 @@ enum NitCommand {
         /// Commit message
         #[arg(short, long)]
         message: Option<String>,
+
+        /// Read the commit message from a file, or from stdin if `-`
+        /// (mirrors `git commit -F`). Mutually exclusive with -m.
+        #[arg(short = 'F', long = "file")]
+        file: Option<String>,
     },
 
     /// Pull + render + deploy + triggers (fleet sync, no commit)
@@ -246,7 +251,42 @@ enum NitCommand {
     Git(Vec<String>),
 }
 
+/// Pure: if `argv` names a *pure-passthrough* git subcommand (verbatim
+/// args, no nit-specific flags), return `(subcommand, &argv[2..])`. `main`
+/// routes these to git BEFORE `Cli::parse()` so the `--` pathspec separator
+/// survives verbatim — clap's `trailing_var_arg` strips the first `--`,
+/// yielding a FALSE-EMPTY pathspec scope (`nit log -- <path>` →
+/// `git log <path>`), which is exactly the scope-verification blindness of
+/// incident sharp-edge #5. Defined nit subcommands (status, commit, add, …)
+/// keep clap parsing (they have real nit flags).
+fn passthrough_subcommand(argv: &[String]) -> Option<(&str, &[String])> {
+    const PASSTHROUGH: &[&str] = &[
+        "log", "diff", "show", "push", "mv", "rm", "reset", "reflog", "branch",
+    ];
+    let name = argv.get(1)?.as_str();
+    if PASSTHROUGH.contains(&name) {
+        Some((name, &argv[2..]))
+    } else {
+        None
+    }
+}
+
 fn main() -> ExitCode {
+    // Pure-passthrough subcommands: route to git BEFORE clap so the `--`
+    // pathspec separator survives verbatim (incident sharp-edge #5 — clap's
+    // trailing_var_arg strips the first `--`). Mirrors the external-subcommand
+    // strategy resolution. `fall_through_with` execs git and exits (`!`).
+    let argv: Vec<String> = std::env::args().collect();
+    if let Some((sub, rest)) = passthrough_subcommand(&argv) {
+        let strategy = config::load_config()
+            .map(|c| c.local.git.strategy.clone())
+            .unwrap_or(config::GitStrategy::Bare);
+        let mut gitargs: Vec<String> = Vec::with_capacity(rest.len() + 1);
+        gitargs.push(sub.to_string());
+        gitargs.extend_from_slice(rest);
+        git::fall_through_with(&strategy, &gitargs);
+    }
+
     let cli = Cli::parse();
 
     match cli.command {
@@ -327,7 +367,9 @@ fn run_command(cmd: NitCommand, config: &NitConfig) -> Result<(), Box<dyn std::e
             diff,
             edit,
         } => cmd_pick(file.as_deref(), dismiss, diff, edit, config),
-        NitCommand::Commit { message } => cmd_commit(message.as_deref(), config),
+        NitCommand::Commit { message, file } => {
+            cmd_commit(message.as_deref(), file.as_deref(), config)
+        }
         NitCommand::Update { safe } => cmd_update(safe, config),
         NitCommand::Status {
             show_untracked,
@@ -1166,9 +1208,60 @@ fn staged_index_snapshot(
         .collect()
 }
 
-fn cmd_commit(message: Option<&str>, config: &NitConfig) -> Result<(), Box<dyn std::error::Error>> {
+/// Pure: resolve the final commit message from `-m`/`-F` precedence
+/// (mirrors `git commit`: `-m` and `-F` are mutually exclusive). `loaded`
+/// is the content the caller already read for the `-F` source ("-" = stdin,
+/// else a file). Trailing newline trimmed; empty → error (git rejects empty
+/// messages). No `-m`/`-F` → the historical "nit commit" default.
+fn resolve_commit_message(
+    message: Option<&str>,
+    file_arg: Option<&str>,
+    loaded: Option<&str>,
+) -> Result<String, String> {
+    match (message, file_arg) {
+        (Some(_), Some(_)) => {
+            Err("cannot combine -m/--message and -F/--file (mirrors git commit)".to_string())
+        }
+        (Some(m), None) => Ok(m.to_string()),
+        (None, Some(_)) => {
+            let content = loaded.ok_or_else(|| "could not read -F message source".to_string())?;
+            let trimmed = content.trim_end_matches('\n');
+            if trimmed.trim().is_empty() {
+                Err("empty commit message (-F source had no content)".to_string())
+            } else {
+                Ok(trimmed.to_string())
+            }
+        }
+        (None, None) => Ok("nit commit".to_string()),
+    }
+}
+
+fn cmd_commit(
+    message: Option<&str>,
+    file: Option<&str>,
+    config: &NitConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
     let strategy = config.git_strategy();
-    let msg = message.unwrap_or("nit commit");
+
+    // Resolve -m / -F (file or `-`=stdin). IO here; precedence/validation is
+    // the pure `resolve_commit_message` (RED-GREEN tested).
+    let loaded: Option<String> = match file {
+        Some("-") => {
+            use std::io::Read;
+            let mut s = String::new();
+            std::io::stdin()
+                .read_to_string(&mut s)
+                .map_err(|e| format!("reading commit message from stdin: {e}"))?;
+            Some(s)
+        }
+        Some(path) => Some(
+            std::fs::read_to_string(path)
+                .map_err(|e| format!("reading commit message file {path}: {e}"))?,
+        ),
+        None => None,
+    };
+    let msg_owned = resolve_commit_message(message, file, loaded.as_deref())?;
+    let msg = msg_owned.as_str();
 
     // 1. Check what's staged
     let staged_output = git::git_output_with(strategy, &["diff", "--cached", "--name-only"])?;
@@ -1776,6 +1869,68 @@ fn cmd_status(
             println!("Modified (run `nit add <path>` to stage):");
             for line in &modified_lines {
                 println!("  {}", line);
+            }
+        }
+
+        // Session-intent commit-scope preview — answers "what exactly will
+        // `nit commit` include/deploy?" (incident sharp-edge #5: this
+        // verification primitive was missing). Uses the SAME pure
+        // `plan_commit_scope` cmd_commit uses, fed the SAME
+        // `git diff --cached --name-only` index, so the preview cannot lie.
+        let idx = git::git_output_with(strategy, &["diff", "--cached", "--name-only"])
+            .unwrap_or_default();
+        let index_staged: Vec<String> = idx
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|s| s.to_string())
+            .collect();
+        if !index_staged.is_empty() {
+            let home = dirs::home_dir().expect("cannot determine home directory");
+            let tmpl_rels: Vec<String> = mappings
+                .iter()
+                .map(|m| {
+                    m.source
+                        .strip_prefix(&home)
+                        .unwrap_or(&m.source)
+                        .to_string_lossy()
+                        .to_string()
+                })
+                .collect();
+            let sess = syncbase::read_session_staged(syncbase::get_session_anchor());
+            let plan = plan_commit_scope(&sess, &index_staged, &tmpl_rels);
+            println!();
+            if plan.session_tracking_bypassed {
+                println!(
+                    "Commit scope: \u{26a0} no `nit add` record for this session — \
+                     `nit commit` would commit the WHOLE index ({} path(s), legacy). \
+                     Use `nit add <paths>` to scope to this session.",
+                    index_staged.len()
+                );
+            } else {
+                let excluded = index_staged
+                    .len()
+                    .saturating_sub(plan.commit_pathspec.len());
+                println!(
+                    "Commit scope (this session): {} path(s) commit, {} template(s) deploy",
+                    plan.commit_pathspec.len(),
+                    plan.deploy_mapping_idx.len()
+                );
+                for p in &plan.commit_pathspec {
+                    println!("  + {}", p);
+                }
+                if plan.commit_pathspec.is_empty() {
+                    println!(
+                        "  (nothing this session staged is still staged — `nit commit` \
+                         would refuse; run `nit add`)"
+                    );
+                }
+                if excluded > 0 {
+                    println!(
+                        "  ({} index path(s) are from another session — EXCLUDED from \
+                         this session's commit, preserved for theirs)",
+                        excluded
+                    );
+                }
             }
         }
     }
@@ -2554,5 +2709,93 @@ source_dir = "~/dotfiles/templates"
         assert!(plan.commit_pathspec.is_empty());
         assert!(!plan.session_tracking_bypassed);
         assert!(plan.plain_only, "no template in the (empty) scope");
+    }
+
+    // ── nit-transparency: passthrough `--` preservation (sharp-edge #5) ────
+
+    fn av(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn passthrough_routes_log_preserving_double_dash() {
+        let argv = av(&["nit", "log", "master..HEAD", "--", "dotfiles/CLAUDE.md"]);
+        let got = passthrough_subcommand(&argv);
+        assert_eq!(
+            got,
+            Some((
+                "log",
+                av(&["master..HEAD", "--", "dotfiles/CLAUDE.md"]).as_slice()
+            )),
+            "the `--` pathspec separator MUST survive verbatim"
+        );
+    }
+
+    #[test]
+    fn passthrough_routes_bare_diff() {
+        let argv = av(&["nit", "diff"]);
+        assert_eq!(passthrough_subcommand(&argv), Some(("diff", [].as_slice())));
+    }
+
+    #[test]
+    fn passthrough_routes_diff_cached() {
+        let argv = av(&["nit", "diff", "--cached"]);
+        assert_eq!(
+            passthrough_subcommand(&argv),
+            Some(("diff", av(&["--cached"]).as_slice()))
+        );
+    }
+
+    #[test]
+    fn passthrough_ignores_nit_subcommands_and_empty() {
+        assert!(passthrough_subcommand(&av(&["nit", "commit", "-m", "x"])).is_none());
+        assert!(passthrough_subcommand(&av(&["nit", "status", "-v"])).is_none());
+        assert!(passthrough_subcommand(&av(&["nit", "add", "f"])).is_none());
+        assert!(passthrough_subcommand(&av(&["nit", "sync"])).is_none());
+        assert!(passthrough_subcommand(&av(&["nit"])).is_none());
+    }
+
+    // ── nit-transparency: -m/-F commit-message resolution ─────────────────
+
+    #[test]
+    fn commit_msg_m_and_f_mutually_exclusive() {
+        let e = resolve_commit_message(Some("m"), Some("f"), Some("x")).unwrap_err();
+        assert!(e.contains("cannot combine"), "got: {e}");
+    }
+
+    #[test]
+    fn commit_msg_dash_m_passthrough() {
+        assert_eq!(
+            resolve_commit_message(Some("hello"), None, None).unwrap(),
+            "hello"
+        );
+    }
+
+    #[test]
+    fn commit_msg_dash_f_trims_trailing_newline() {
+        assert_eq!(
+            resolve_commit_message(None, Some("msg.txt"), Some("subject\n\nbody\n")).unwrap(),
+            "subject\n\nbody"
+        );
+    }
+
+    #[test]
+    fn commit_msg_dash_f_empty_is_error() {
+        let e = resolve_commit_message(None, Some("-"), Some("  \n")).unwrap_err();
+        assert!(e.contains("empty"), "got: {e}");
+    }
+
+    #[test]
+    fn commit_msg_dash_f_unreadable_is_error() {
+        let e = resolve_commit_message(None, Some("nope.txt"), None).unwrap_err();
+        assert!(e.contains("could not read"), "got: {e}");
+    }
+
+    #[test]
+    fn commit_msg_default_when_neither() {
+        assert_eq!(
+            resolve_commit_message(None, None, None).unwrap(),
+            "nit commit"
+        );
     }
 }
