@@ -477,6 +477,10 @@ fn default_log_dir() -> PathBuf {
 fn cmd_add(paths: &[String], config: &NitConfig) -> Result<(), Box<dyn std::error::Error>> {
     let strategy = config.git_strategy();
 
+    // Session-intent scoping: snapshot the index so we can record exactly
+    // what THIS invocation stages (delta) into this session-anchor's store.
+    let staged_before = staged_index_snapshot(strategy);
+
     // Discover templates and build reverse lookup
     let mappings = template::discover_templates(config);
     let target_to_source = template::build_target_to_source_map(&mappings);
@@ -497,6 +501,7 @@ fn cmd_add(paths: &[String], config: &NitConfig) -> Result<(), Box<dyn std::erro
                     report_template_drift(mapping, config);
                 }
             }
+            record_session_staged_delta(strategy, &staged_before);
             return Ok(());
         }
 
@@ -547,6 +552,8 @@ fn cmd_add(paths: &[String], config: &NitConfig) -> Result<(), Box<dyn std::erro
             );
         }
     }
+
+    record_session_staged_delta(strategy, &staged_before);
 
     Ok(())
 }
@@ -1034,6 +1041,131 @@ fn cmd_sync(config: &NitConfig) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Session-intent commit scoping (2026-05-17 keystone)
+//
+// Pure decision function — no git, no $HOME, no I/O — so the entire keystone
+// contract is RED-GREEN testable in isolation (mirrors the codebase pure-fn
+// idiom: filter_forward_only_drift, resolve_path_with, add_recipient_to_toml).
+//
+// CONTRACT: a `nit commit` includes ONLY paths THIS session-anchor recorded
+// via `nit add` (`session_staged`), intersected with what is still staged in
+// the shared index (`index_staged`). A concurrent session's `nit add` entries
+// live in the shared index but are absent from THIS session's record, so they
+// are never committed and their templates are never rendered/deployed. This
+// degrades the concurrent-session race from catastrophe (cross-workstream
+// bundle + live-deploy of an in-flight template) to a benign, reversible,
+// correctly-scoped local commit. Honors AC-5.2 (ack-gate keys off staged
+// template sources — now session-scoped), AC-5.7 (plain-only → zero friction,
+// even when another session staged/modified a template), and EARS:43 (a
+// commit still renders+deploys its templates — but ONLY its own).
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, PartialEq)]
+struct CommitPlan {
+    /// Exact pathspec for `git commit -- <...>` (work-tree-relative).
+    commit_pathspec: Vec<String>,
+    /// Indices into the caller's discovered-`mappings` slice whose template
+    /// SOURCE is in scope → the ONLY templates this commit may render+deploy.
+    deploy_mapping_idx: Vec<usize>,
+    /// True when no template source is in scope → AC-5.7 zero-friction path
+    /// (skip all ack checks) even if another session staged/modified a template.
+    plain_only: bool,
+    /// True when this session recorded NO staged paths (raw `git add` bypassing
+    /// `nit add`, or a fresh session). Caller falls back to legacy whole-index
+    /// behavior and warns — preserves backward-compat for non-nit-add flows
+    /// while session-intent scoping protects every nit-add flow (the incident
+    /// class).
+    session_tracking_bypassed: bool,
+}
+
+/// See module contract above. `template_source_rels[i]` is the work-tree-
+/// relative source path of the caller's `mappings[i]` (parallel slices).
+fn plan_commit_scope(
+    session_staged: &[String],
+    index_staged: &[String],
+    template_source_rels: &[String],
+) -> CommitPlan {
+    use std::collections::BTreeSet;
+    let index_set: BTreeSet<&str> = index_staged.iter().map(String::as_str).collect();
+
+    // Scope selection:
+    //  - session recorded paths → intersection(session, index): commit ONLY
+    //    what THIS session staged AND is still staged. A concurrent session's
+    //    shared-index entries are absent from `session_staged` → excluded.
+    //    This session's since-unstaged paths are absent from the index →
+    //    excluded.
+    //  - session recorded nothing → legacy fallback: the whole index, flagged
+    //    `session_tracking_bypassed` so the caller warns (raw `git add`
+    //    bypassing `nit add`, or a fresh session — backward-compat preserved).
+    let session_tracking_bypassed = session_staged.is_empty();
+    let mut commit_pathspec: Vec<String> = if session_tracking_bypassed {
+        index_staged.to_vec()
+    } else {
+        session_staged
+            .iter()
+            .filter(|p| index_set.contains(p.as_str()))
+            .cloned()
+            .collect()
+    };
+    // Sort for deterministic output + order-independent pathspec (git treats
+    // `git commit -- a b` and `git commit -- b a` identically).
+    commit_pathspec.sort();
+
+    let scope_set: BTreeSet<&str> = commit_pathspec.iter().map(String::as_str).collect();
+    let deploy_mapping_idx: Vec<usize> = template_source_rels
+        .iter()
+        .enumerate()
+        .filter(|(_, src)| scope_set.contains(src.as_str()))
+        .map(|(i, _)| i)
+        .collect();
+
+    CommitPlan {
+        plain_only: deploy_mapping_idx.is_empty(),
+        commit_pathspec,
+        deploy_mapping_idx,
+        session_tracking_bypassed,
+    }
+}
+
+/// Record into the current session-anchor's staged store the paths THIS
+/// `nit add` invocation newly staged (index delta vs `before`). Union
+/// semantics across invocations accumulate the session's full staging
+/// intent. Delta-based (not explicit-path-based) on purpose: it avoids
+/// path-normalization hazards (git emits work-tree-root-relative paths;
+/// so does this) and conservatively under-records rather than over-records
+/// — an unrecorded path is excluded from scope (safe: a benign "nothing
+/// staged by this session" beats wrongly bundling another session's work).
+fn record_session_staged_delta(
+    strategy: &crate::config::GitStrategy,
+    before: &std::collections::BTreeSet<String>,
+) {
+    let after =
+        git::git_output_with(strategy, &["diff", "--cached", "--name-only"]).unwrap_or_default();
+    let newly: Vec<String> = after
+        .lines()
+        .filter(|l| !l.is_empty())
+        .filter(|l| !before.contains(*l))
+        .map(|s| s.to_string())
+        .collect();
+    if !newly.is_empty() {
+        syncbase::record_session_staged(&newly);
+    }
+}
+
+/// Snapshot the currently-staged set (work-tree-root-relative), for delta
+/// computation in `record_session_staged_delta`.
+fn staged_index_snapshot(
+    strategy: &crate::config::GitStrategy,
+) -> std::collections::BTreeSet<String> {
+    git::git_output_with(strategy, &["diff", "--cached", "--name-only"])
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|s| s.to_string())
+        .collect()
+}
+
 fn cmd_commit(message: Option<&str>, config: &NitConfig) -> Result<(), Box<dyn std::error::Error>> {
     let strategy = config.git_strategy();
     let msg = message.unwrap_or("nit commit");
@@ -1046,51 +1178,91 @@ fn cmd_commit(message: Option<&str>, config: &NitConfig) -> Result<(), Box<dyn s
         return Err("nothing staged to commit".into());
     }
 
-    // 2. Identify staged template sources
+    // 2. Discover templates + their work-tree-root-relative source paths
+    //    (parallel to `mappings`, fed to the pure scope planner).
     let mappings = template::discover_templates(config);
-    // Find which staged files are template sources
     let home = dirs::home_dir().expect("cannot determine home directory");
-    let staged_template_mappings: Vec<&template::TemplateMapping> = mappings
+    let template_source_rels: Vec<String> = mappings
         .iter()
-        .filter(|m| {
-            let source_rel = m
-                .source
+        .map(|m| {
+            m.source
                 .strip_prefix(&home)
                 .unwrap_or(&m.source)
                 .to_string_lossy()
-                .to_string();
-            staged_files.iter().any(|sf| *sf == source_rel)
+                .to_string()
         })
         .collect();
 
-    let has_template_sources = !staged_template_mappings.is_empty();
+    // 3. Session-intent scoping (2026-05-17 keystone). The session anchor is
+    //    the stable identity across all of CC's per-Bash-call ephemeral
+    //    shells (see syncbase::get_session_anchor). `nit add` recorded what
+    //    THIS session staged; scope commit + template-deploy to that set so a
+    //    concurrent session's shared-index entries are never bundled or
+    //    live-deployed (the 2026-05-17 incident class).
+    let my_anchor = syncbase::get_session_anchor();
+    let session_staged = syncbase::read_session_staged(my_anchor);
+    let index_staged: Vec<String> = staged_files.iter().map(|s| s.to_string()).collect();
+    let plan = plan_commit_scope(&session_staged, &index_staged, &template_source_rels);
 
-    // 4. If ONLY plain files staged (no template sources): skip all ack checks
-    if !has_template_sources {
-        // Straight git commit
-        git::exec_git_with(strategy, &["commit", "-m", msg])?;
-        eprintln!("nit: committed (plain files only, no templates)");
+    if plan.session_tracking_bypassed {
+        eprintln!(
+            "nit: \u{26a0} no nit-add staging recorded for this session — committing the \
+             whole index (legacy behavior). Prefer `nit add <paths>` so commits are \
+             scoped to this session and cannot bundle a concurrent session's work."
+        );
+    } else if plan.commit_pathspec.is_empty() {
+        return Err("nothing staged by THIS session to commit — the paths this \
+                    session staged are no longer staged (already committed, or \
+                    unstaged). Run `nit add <paths>` first."
+            .into());
+    }
+
+    // Deploy/ack scope = ONLY templates whose source is in this session's
+    // committed scope. A concurrent session's in-flight template (present in
+    // the shared index but absent from this session's record) is NEVER here.
+    let scoped_templates: Vec<&template::TemplateMapping> = plan
+        .deploy_mapping_idx
+        .iter()
+        .map(|&i| &mappings[i])
+        .collect();
+
+    // Scoped pathspec for `git commit -- :/<path>`. The `:/` (work-tree-top)
+    // pathspec magic anchors at the work-tree root regardless of CWD — nit
+    // runs from any directory; without it git resolves paths relative to CWD
+    // (incident sharp-edge #5: wrapper/pathspec opacity → false-empty scope).
+    let commit_pathspecs: Vec<String> = plan
+        .commit_pathspec
+        .iter()
+        .map(|p| format!(":/{}", p))
+        .collect();
+
+    // 4. AC-5.7: only plain files in scope → zero-friction, scoped commit.
+    if plan.plain_only {
+        let mut args: Vec<&str> = vec!["commit", "-m", msg, "--"];
+        args.extend(commit_pathspecs.iter().map(String::as_str));
+        git::exec_git_with(strategy, &args)?;
+        syncbase::clear_session_staged(my_anchor);
+        syncbase::prune_dead_staged();
+        eprintln!(
+            "nit: committed {} path(s) (plain files only, no templates)",
+            plan.commit_pathspec.len()
+        );
         return Ok(());
     }
 
-    // 3. For each staged template source, apply 4-cell ack validation
-    //
-    // Acks are keyed by SESSION ANCHOR (not raw PPID) — see syncbase::
-    // get_session_anchor for the walk-up rationale. This makes one CC
-    // conversation = one stable identity across all of CC's per-Bash-call
-    // ephemeral shells. Same for Codex sessions, terminal shell sessions, etc.
-    let my_anchor = syncbase::get_session_anchor();
+    // 5. AC-5.2: ack-gate each in-scope template source (4-cell matrix).
+    //    Acks are keyed by the same session anchor.
     let my_acks = syncbase::read_acks(my_anchor);
 
-    // Prune dead-anchor ack files (pure housekeeping, no longer load-bearing
-    // since cross-session ack reuse was removed — only own-anchor acks count).
+    // Prune dead-anchor ack/staged files (pure housekeeping; only own-anchor
+    // state is load-bearing since cross-session reuse was removed).
     syncbase::prune_dead_acks();
 
     let mut blocked = false;
     let mut block_reasons: Vec<String> = Vec::new();
     let mut drifted_rels: Vec<String> = Vec::new();
 
-    for mapping in &staged_template_mappings {
+    for mapping in &scoped_templates {
         let rel = target_rel_path(&mapping.target);
 
         // Current rendered content
@@ -1169,8 +1341,11 @@ fn cmd_commit(message: Option<&str>, config: &NitConfig) -> Result<(), Box<dyn s
         return Err("commit blocked by ack validation".into());
     }
 
-    // 5. All acks valid — deploy, commit, run triggers
-    for mapping in &mappings {
+    // 6. All acks valid — deploy ONLY this session's in-scope templates.
+    //    EARS:43 honored (a commit renders+deploys its templates) but NEVER
+    //    another session's in-flight template — that is the deploy-side-effect
+    //    footgun this keystone closes.
+    for mapping in &scoped_templates {
         let rel = target_rel_path(&mapping.target);
 
         let rendered = match template::render_template(mapping, config) {
@@ -1211,8 +1386,15 @@ fn cmd_commit(message: Option<&str>, config: &NitConfig) -> Result<(), Box<dyn s
         eprintln!("nit: warning: secret deployment failed: {}", e);
     }
 
-    // Git commit (only what was staged — do NOT auto-stage)
-    git::exec_git_with(strategy, &["commit", "-m", msg])?;
+    // 7. Git commit — scoped to exactly this session's staged paths via
+    //    `:/`-anchored pathspec (never another session's shared-index entry).
+    {
+        let mut args: Vec<&str> = vec!["commit", "-m", msg, "--"];
+        args.extend(commit_pathspecs.iter().map(String::as_str));
+        git::exec_git_with(strategy, &args)?;
+    }
+    syncbase::clear_session_staged(my_anchor);
+    syncbase::prune_dead_staged();
 
     // Run triggers (skip drifted files)
     let log_dir = default_log_dir();
@@ -1245,7 +1427,11 @@ fn cmd_commit(message: Option<&str>, config: &NitConfig) -> Result<(), Box<dyn s
         }
     }
 
-    eprintln!("nit: committed with {} templates deployed", mappings.len());
+    eprintln!(
+        "nit: committed {} path(s), {} template(s) deployed",
+        plan.commit_pathspec.len(),
+        scoped_templates.len()
+    );
 
     Ok(())
 }
@@ -2223,5 +2409,150 @@ source_dir = "~/dotfiles/templates"
 
         let result = resolve_path_with(".claude/CLAUDE.md", &home, &home);
         assert_eq!(result, home.join(".claude/CLAUDE.md"));
+    }
+
+    // ── Session-intent commit scoping (2026-05-17 keystone) ───────────────
+    //
+    // RED-GREEN contract for plan_commit_scope. Headline:
+    // `scopes_out_concurrent_session_index_entries` — the 3cf94eb8 incident
+    // regression: Session 1 recorded only its 3 docs; Session 2's skills +
+    // .zshenv.tmpl were in the SHARED index. Session 1's commit must include
+    // ONLY its 3 docs and deploy NO template.
+
+    fn sv(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn scopes_out_concurrent_session_index_entries() {
+        let session = sv(&[
+            "dotfiles/CLAUDE.md",
+            "dotfiles/TODO.md",
+            "dotfiles/docs/demeter_excavation_2026_05_14.md",
+        ]);
+        let index = sv(&[
+            "dotfiles/CLAUDE.md",
+            "dotfiles/TODO.md",
+            "dotfiles/docs/demeter_excavation_2026_05_14.md",
+            ".claude/skills/reflect/SKILL.md", // Session 2's (sample of 17)
+            ".claude/skills/recall/SKILL.md",
+            "dotfiles/templates/.zshenv.tmpl", // Session 2's in-flight template
+        ]);
+        let tmpl_rels = sv(&["dotfiles/templates/.zshenv.tmpl"]);
+        let plan = plan_commit_scope(&session, &index, &tmpl_rels);
+        assert_eq!(
+            plan.commit_pathspec,
+            sv(&[
+                "dotfiles/CLAUDE.md",
+                "dotfiles/TODO.md",
+                "dotfiles/docs/demeter_excavation_2026_05_14.md",
+            ]),
+            "commit ONLY Session 1's 3 docs — not Session 2's skills/tmpl"
+        );
+        assert!(
+            plan.deploy_mapping_idx.is_empty(),
+            "NO template deployed — .zshenv.tmpl was another session's in-flight edit"
+        );
+        assert!(plan.plain_only, "plain-only → zero-friction (AC-5.7)");
+        assert!(!plan.session_tracking_bypassed);
+    }
+
+    #[test]
+    fn ac_5_7_plain_only_zero_friction_with_unrelated_staged_template() {
+        let session = sv(&["dotfiles/CLAUDE.md"]);
+        let index = sv(&["dotfiles/CLAUDE.md", "dotfiles/templates/.zshenv.tmpl"]);
+        let tmpl_rels = sv(&["dotfiles/templates/.zshenv.tmpl"]);
+        let plan = plan_commit_scope(&session, &index, &tmpl_rels);
+        assert!(
+            plan.plain_only,
+            "another session's staged template must NOT pull us off the zero-friction path"
+        );
+        assert!(plan.deploy_mapping_idx.is_empty());
+        assert_eq!(plan.commit_pathspec, sv(&["dotfiles/CLAUDE.md"]));
+    }
+
+    #[test]
+    fn ac_5_2_own_staged_template_is_in_scope_and_gated() {
+        let session = sv(&["dotfiles/templates/.zshenv.tmpl", "dotfiles/CLAUDE.md"]);
+        let index = sv(&[
+            "dotfiles/templates/.zshenv.tmpl",
+            "dotfiles/CLAUDE.md",
+            "dotfiles/templates/.zprofile.tmpl",
+        ]);
+        let tmpl_rels = sv(&[
+            "dotfiles/templates/.zshenv.tmpl",
+            "dotfiles/templates/.zprofile.tmpl",
+        ]);
+        let plan = plan_commit_scope(&session, &index, &tmpl_rels);
+        assert_eq!(
+            plan.deploy_mapping_idx,
+            vec![0usize],
+            "deploy ONLY the session's own template (idx 0), never idx 1 (other session's)"
+        );
+        assert!(
+            !plan.plain_only,
+            "a template is in scope → ack-gate runs (AC-5.2)"
+        );
+        assert_eq!(
+            plan.commit_pathspec,
+            sv(&["dotfiles/CLAUDE.md", "dotfiles/templates/.zshenv.tmpl"]),
+            "sorted scope"
+        );
+    }
+
+    #[test]
+    fn ears_43_never_deploys_another_sessions_staged_template() {
+        let session = sv(&["dotfiles/CLAUDE.md"]);
+        let index = sv(&["dotfiles/CLAUDE.md", "dotfiles/templates/.zshenv.tmpl"]);
+        let tmpl_rels = sv(&["dotfiles/templates/.zshenv.tmpl"]);
+        let plan = plan_commit_scope(&session, &index, &tmpl_rels);
+        assert!(
+            plan.deploy_mapping_idx.is_empty(),
+            "another session's in-flight template must NEVER render+deploy live"
+        );
+    }
+
+    #[test]
+    fn scope_is_session_intersect_index_excludes_unstaged() {
+        let plan = plan_commit_scope(&sv(&["a.txt", "b.txt"]), &sv(&["a.txt"]), &[]);
+        assert_eq!(
+            plan.commit_pathspec,
+            sv(&["a.txt"]),
+            "a session path no longer in the index drops out of scope"
+        );
+        assert!(!plan.session_tracking_bypassed);
+    }
+
+    #[test]
+    fn empty_session_record_falls_back_to_index_flagged_bypassed() {
+        let index = sv(&["x.txt", "y.txt", "dotfiles/templates/.zshenv.tmpl"]);
+        let tmpl_rels = sv(&["dotfiles/templates/.zshenv.tmpl"]);
+        let plan = plan_commit_scope(&[], &index, &tmpl_rels);
+        assert!(
+            plan.session_tracking_bypassed,
+            "no session record → bypass flag so caller warns"
+        );
+        assert_eq!(
+            plan.commit_pathspec,
+            sv(&["dotfiles/templates/.zshenv.tmpl", "x.txt", "y.txt"]),
+            "legacy whole-index (sorted) preserved for non-nit-add flows"
+        );
+        assert_eq!(
+            plan.deploy_mapping_idx,
+            vec![0usize],
+            "legacy: index template still deploys (EARS:43)"
+        );
+        assert!(!plan.plain_only);
+    }
+
+    #[test]
+    fn nonempty_session_but_empty_scope_signals_caller_error() {
+        // Session recorded a.txt; it is no longer staged → empty scope, NOT
+        // bypassed. Caller turns this into a clean "nothing staged by this
+        // session" error — never a bare `git commit`.
+        let plan = plan_commit_scope(&sv(&["a.txt"]), &sv(&["b.txt"]), &[]);
+        assert!(plan.commit_pathspec.is_empty());
+        assert!(!plan.session_tracking_bypassed);
+        assert!(plan.plain_only, "no template in the (empty) scope");
     }
 }

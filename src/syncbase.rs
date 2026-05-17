@@ -409,6 +409,93 @@ pub fn prune_dead_acks() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Session-intent staged-path store (2026-05-17 keystone)
+//
+// Mirrors the per-session-anchor ack store. Each session records the
+// work-tree-relative paths IT staged via `nit add`, so `nit commit` can scope
+// commit + template-deploy to its OWN session's set and never bundle or
+// live-deploy a concurrent session's shared-index entries. This is the
+// faithful reading of requirements.md US-5 ("commit exactly the explicitly-
+// staged paths" — staged BY THIS SESSION) + design.md "No auto-staging — each
+// agent accountable for exactly the files they stage". See
+// ~/Projects/nit/TODO.md § "Archaeology reframe" + "Session-intent scoping".
+// ---------------------------------------------------------------------------
+
+/// Staged-paths directory: ~/.local/share/nit/staged/
+pub fn staged_dir() -> PathBuf {
+    nit_data_dir().join("staged")
+}
+
+/// Path to a specific anchor's staged-paths file.
+pub fn staged_file_path(anchor: u32) -> PathBuf {
+    staged_dir().join(format!("{}.json", anchor))
+}
+
+/// Read the work-tree-relative paths this anchor recorded as staged.
+/// Empty Vec if none (fresh session, or `nit add` never used by this anchor).
+pub fn read_session_staged(anchor: u32) -> Vec<String> {
+    match fs::read_to_string(staged_file_path(anchor)) {
+        Ok(c) => serde_json::from_str(&c).unwrap_or_default(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Union `paths` into the CURRENT session anchor's staged set (atomic).
+pub fn record_session_staged(paths: &[String]) {
+    record_session_staged_for_anchor(get_session_anchor(), paths);
+}
+
+/// Union `paths` into a specific anchor's staged set (testable variant).
+/// Sorted + de-duplicated for determinism.
+pub fn record_session_staged_for_anchor(anchor: u32, paths: &[String]) {
+    if paths.is_empty() {
+        return;
+    }
+    let merged = merge_staged(read_session_staged(anchor), paths);
+    let json = serde_json::to_string_pretty(&merged).expect("failed to serialize staged set");
+    atomic_write(&staged_file_path(anchor), &json);
+}
+
+/// Pure: union `existing` + `new`, sorted + de-duplicated. The sorted on-disk
+/// form is deterministic; the set is what the commit-scope planner intersects
+/// against. Extracted pure so it is RED-GREEN testable without filesystem I/O
+/// (codebase idiom: filter_forward_only_drift, resolve_path_with, …).
+fn merge_staged(existing: Vec<String>, new: &[String]) -> Vec<String> {
+    let mut set: std::collections::BTreeSet<String> = existing.into_iter().collect();
+    set.extend(new.iter().cloned());
+    set.into_iter().collect()
+}
+
+/// Clear an anchor's staged record. Called after a successful commit — the
+/// recorded paths are now in git history; the next changeset starts fresh.
+/// Idempotent + infallible (mirrors `clear_drift`).
+pub fn clear_session_staged(anchor: u32) {
+    let _ = fs::remove_file(staged_file_path(anchor));
+}
+
+/// Prune staged-record files whose anchor PID is no longer running
+/// (mirrors `prune_dead_acks` — pure housekeeping).
+pub fn prune_dead_staged() {
+    let dir = staged_dir();
+    if !dir.exists() {
+        return;
+    }
+    let entries = match fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.filter_map(|e| e.ok()) {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if let Some(pid_str) = name.strip_suffix(".json")
+            && let Ok(pid) = pid_str.parse::<u32>()
+            && !is_pid_alive(pid)
+        {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
 /// Check if a PID is alive using kill(pid, 0).
 fn is_pid_alive(pid: u32) -> bool {
     #[cfg(unix)]
@@ -976,5 +1063,26 @@ mod tests {
         let json = serde_json::to_string(&entry).unwrap();
         let parsed: AckEntry = serde_json::from_str(&json).unwrap();
         assert_eq!(entry, parsed);
+    }
+
+    // ── Session-intent staged store (2026-05-17 keystone) ─────────────────
+
+    #[test]
+    fn merge_staged_unions_sorts_dedups() {
+        let out = merge_staged(
+            vec!["b".to_string(), "a".to_string()],
+            &["a".to_string(), "c".to_string()],
+        );
+        assert_eq!(
+            out,
+            vec!["a".to_string(), "b".to_string(), "c".to_string()],
+            "union across nit-add invocations, sorted, de-duplicated"
+        );
+    }
+
+    #[test]
+    fn merge_staged_empty_new_keeps_existing_sorted() {
+        let out = merge_staged(vec!["z".to_string(), "a".to_string()], &[]);
+        assert_eq!(out, vec!["a".to_string(), "z".to_string()]);
     }
 }
