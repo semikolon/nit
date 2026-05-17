@@ -88,9 +88,10 @@ enum NitCommand {
 
     /// Render + deploy + git commit + triggers
     Commit {
-        /// Commit message
+        /// Commit message. Repeatable like `git commit -m … -m …` —
+        /// multiple values become paragraphs joined by a blank line.
         #[arg(short, long)]
-        message: Option<String>,
+        message: Vec<String>,
 
         /// Read the commit message from a file, or from stdin if `-`
         /// (mirrors `git commit -F`). Mutually exclusive with -m.
@@ -367,9 +368,7 @@ fn run_command(cmd: NitCommand, config: &NitConfig) -> Result<(), Box<dyn std::e
             diff,
             edit,
         } => cmd_pick(file.as_deref(), dismiss, diff, edit, config),
-        NitCommand::Commit { message, file } => {
-            cmd_commit(message.as_deref(), file.as_deref(), config)
-        }
+        NitCommand::Commit { message, file } => cmd_commit(&message, file.as_deref(), config),
         NitCommand::Update { safe } => cmd_update(safe, config),
         NitCommand::Status {
             show_untracked,
@@ -1214,16 +1213,17 @@ fn staged_index_snapshot(
 /// else a file). Trailing newline trimmed; empty → error (git rejects empty
 /// messages). No `-m`/`-F` → the historical "nit commit" default.
 fn resolve_commit_message(
-    message: Option<&str>,
+    messages: &[String],
     file_arg: Option<&str>,
     loaded: Option<&str>,
 ) -> Result<String, String> {
-    match (message, file_arg) {
-        (Some(_), Some(_)) => {
+    match (messages.is_empty(), file_arg) {
+        (false, Some(_)) => {
             Err("cannot combine -m/--message and -F/--file (mirrors git commit)".to_string())
         }
-        (Some(m), None) => Ok(m.to_string()),
-        (None, Some(_)) => {
+        // git semantics: each -m is a paragraph, joined by a blank line.
+        (false, None) => Ok(messages.join("\n\n")),
+        (true, Some(_)) => {
             let content = loaded.ok_or_else(|| "could not read -F message source".to_string())?;
             let trimmed = content.trim_end_matches('\n');
             if trimmed.trim().is_empty() {
@@ -1232,12 +1232,12 @@ fn resolve_commit_message(
                 Ok(trimmed.to_string())
             }
         }
-        (None, None) => Ok("nit commit".to_string()),
+        (true, None) => Ok("nit commit".to_string()),
     }
 }
 
 fn cmd_commit(
-    message: Option<&str>,
+    messages: &[String],
     file: Option<&str>,
     config: &NitConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1260,7 +1260,7 @@ fn cmd_commit(
         ),
         None => None,
     };
-    let msg_owned = resolve_commit_message(message, file, loaded.as_deref())?;
+    let msg_owned = resolve_commit_message(messages, file, loaded.as_deref())?;
     let msg = msg_owned.as_str();
 
     // 1. Check what's staged
@@ -2759,42 +2759,57 @@ source_dir = "~/dotfiles/templates"
 
     #[test]
     fn commit_msg_m_and_f_mutually_exclusive() {
-        let e = resolve_commit_message(Some("m"), Some("f"), Some("x")).unwrap_err();
+        let e = resolve_commit_message(&av(&["m"]), Some("f"), Some("x")).unwrap_err();
+        assert!(e.contains("cannot combine"), "got: {e}");
+    }
+
+    #[test]
+    fn commit_msg_multiple_m_with_f_still_errors() {
+        let e = resolve_commit_message(&av(&["a", "b"]), Some("f"), None).unwrap_err();
         assert!(e.contains("cannot combine"), "got: {e}");
     }
 
     #[test]
     fn commit_msg_dash_m_passthrough() {
         assert_eq!(
-            resolve_commit_message(Some("hello"), None, None).unwrap(),
+            resolve_commit_message(&av(&["hello"]), None, None).unwrap(),
             "hello"
+        );
+    }
+
+    #[test]
+    fn commit_msg_multiple_m_joined_as_paragraphs() {
+        // git semantics: each -m is a paragraph, joined by a blank line.
+        assert_eq!(
+            resolve_commit_message(&av(&["title line", "body paragraph"]), None, None).unwrap(),
+            "title line\n\nbody paragraph"
         );
     }
 
     #[test]
     fn commit_msg_dash_f_trims_trailing_newline() {
         assert_eq!(
-            resolve_commit_message(None, Some("msg.txt"), Some("subject\n\nbody\n")).unwrap(),
+            resolve_commit_message(&[], Some("msg.txt"), Some("subject\n\nbody\n")).unwrap(),
             "subject\n\nbody"
         );
     }
 
     #[test]
     fn commit_msg_dash_f_empty_is_error() {
-        let e = resolve_commit_message(None, Some("-"), Some("  \n")).unwrap_err();
+        let e = resolve_commit_message(&[], Some("-"), Some("  \n")).unwrap_err();
         assert!(e.contains("empty"), "got: {e}");
     }
 
     #[test]
     fn commit_msg_dash_f_unreadable_is_error() {
-        let e = resolve_commit_message(None, Some("nope.txt"), None).unwrap_err();
+        let e = resolve_commit_message(&[], Some("nope.txt"), None).unwrap_err();
         assert!(e.contains("could not read"), "got: {e}");
     }
 
     #[test]
     fn commit_msg_default_when_neither() {
         assert_eq!(
-            resolve_commit_message(None, None, None).unwrap(),
+            resolve_commit_message(&[], None, None).unwrap(),
             "nit commit"
         );
     }
