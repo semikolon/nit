@@ -236,6 +236,11 @@ enum NitCommand {
         comment: Option<String>,
     },
 
+    /// Flush forward-only runtime files (decisions state/cache, spela
+    /// config) to git: pathspec-scoped commit of the declared
+    /// `[sync] forward_only` paths. Never `-A`; does NOT push.
+    Sync {},
+
     /// Any unrecognized subcommand falls through to git
     #[command(external_subcommand)]
     Git(Vec<String>),
@@ -342,6 +347,7 @@ fn run_command(cmd: NitCommand, config: &NitConfig) -> Result<(), Box<dyn std::e
         NitCommand::Rekey => cmd_rekey(config),
         NitCommand::List => cmd_list(config),
         NitCommand::Run { name } => cmd_run(&name, config),
+        NitCommand::Sync {} => cmd_sync(config),
         NitCommand::FleetAddRecipient {
             tier,
             pubkey,
@@ -975,6 +981,59 @@ fn detect_live_drift(mapping: &template::TemplateMapping, _config: &NitConfig) -
 // T-10: cmd_commit — Render + deploy + ack gate + git commit + triggers
 // ---------------------------------------------------------------------------
 
+// cmd_sync — Flush forward-only runtime files (v2 forward-only-sync, 2026-05-17)
+// ---------------------------------------------------------------------------
+// Forward-only paths are tracked-for-backup but never deployed source->target
+// (the machine copy is authoritative). This is the explicit "flush" that
+// captures their current runtime content into git. Pathspec-scoped commit —
+// never `-A`, never sweeps another session's staged changes (contamination-
+// safe, per the "commit caution scales with reversibility" directive). Does
+// NOT push (push is an explicit boundary the user owns).
+fn cmd_sync(config: &NitConfig) -> Result<(), Box<dyn std::error::Error>> {
+    let strategy = config.git_strategy();
+    let forward_only: Vec<String> = config
+        .fleet
+        .sync
+        .as_ref()
+        .map(|s| s.forward_only.clone())
+        .unwrap_or_default();
+    if forward_only.is_empty() {
+        eprintln!(
+            "nit sync: no forward-only paths declared (fleet.toml [sync] forward_only) — nothing to flush"
+        );
+        return Ok(());
+    }
+    // Only flush declared paths that actually exist on this machine — a
+    // declared path may legitimately be absent here (e.g. spela config on a
+    // server). Avoids a pathspec error aborting the whole commit.
+    let home = dirs::home_dir().expect("cannot determine home directory");
+    let present: Vec<&str> = forward_only
+        .iter()
+        .filter(|p| home.join(p.as_str()).exists())
+        .map(|p| p.as_str())
+        .collect();
+    if present.is_empty() {
+        eprintln!(
+            "nit sync: no declared forward-only files present on this machine — nothing to flush"
+        );
+        return Ok(());
+    }
+    let mut args: Vec<&str> = vec!["commit", "-m", "sync: forward-only runtime snapshot", "--"];
+    args.extend(present.iter().copied());
+    let status = git::exec_git_with(strategy, &args)?;
+    if status.success() {
+        eprintln!(
+            "nit sync: flushed {} forward-only path(s) — committed locally, NOT pushed",
+            present.len()
+        );
+    } else {
+        // Non-zero almost always = "nothing to commit" (files unchanged since
+        // last flush). Benign — not an error condition.
+        eprintln!("nit sync: forward-only files unchanged — nothing to flush");
+    }
+    Ok(())
+}
+
 fn cmd_commit(message: Option<&str>, config: &NitConfig) -> Result<(), Box<dyn std::error::Error>> {
     let strategy = config.git_strategy();
     let msg = message.unwrap_or("nit commit");
@@ -1217,7 +1276,21 @@ fn cmd_update(safe: bool, config: &NitConfig) -> Result<(), Box<dyn std::error::
     // If any tracked file is modified/deleted, ABORT and write status. Untracked
     // files are fine (gitignored or genuinely new — won't be touched by pull).
     let porcelain = git::git_output_with(strategy, &["status", "--porcelain"]).unwrap_or_default();
-    let drift = sync_status::detect_pre_pull_drift(&porcelain);
+    // `detect_pre_pull_drift` is intentionally NOT modified — it must keep
+    // detecting ALL drift (it prevented the 2026-05-04 clobber). Forward-only
+    // runtime files (decisions state/cache, spela config) are dirty BY DESIGN;
+    // filter them out here — explicitly + auditably, at the call site. Any
+    // non-forward-only drift survives the filter, so the abort still fires.
+    let forward_only = config
+        .fleet
+        .sync
+        .as_ref()
+        .map(|s| s.forward_only.as_slice())
+        .unwrap_or(&[]);
+    let drift = crate::config::filter_forward_only_drift(
+        sync_status::detect_pre_pull_drift(&porcelain),
+        forward_only,
+    );
     if !drift.is_empty() {
         status.result = sync_status::SyncResult::AbortedDrift;
         status.drift_files = drift.clone();
@@ -1436,10 +1509,25 @@ fn cmd_status(
         args.push("--untracked-files=normal");
     }
     let git_status = git::git_output_with(strategy, &args).unwrap_or_default();
-    let modified = git_status
+    // Forward-only runtime files are dirty BY DESIGN — exclude them from the
+    // scary "modified" count so they stop being perpetual noise; surface them
+    // calmly on their own line below.
+    let forward_only = config
+        .fleet
+        .sync
+        .as_ref()
+        .map(|s| s.forward_only.as_slice())
+        .unwrap_or(&[]);
+    let is_modified = |l: &str| l.starts_with(" M") || l.starts_with("M ");
+    let modified_total = git_status.lines().filter(|l| is_modified(l)).count();
+    let fo_modified = git_status
         .lines()
-        .filter(|l| l.starts_with(" M") || l.starts_with("M "))
+        .filter(|l| {
+            is_modified(l)
+                && crate::config::is_forward_only(crate::config::porcelain_path(l), forward_only)
+        })
         .count();
+    let modified = modified_total - fo_modified;
     let staged = git_status
         .lines()
         .filter(|l| {
@@ -1456,6 +1544,12 @@ fn cmd_status(
         "nit: {} templates ({} drifted), {} triggers | git: {} staged, {} modified, {} untracked",
         template_count, drift_count, trigger_count, staged, modified, untracked
     );
+    if fo_modified > 0 {
+        println!(
+            "nit: forward-only: {} runtime path(s) uncommitted (expected; flush with `nit sync`)",
+            fo_modified
+        );
+    }
 
     // Last-sync health summary (from ~/.local/share/nit/last-sync.json).
     if let Some(last) = sync_status::load_status() {

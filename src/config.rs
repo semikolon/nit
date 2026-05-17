@@ -83,6 +83,15 @@ pub struct SyncConfig {
     pub idle_gated: bool,
     #[serde(default)]
     pub overrides: HashMap<String, SyncOverride>,
+    /// Paths declared "forward-only": runtime-mutated files (e.g. the
+    /// decisions CLI state/cache, spela's config) that nit must NEVER deploy
+    /// source->target in steady state — the machine copy is authoritative.
+    /// Tracked for backup but excluded from the pre-pull drift ABORT and
+    /// from the scary "modified" status line, so they stop being perpetual
+    /// noise. Captured to git only on an explicit `nit sync`.
+    /// (v2 forward-only-sync feature, 2026-05-17.)
+    #[serde(default)]
+    pub forward_only: Vec<String>,
 }
 
 fn default_sync_command() -> String {
@@ -93,6 +102,47 @@ fn default_sync_command() -> String {
 #[allow(dead_code)]
 pub struct SyncOverride {
     pub strategy: Option<String>,
+}
+
+/// Extract the work-tree-relative path from a `git status --porcelain` v1
+/// line. Format: 2 status chars + space + path; renames are
+/// `R  old -> new` (take the post-`-> ` destination). Defensive fallback:
+/// the whole line trimmed.
+pub fn porcelain_path(line: &str) -> &str {
+    let rest = line.get(3..).unwrap_or(line).trim();
+    match rest.rsplit_once(" -> ") {
+        Some((_, dst)) => dst.trim(),
+        None => rest,
+    }
+}
+
+/// Is `rel_path` (work-tree-relative, forward-slash) declared forward-only?
+/// EXACT match against the declared list — no globbing/prefixing. Explicit
+/// is the only safe matching for a list that gates the safety-critical
+/// pre-pull abort (a stray glob must never silence a real file's drift).
+pub fn is_forward_only(rel_path: &str, forward_only: &[String]) -> bool {
+    forward_only.iter().any(|fo| fo == rel_path)
+}
+
+/// Filter forward-only paths OUT of the pre-pull drift set.
+///
+/// SAFETY: `sync_status::detect_pre_pull_drift` is intentionally left
+/// untouched (it must keep detecting *all* drift — it is the function that
+/// prevented the 2026-05-04 clobber). This explicit, auditable call-site
+/// filter removes only lines whose path is EXACTLY in `forward_only`. Any
+/// non-forward-only drift line is retained, so a real local edit on any
+/// other tracked file still aborts the pull, unchanged. If a forward-only
+/// path AND a real file are both modified, the real file remains → the
+/// abort still fires. Forward-only exclusion can never weaken protection
+/// for a non-forward-only file.
+pub fn filter_forward_only_drift(drift: Vec<String>, forward_only: &[String]) -> Vec<String> {
+    if forward_only.is_empty() {
+        return drift;
+    }
+    drift
+        .into_iter()
+        .filter(|line| !is_forward_only(porcelain_path(line), forward_only))
+        .collect()
 }
 
 /// Per-machine identity (NOT tracked, at ~/.config/nit/local.toml)
@@ -904,5 +954,80 @@ ssh_host = "gamma"
         assert!(err.contains("delta"));
         // At least one of the available machines should appear
         assert!(err.contains("alpha") || err.contains("beta") || err.contains("gamma"));
+    }
+
+    // ---- forward-only sync (v2, 2026-05-17) ----
+
+    #[test]
+    fn test_porcelain_path_basic() {
+        assert_eq!(
+            porcelain_path(" M .claude/decisions_state.json"),
+            ".claude/decisions_state.json"
+        );
+        assert_eq!(porcelain_path("M  src/main.rs"), "src/main.rs");
+        assert_eq!(porcelain_path("?? new/file"), "new/file");
+    }
+
+    #[test]
+    fn test_porcelain_path_rename() {
+        assert_eq!(porcelain_path("R  old/path -> new/path"), "new/path");
+    }
+
+    #[test]
+    fn test_is_forward_only_exact_match_only() {
+        let fo = vec![".claude/decisions_state.json".to_string()];
+        assert!(is_forward_only(".claude/decisions_state.json", &fo));
+        // No glob / prefix / suffix matching — explicit only (safety).
+        assert!(!is_forward_only(".claude/decisions_state.json.bak", &fo));
+        assert!(!is_forward_only(".claude/decisions", &fo));
+        assert!(!is_forward_only("src/main.rs", &fo));
+    }
+
+    #[test]
+    fn test_filter_only_forward_only_modified_yields_empty() {
+        // Only forward-only files dirty → drift set empties → nit update does NOT abort.
+        let fo = vec![
+            ".claude/decisions_state.json".to_string(),
+            ".config/spela/config.toml".to_string(),
+        ];
+        let drift = vec![
+            " M .claude/decisions_state.json".to_string(),
+            " M .config/spela/config.toml".to_string(),
+        ];
+        assert!(filter_forward_only_drift(drift, &fo).is_empty());
+    }
+
+    #[test]
+    fn test_filter_real_drift_alone_is_retained_still_aborts() {
+        // SAFETY: a non-forward-only modified file MUST survive the filter so
+        // the pre-pull abort still fires (the 2026-05-04-clobber guarantee).
+        let fo = vec![".claude/decisions_state.json".to_string()];
+        let drift = vec![" M .zshrc".to_string()];
+        assert_eq!(
+            filter_forward_only_drift(drift, &fo),
+            vec![" M .zshrc".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_filter_mixed_real_drift_still_aborts() {
+        // SAFETY: forward-only + a real edit together → the real edit remains
+        // → abort still fires. Forward-only exclusion can never weaken
+        // protection when real drift coexists.
+        let fo = vec![".claude/decisions_state.json".to_string()];
+        let drift = vec![
+            " M .claude/decisions_state.json".to_string(),
+            " M .zshrc".to_string(),
+        ];
+        assert_eq!(
+            filter_forward_only_drift(drift, &fo),
+            vec![" M .zshrc".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_filter_empty_forward_only_list_is_noop() {
+        let drift = vec![" M .claude/decisions_state.json".to_string()];
+        assert_eq!(filter_forward_only_drift(drift.clone(), &[]), drift);
     }
 }
