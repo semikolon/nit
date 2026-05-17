@@ -890,7 +890,7 @@ role = ["dev"]
         let current_os = current_os();
         std::fs::write(
             &triggers_path,
-            &format!(
+            format!(
                 r#"
 [[trigger]]
 name = "matching-both"

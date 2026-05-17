@@ -766,7 +766,7 @@ mod tests {
         };
 
         let resolved = resolve_watch_globs(&trigger.watch, dir.path());
-        let skip_drifted = vec!["Brewfile".to_string()];
+        let skip_drifted = ["Brewfile".to_string()];
 
         // Simulate the skip logic from run_applicable_triggers
         let has_drifted = resolved.iter().any(|p| {
@@ -791,8 +791,10 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let state_path = dir.path().join("state.json");
 
-        let mut state = TriggerState::default();
-        state.last_apply = Some("2026-03-24T12:00:00Z".to_string());
+        let mut state = TriggerState {
+            last_apply: Some("2026-03-24T12:00:00Z".to_string()),
+            ..Default::default()
+        };
         let mut hashes = HashMap::new();
         hashes.insert("file.txt".to_string(), "abc123".to_string());
         state

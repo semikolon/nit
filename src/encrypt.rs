@@ -489,7 +489,12 @@ mod tests {
         fs::write(&plaintext_path, "rekey me").unwrap();
 
         // Encrypt with key A
-        encrypt_file(&plaintext_path, &[pubkey_a.clone()], &encrypted_path).unwrap();
+        encrypt_file(
+            &plaintext_path,
+            std::slice::from_ref(&pubkey_a),
+            &encrypted_path,
+        )
+        .unwrap();
 
         // Verify A can decrypt
         let decrypted = decrypt_file(&encrypted_path, &identity_a).unwrap();
@@ -519,7 +524,12 @@ mod tests {
         let plaintext_path = dir.path().join("tier-all.env");
         let encrypted_path = secrets_dir.join("tier-all.env.age");
         fs::write(&plaintext_path, "API_KEY=secret123").unwrap();
-        encrypt_file(&plaintext_path, &[pubkey.clone()], &encrypted_path).unwrap();
+        encrypt_file(
+            &plaintext_path,
+            std::slice::from_ref(&pubkey),
+            &encrypted_path,
+        )
+        .unwrap();
 
         let target_path = dir.path().join("deployed/tier-all.env");
 
@@ -614,7 +624,12 @@ mod tests {
         let plaintext_path = dir.path().join("plaintext.tmp");
         let encrypted_path = secrets_dir.join("tier-all.env.age");
         fs::write(&plaintext_path, "ORIGINAL=value\n").unwrap();
-        encrypt_file(&plaintext_path, &[pubkey.clone()], &encrypted_path).unwrap();
+        encrypt_file(
+            &plaintext_path,
+            std::slice::from_ref(&pubkey),
+            &encrypted_path,
+        )
+        .unwrap();
 
         // Simulate vim-edit-without-encrypt: target has different content
         let target_path = dir.path().join("deployed/tier-all.env");
@@ -674,7 +689,12 @@ mod tests {
         let plaintext_path = dir.path().join("plaintext.tmp");
         let encrypted_path = secrets_dir.join("tier-all.env.age");
         fs::write(&plaintext_path, "X=1\n").unwrap();
-        encrypt_file(&plaintext_path, &[pubkey.clone()], &encrypted_path).unwrap();
+        encrypt_file(
+            &plaintext_path,
+            std::slice::from_ref(&pubkey),
+            &encrypted_path,
+        )
+        .unwrap();
 
         // Pre-populate target with IDENTICAL content
         let target_path = dir.path().join("deployed/tier-all.env");
