@@ -15,20 +15,45 @@ pub struct SecretResult {
     pub status: DeployStatus,
 }
 
+/// Direction of a secret-target drift (which side has content the other lacks),
+/// so the abort message can guide the operator instead of always blaming an
+/// "unflushed manual edit". The pre-2026-05-18 heuristic sent the operator to
+/// investigate a non-edit whenever the source merely advanced upstream and the
+/// deployed target was stale. See nit `TODO.md` § "Finding — nit secret-drift
+/// heuristic is false-positive-prone".
+#[derive(Debug, PartialEq, Eq)]
+pub enum DriftClass {
+    /// Source has key(s) the target lacks, with NO target-only keys and NO
+    /// changed values → the source legitimately advanced; the deployed target
+    /// is stale. `nit apply --force-drift` (take source) is the safe fix;
+    /// `nit encrypt` here would WRONGLY push the stale target back.
+    StaleTarget { missing: usize },
+    /// Target has extra key(s) and/or changed value(s) not in the source → a
+    /// genuine local edit `nit encrypt` would flush. Discarding via
+    /// `--force-drift` would lose it. (Wins over StaleTarget when both hold:
+    /// any target-unique content is the dangerous-to-discard signal.)
+    LikelyUnflushedEdit { extra: usize, changed: usize },
+    /// Non-env content, or a byte-diff with no key-level delta (whitespace /
+    /// comments / ordering) — can't disambiguate; show both options.
+    Ambiguous,
+}
+
 /// Status of a secret deployment
 #[derive(Debug)]
 pub enum DeployStatus {
     Deployed,
     Skipped(String),
     Error(String),
-    /// Target file diverges from source-decrypt — almost always means the user
-    /// vim-edited the target and forgot `nit encrypt`. Apply was aborted to
-    /// prevent silent overwrite of unflushed manual edits.
-    /// See: `~/.claude/CLAUDE.md` § "Secrets editing — `nit encrypt` is part of
-    /// the same edit, not a follow-up step" (May 4, 2026 MANDATORY directive).
+    /// Target file diverges from source-decrypt. `classification` captures the
+    /// *direction* of the divergence so the caller emits direction-correct
+    /// guidance instead of always blaming an unflushed manual edit (2026-05-18
+    /// heuristic refinement; see nit `TODO.md`).
+    /// See also: `~/.claude/CLAUDE.md` § "Secrets editing — `nit encrypt` is
+    /// part of the same edit, not a follow-up step" (May 4, 2026 directive).
     DriftDetected {
         target_bytes: usize,
         source_bytes: usize,
+        classification: DriftClass,
     },
 }
 
@@ -40,7 +65,7 @@ pub enum DeployStatus {
 /// Note: we don't use mtime as a signal — both vim-edits-without-encrypt
 /// AND legitimate forward deploys (post-pull, post-rekey) can produce
 /// "source-decrypt != target". The user must resolve the ambiguity.
-fn check_target_drift(plaintext: &[u8], target_path: &Path) -> Option<(usize, usize)> {
+fn check_target_drift(plaintext: &[u8], target_path: &Path) -> Option<(usize, usize, DriftClass)> {
     if !target_path.exists() {
         return None;
     }
@@ -51,7 +76,91 @@ fn check_target_drift(plaintext: &[u8], target_path: &Path) -> Option<(usize, us
     if target_content == plaintext {
         return None;
     }
-    Some((target_content.len(), plaintext.len()))
+    let classification = classify_env_drift(plaintext, &target_content);
+    Some((target_content.len(), plaintext.len(), classification))
+}
+
+/// Parse an env-style buffer into KEY→VALUE, ignoring blank / `#`-comment /
+/// no-`=` lines and an optional leading `export ` on the key. Mirrors the
+/// operator's mental model of a `tier-*.env` file (order-insensitive).
+fn parse_env(buf: &[u8]) -> std::collections::BTreeMap<String, String> {
+    let mut map = std::collections::BTreeMap::new();
+    let text = String::from_utf8_lossy(buf);
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let Some((raw_key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let mut key = raw_key.trim();
+        if let Some(rest) = key.strip_prefix("export ") {
+            key = rest.trim();
+        }
+        if key.is_empty() {
+            continue;
+        }
+        map.insert(key.to_string(), value.to_string());
+    }
+    map
+}
+
+/// Classify the *direction* of a secret-target drift so the abort message can
+/// guide the operator. The pre-2026-05-18 heuristic always said "unflushed
+/// manual edit" — wrong, and a wasted investigation, when the source merely
+/// advanced upstream and the target is stale. Conservative priority: ANY
+/// target-unique content (extra key OR changed value) ⇒ `LikelyUnflushedEdit`
+/// (the dangerous-to-discard case) even if keys are also missing; pure
+/// missing-only ⇒ `StaleTarget` (safe to `--force-drift`).
+fn classify_env_drift(source: &[u8], target: &[u8]) -> DriftClass {
+    let src = parse_env(source);
+    let tgt = parse_env(target);
+    if src.is_empty() && tgt.is_empty() {
+        return DriftClass::Ambiguous; // non-env content (e.g. a config blob)
+    }
+    let missing = src.keys().filter(|k| !tgt.contains_key(*k)).count();
+    let extra = tgt.keys().filter(|k| !src.contains_key(*k)).count();
+    let mut changed = 0usize;
+    for (k, v) in &src {
+        if let Some(tv) = tgt.get(k)
+            && tv != v
+        {
+            changed += 1;
+        }
+    }
+    if extra > 0 || changed > 0 {
+        DriftClass::LikelyUnflushedEdit { extra, changed }
+    } else if missing > 0 {
+        DriftClass::StaleTarget { missing }
+    } else {
+        // byte-diff with no key-level delta (whitespace / comments / ordering)
+        DriftClass::Ambiguous
+    }
+}
+
+/// Direction-aware operator guidance for a detected drift. Single source of
+/// truth shared by `cmd_apply`, `cmd_update`, and `bootstrap` so all three
+/// emit identical, correct advice.
+pub fn drift_guidance(class: &DriftClass, target: &str) -> String {
+    match class {
+        DriftClass::StaleTarget { missing } => format!(
+            "target is STALE ({missing} key(s) the source added upstream are \
+             missing; no local edits) — `nit apply --force-drift` is SAFE here \
+             (take the authoritative source). Do NOT `nit encrypt`: it would \
+             push the stale target back over the source."
+        ),
+        DriftClass::LikelyUnflushedEdit { extra, changed } => format!(
+            "target has LOCAL edits not in the source ({extra} extra key(s), \
+             {changed} changed) — run `nit encrypt {target}` to flush them into \
+             the source, or `nit apply --force-drift` to DISCARD them."
+        ),
+        DriftClass::Ambiguous => format!(
+            "target diverges from source (non-key-level or mixed) — \
+             `nit encrypt {target}` to flush target→source, or \
+             `nit apply --force-drift` to overwrite target with source."
+        ),
+    }
 }
 
 /// Encrypt a plaintext file to one or more age recipients, writing to output_path.
@@ -286,7 +395,7 @@ pub fn deploy_secrets(
         };
 
         if !force_drift_override
-            && let Some((target_bytes, source_bytes)) =
+            && let Some((target_bytes, source_bytes, classification)) =
                 check_target_drift(plaintext.as_bytes(), &target_path)
         {
             results.push(SecretResult {
@@ -295,6 +404,7 @@ pub fn deploy_secrets(
                 status: DeployStatus::DriftDetected {
                     target_bytes,
                     source_bytes,
+                    classification,
                 },
             });
             continue;
@@ -609,6 +719,106 @@ mod tests {
         assert!(matches!(results[0].status, DeployStatus::Error(_)));
     }
 
+    // ── 2026-05-18 drift-direction classifier (the fleet-rollout finding) ──
+
+    /// The MERIAN `tier-mac` anchoring case: source legitimately gained a key
+    /// upstream; the deployed target is just stale (missing it), no local
+    /// edits. Must classify StaleTarget so the operator is told `--force-drift`
+    /// is SAFE — NOT sent to investigate a non-edit.
+    #[test]
+    fn classify_stale_target_when_source_added_a_key() {
+        let source = b"A=1\nB=2\nADDED_UPSTREAM=x\n";
+        let target = b"A=1\nB=2\n";
+        assert_eq!(
+            classify_env_drift(source, target),
+            DriftClass::StaleTarget { missing: 1 }
+        );
+    }
+
+    #[test]
+    fn classify_unflushed_edit_when_target_has_extra_key() {
+        let source = b"A=1\nB=2\n";
+        let target = b"A=1\nB=2\nC=3\n";
+        assert_eq!(
+            classify_env_drift(source, target),
+            DriftClass::LikelyUnflushedEdit {
+                extra: 1,
+                changed: 0
+            }
+        );
+    }
+
+    #[test]
+    fn classify_unflushed_edit_when_value_changed() {
+        let source = b"A=1\nB=2\n";
+        let target = b"A=1\nB=999\n";
+        assert_eq!(
+            classify_env_drift(source, target),
+            DriftClass::LikelyUnflushedEdit {
+                extra: 0,
+                changed: 1
+            }
+        );
+    }
+
+    /// Mixed (target both missing a source key AND carrying an extra one):
+    /// conservative priority must pick the dangerous-to-discard class so
+    /// `--force-drift` is never wrongly advertised as safe.
+    #[test]
+    fn classify_mixed_prefers_unflushed_edit() {
+        let source = b"A=1\nB=2\nC=3\n"; // C missing from target
+        let target = b"A=1\nB=2\nD=4\n"; // D extra on target
+        assert_eq!(
+            classify_env_drift(source, target),
+            DriftClass::LikelyUnflushedEdit {
+                extra: 1,
+                changed: 0
+            }
+        );
+    }
+
+    /// Parser must strip `export ` + ignore comments so a purely cosmetic
+    /// byte-diff (same keys/values) is NOT mis-flagged as a genuine edit.
+    #[test]
+    fn classify_ambiguous_when_only_cosmetic_diff() {
+        let source = b"export A=1\n# a comment\nB=2\n";
+        let target = b"A=1\nB=2\n";
+        assert_eq!(classify_env_drift(source, target), DriftClass::Ambiguous);
+    }
+
+    #[test]
+    fn classify_ambiguous_for_non_env_content() {
+        let source = b"some free-form\nblob with no equals\n";
+        let target = b"a different blob entirely\n";
+        assert_eq!(classify_env_drift(source, target), DriftClass::Ambiguous);
+    }
+
+    /// Guidance must be direction-correct: StaleTarget says force-drift is
+    /// SAFE and warns off `nit encrypt`; UnflushedEdit names `nit encrypt
+    /// <target>` and DISCARD; Ambiguous offers both.
+    #[test]
+    fn drift_guidance_is_direction_correct() {
+        let stale = drift_guidance(&DriftClass::StaleTarget { missing: 2 }, "/tmp/t.env");
+        assert!(stale.contains("STALE"));
+        assert!(stale.contains("`nit apply --force-drift` is SAFE"));
+        assert!(stale.contains("Do NOT `nit encrypt`"));
+
+        let edit = drift_guidance(
+            &DriftClass::LikelyUnflushedEdit {
+                extra: 1,
+                changed: 0,
+            },
+            "/tmp/t.env",
+        );
+        assert!(edit.contains("LOCAL edits"));
+        assert!(edit.contains("nit encrypt /tmp/t.env"));
+        assert!(edit.contains("DISCARD"));
+
+        let amb = drift_guidance(&DriftClass::Ambiguous, "/tmp/t.env");
+        assert!(amb.contains("non-key-level or mixed"));
+        assert!(amb.contains("--force-drift"));
+    }
+
     /// Anchoring scenario for the May 5, 2026 drift-detection feature: target
     /// has unflushed manual edits, source-decrypt diverges. `deploy_secrets`
     /// must NOT clobber it (must report DriftDetected). Then `--force-drift`
@@ -654,9 +864,19 @@ mod tests {
             DeployStatus::DriftDetected {
                 target_bytes,
                 source_bytes,
+                classification,
             } => {
                 assert_eq!(*target_bytes, "VIM_EDITED=newvalue\n".len());
                 assert_eq!(*source_bytes, "ORIGINAL=value\n".len());
+                // ORIGINAL only-in-source, VIM_EDITED only-in-target →
+                // target-unique content present ⇒ genuine-edit class.
+                assert_eq!(
+                    *classification,
+                    DriftClass::LikelyUnflushedEdit {
+                        extra: 1,
+                        changed: 0
+                    }
+                );
             }
             other => panic!("expected DriftDetected, got {:?}", other),
         }

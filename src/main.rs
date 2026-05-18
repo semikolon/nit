@@ -746,16 +746,16 @@ fn cmd_apply(
                     encrypt::DeployStatus::DriftDetected {
                         target_bytes,
                         source_bytes,
+                        classification,
                     } => {
                         secrets_drift_count += 1;
                         eprintln!(
-                            "nit: secret {} DRIFT: {} (target {}B, source-decrypt {}B) — \
-                             target diverges from source. The target was likely vim-edited \
-                             without `nit encrypt`. Apply was skipped to prevent silent overwrite. \
-                             Resolve with one of:\n  \
-                             nit encrypt {}    # flush target → source (preserve target edits)\n  \
-                             nit apply --force-drift   # overwrite target with source (discard target edits)",
-                            r.tier, r.target, target_bytes, source_bytes, r.target
+                            "nit: secret {} DRIFT: {} (target {}B, source-decrypt {}B) — {}",
+                            r.tier,
+                            r.target,
+                            target_bytes,
+                            source_bytes,
+                            encrypt::drift_guidance(classification, &r.target)
                         );
                     }
                 }
@@ -1686,13 +1686,16 @@ fn cmd_update(safe: bool, config: &NitConfig) -> Result<(), Box<dyn std::error::
                     encrypt::DeployStatus::DriftDetected {
                         target_bytes,
                         source_bytes,
+                        classification,
                     } => {
                         secrets_drift_count += 1;
                         eprintln!(
-                            "nit: secret {} DRIFT: {} (target {}B, source-decrypt {}B) — \
-                             unflushed manual edit detected. Run `nit encrypt {}` to flush \
-                             or `nit apply --force-drift` to discard target edits.",
-                            r.tier, r.target, target_bytes, source_bytes, r.target
+                            "nit: secret {} DRIFT: {} (target {}B, source-decrypt {}B) — {}",
+                            r.tier,
+                            r.target,
+                            target_bytes,
+                            source_bytes,
+                            encrypt::drift_guidance(classification, &r.target)
                         );
                     }
                 }
