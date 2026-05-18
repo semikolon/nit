@@ -76,6 +76,18 @@ A founding-spec read (`~/dotfiles/.claude/specs/nit/requirements.md` US-5 + EARS
 
 **Recommended order (updated 2026-05-17):** ✅ clippy hygiene (`51e002a`) → ✅ **honor-staged-scope keystone + re-scope-deploy-to-staged via Session-intent scoping** (`02c30db`; RED-GREEN + end-to-end verified) → ✅ **nit-transparency fix** (this commit; RED-GREEN + end-to-end smoke) → ✅ obsolescence pass (index-lock + atomic-add-commit retired as keystone-resolved; *unexpected-gate-is-information* kept) → ✅ **PUSHED to `semikolon/nit` master, 2026-05-17** (PUBLIC OSS repo; trufflehog-clean — 0 verified / 0 findings of any kind; clean fast-forward, no force; 208 tests + `cargo clippy -- -D warnings` + `--all-targets` + `cargo fmt --check` all green). Index lock = rejected alternative; revisit only on a real keystone-insufficiency failure (see correction note above).
 
+### Post-keystone fleet-rollout hardening (2026-05-18)
+
+Surfaced + fixed while deploying the keystone fleet-wide (all pushed; Mac Mini runs `cd1d18a`):
+- ✅ **`nit sync` no longer git-commits** (`cd1d18a`) — snapshots forward-only paths to `~/.local/share/nit/forward-only/` (restic-covered, local-only). Kills the push-lineage → fleet-pull-conflict landmine. MIGRATION_CHECKLIST forward-only § trued + residual caveat recorded there.
+- ✅ **`nit commit -m` repeatable like git** (`ee041f9`) — `Vec<String>`, `\n\n`-joined paragraphs; was a single-value clap footgun.
+- ✅ **`rebuild-nit` no_local_build gate** (dotfiles `bfa4362f`) — shannon+turing flagged `no_local_build = true` in fleet.toml; rebuild-nit is **correct-by-construction** structurally incapable of `cargo install` on them (fetches Darwin-cross-staged aarch64, else skip-loud; stale-but-running is safe, frozen is not). Strong machines unchanged (verified per-machine vs real fleet.toml; `bash -n` clean).
+- ✅ **Push-gate directive relaxed** (`~/.claude/CLAUDE.md` § Git Workflow) — private-repo non-secret push = low-ceremony just-push; full rigor only for public / secret-bearing / sensitive-aggregate; plaintext-credential invariant always.
+
+**Durable follow-up (the rebuild-nit fix is an INTERIM — *Fix the system, never work around it*):** Darwin-internal cross-stage is fleet-build infra. End-state = the **GitHub-Actions release-artifact path design.md already intends** (`release.yml` cross-builds aarch64/x86_64/arm64-darwin; make `.nit-version` bumps produce/point to a downloadable artifact so NO fleet box compiles, Darwin included). Not built; tracked here.
+
+**Open next-step — per-host fleet propagation (USER-GATED):** Darwin/MERIAN/Shannon/Turing are NOT yet on `cd1d18a`. Their nightly `nit update` historically aborts (old nit + own runtime drift); needs explicit per-host go (Darwin = prod-router → mandatory resource preflight). **Residual landmine, first post-upgrade pull on any machine with forward-only runtime drift:** pre-fix `nit sync` snapshot commits are already on dotfiles origin → before that machine's first pull, drift-resolve its forward-only paths (snapshot-then-`git checkout -- <those paths>`). One-time; full detail in `docs/MIGRATION_CHECKLIST.md` forward-only "Shipped reality (2026-05-18)" note. The concurrent Shannon session was handed this + the `cd1d18a` manual cross-build-and-deploy.
+
 ### Cross-references
 - **Correct-behavior reference:** `b643880c` + `99b6503c` (4-/2-file "plain files only" path — what `nit commit` *should* do; proves the spec-intended path works absent template drift).
 - **Failure exemplar:** `3cf94eb8` (template-mode, 21-file + 17-template live-deploy). All local, unpushed.
