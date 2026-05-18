@@ -60,6 +60,20 @@ pub fn write_sync_base(target_rel: &str, content: &str) {
     atomic_write(&path, content);
 }
 
+/// Forward-only snapshot directory: ~/.local/share/nit/forward-only/
+pub fn forward_only_dir() -> PathBuf {
+    nit_data_dir().join("forward-only")
+}
+
+/// Write a forward-only runtime snapshot (atomic; mirrors write_sync_base).
+/// LOCAL-only durable capture — deliberately NOT a git commit, so it can
+/// never ride the push lineage onto origin and merge-conflict fleet
+/// machines' pulls of their own runtime-drifted copies. restic backs up
+/// this dir (same tier as sync-base/drift).
+pub fn write_forward_only_snapshot(rel: &str, content: &str) {
+    atomic_write(&forward_only_dir().join(rel), content);
+}
+
 // ---------------------------------------------------------------------------
 // Drift detection
 // ---------------------------------------------------------------------------

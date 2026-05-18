@@ -1037,8 +1037,19 @@ fn detect_live_drift(mapping: &template::TemplateMapping, _config: &NitConfig) -
 // never `-A`, never sweeps another session's staged changes (contamination-
 // safe, per the "commit caution scales with reversibility" directive). Does
 // NOT push (push is an explicit boundary the user owns).
+/// Pure: which declared forward-only paths are present on this machine.
+/// A declared path may legitimately be absent here (e.g. spela config on a
+/// server); exclude it so `nit sync` never snapshots/errors on a missing
+/// file. RED-GREEN testable (inject the presence predicate).
+fn present_forward_only(forward_only: &[String], is_present: impl Fn(&str) -> bool) -> Vec<String> {
+    forward_only
+        .iter()
+        .filter(|p| is_present(p))
+        .cloned()
+        .collect()
+}
+
 fn cmd_sync(config: &NitConfig) -> Result<(), Box<dyn std::error::Error>> {
-    let strategy = config.git_strategy();
     let forward_only: Vec<String> = config
         .fleet
         .sync
@@ -1051,34 +1062,35 @@ fn cmd_sync(config: &NitConfig) -> Result<(), Box<dyn std::error::Error>> {
         );
         return Ok(());
     }
-    // Only flush declared paths that actually exist on this machine — a
-    // declared path may legitimately be absent here (e.g. spela config on a
-    // server). Avoids a pathspec error aborting the whole commit.
+    // Snapshot to a LOCAL dir (restic-covered), NOT a git commit. A git
+    // commit here would ride the push lineage onto origin and merge-conflict
+    // every fleet machine's pull of its own runtime-drifted copy. Per-machine
+    // runtime state must never enter shared/pushable history (keeping origin's
+    // forward-only files static also means bootstrap seeds from baseline,
+    // not from another machine's live state).
     let home = dirs::home_dir().expect("cannot determine home directory");
-    let present: Vec<&str> = forward_only
-        .iter()
-        .filter(|p| home.join(p.as_str()).exists())
-        .map(|p| p.as_str())
-        .collect();
+    let present = present_forward_only(&forward_only, |p| home.join(p).exists());
     if present.is_empty() {
         eprintln!(
-            "nit sync: no declared forward-only files present on this machine — nothing to flush"
+            "nit sync: no declared forward-only files present on this machine — nothing to snapshot"
         );
         return Ok(());
     }
-    let mut args: Vec<&str> = vec!["commit", "-m", "sync: forward-only runtime snapshot", "--"];
-    args.extend(present.iter().copied());
-    let status = git::exec_git_with(strategy, &args)?;
-    if status.success() {
-        eprintln!(
-            "nit sync: flushed {} forward-only path(s) — committed locally, NOT pushed",
-            present.len()
-        );
-    } else {
-        // Non-zero almost always = "nothing to commit" (files unchanged since
-        // last flush). Benign — not an error condition.
-        eprintln!("nit sync: forward-only files unchanged — nothing to flush");
+    let mut n = 0usize;
+    for rel in &present {
+        match std::fs::read_to_string(home.join(rel)) {
+            Ok(content) => {
+                syncbase::write_forward_only_snapshot(rel, &content);
+                n += 1;
+            }
+            Err(e) => eprintln!("nit sync: skipped {rel} (read failed: {e})"),
+        }
     }
+    eprintln!(
+        "nit sync: snapshotted {n} forward-only path(s) → {} — local only, NOT a git commit \
+         (restic-covered; never pushed → never conflicts fleet pulls)",
+        syncbase::forward_only_dir().display()
+    );
     Ok(())
 }
 
@@ -2812,5 +2824,22 @@ source_dir = "~/dotfiles/templates"
             resolve_commit_message(&[], None, None).unwrap(),
             "nit commit"
         );
+    }
+
+    // ── nit sync: present-forward-only selection (no-git-commit fix) ───────
+
+    #[test]
+    fn present_forward_only_excludes_absent() {
+        let got = present_forward_only(&av(&["a", "b", "c"]), |p| p != "b");
+        assert_eq!(
+            got,
+            av(&["a", "c"]),
+            "a declared-but-absent forward-only path must be excluded"
+        );
+    }
+
+    #[test]
+    fn present_forward_only_empty_when_none_present() {
+        assert!(present_forward_only(&av(&["x", "y"]), |_| false).is_empty());
     }
 }
