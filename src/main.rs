@@ -465,6 +465,22 @@ fn target_rel_path(target: &Path) -> String {
         .to_string()
 }
 
+/// Whether a template target carries a genuine local edit to reconcile.
+///
+/// Drift matters only when the target differs from BOTH the recorded sync-base
+/// AND the freshly-rendered source. If `render == target` the source has caught
+/// up to the local edit (e.g. the edit was incorporated into the template, or a
+/// prior source-wins deploy already wrote it), so writing the render is a no-op
+/// — there is nothing to preserve or clobber. Requiring `target != render` (not
+/// just the historical `base != target`) is what lets a resolved drift self-heal
+/// instead of phantom-reporting forever and skipping the file every nightly run.
+/// Safety: when this returns false, the only target the deploy can change is one
+/// that equals the sync-base (a normal update, never a local edit), or one that
+/// already equals the render (a no-op) — the never-clobber guarantee is intact.
+fn is_real_drift(base: Option<&str>, target: Option<&str>, render: &str) -> bool {
+    matches!((base, target), (Some(b), Some(t)) if b != t && t != render)
+}
+
 /// Prepend a warning comment to rendered content before writing to target.
 /// Returns the content unchanged if no comment is appropriate (e.g., JSON).
 fn prepend_warning(rendered: &str, target: &Path) -> String {
@@ -694,7 +710,7 @@ fn cmd_apply(
         // 3. Read target
         let target_content = std::fs::read_to_string(&mapping.target).ok();
 
-        let has_drift = matches!((&base_content, &target_content), (Some(base), Some(target)) if base != target);
+        let has_drift = is_real_drift(base_content.as_deref(), target_content.as_deref(), &rendered_with_comment);
 
         if has_drift {
             // 5. base != target: save drift, deploy source-wins, update sync-base, SKIP triggers
@@ -1471,7 +1487,7 @@ fn cmd_commit(
         let base_content = syncbase::read_sync_base(&rel);
         let target_content = std::fs::read_to_string(&mapping.target).ok();
 
-        let has_drift = matches!((&base_content, &target_content), (Some(base), Some(target)) if base != target);
+        let has_drift = is_real_drift(base_content.as_deref(), target_content.as_deref(), &rendered_with_comment);
 
         if has_drift {
             let drift_diff = syncbase::detect_drift(&rel, target_content.as_deref().unwrap_or(""));
@@ -1480,6 +1496,10 @@ fn cmd_commit(
             }
             drifted_rels.push(rel.clone());
             eprintln!("nit: \u{26a0} Drift saved for {} — source wins", rel);
+        } else {
+            // No real drift: clear any stale .diff so a resolved drift (e.g.
+            // incorporated into the template source) can't phantom-report forever.
+            syncbase::clear_drift(&rel);
         }
 
         write_target(&mapping.target, &rendered_with_comment)?;
@@ -1645,7 +1665,7 @@ fn cmd_update(safe: bool, config: &NitConfig) -> Result<(), Box<dyn std::error::
         let base_content = syncbase::read_sync_base(&rel);
         let target_content = std::fs::read_to_string(&mapping.target).ok();
 
-        let has_drift = matches!((&base_content, &target_content), (Some(base), Some(target)) if base != target);
+        let has_drift = is_real_drift(base_content.as_deref(), target_content.as_deref(), &rendered_with_comment);
 
         if has_drift {
             // nit update special behavior: SKIP drifted files (preserve local fixes)
@@ -2333,6 +2353,38 @@ fn read_identity_pubkey(identity_path: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── is_real_drift: self-healing drift detection ──────────────────
+    #[test]
+    fn test_is_real_drift_no_base_is_not_drift() {
+        // never deployed (no sync-base) → fresh deploy, not drift
+        assert!(!is_real_drift(None, Some("x"), "x"));
+    }
+
+    #[test]
+    fn test_is_real_drift_base_equals_target_is_not_drift() {
+        // target matches last deploy → normal update of new render, not drift
+        assert!(!is_real_drift(Some("x"), Some("x"), "new-render"));
+    }
+
+    #[test]
+    fn test_is_real_drift_render_caught_up_to_target_is_not_drift() {
+        // sync-base stale, BUT render now equals the (locally-edited) target →
+        // source caught up; writing render is a no-op → self-heal, not drift.
+        // This is the phantom-drift case (mannaminne-ingest plist, 2026-06-29).
+        assert!(!is_real_drift(Some("old-render"), Some("new"), "new"));
+    }
+
+    #[test]
+    fn test_is_real_drift_genuine_local_edit_is_drift() {
+        // target differs from BOTH base and render → real local edit to preserve
+        assert!(is_real_drift(Some("old"), Some("local-edit"), "new-render"));
+    }
+
+    #[test]
+    fn test_is_real_drift_missing_target_is_not_drift() {
+        assert!(!is_real_drift(Some("x"), None, "x"));
+    }
 
     // ─── add_recipient_to_toml ────────────────────────────────────────
     //
