@@ -710,7 +710,11 @@ fn cmd_apply(
         // 3. Read target
         let target_content = std::fs::read_to_string(&mapping.target).ok();
 
-        let has_drift = is_real_drift(base_content.as_deref(), target_content.as_deref(), &rendered_with_comment);
+        let has_drift = is_real_drift(
+            base_content.as_deref(),
+            target_content.as_deref(),
+            &rendered_with_comment,
+        );
 
         if has_drift {
             // 5. base != target: save drift, deploy source-wins, update sync-base, SKIP triggers
@@ -1487,7 +1491,11 @@ fn cmd_commit(
         let base_content = syncbase::read_sync_base(&rel);
         let target_content = std::fs::read_to_string(&mapping.target).ok();
 
-        let has_drift = is_real_drift(base_content.as_deref(), target_content.as_deref(), &rendered_with_comment);
+        let has_drift = is_real_drift(
+            base_content.as_deref(),
+            target_content.as_deref(),
+            &rendered_with_comment,
+        );
 
         if has_drift {
             let drift_diff = syncbase::detect_drift(&rel, target_content.as_deref().unwrap_or(""));
@@ -1665,7 +1673,11 @@ fn cmd_update(safe: bool, config: &NitConfig) -> Result<(), Box<dyn std::error::
         let base_content = syncbase::read_sync_base(&rel);
         let target_content = std::fs::read_to_string(&mapping.target).ok();
 
-        let has_drift = is_real_drift(base_content.as_deref(), target_content.as_deref(), &rendered_with_comment);
+        let has_drift = is_real_drift(
+            base_content.as_deref(),
+            target_content.as_deref(),
+            &rendered_with_comment,
+        );
 
         if has_drift {
             // nit update special behavior: SKIP drifted files (preserve local fixes)
