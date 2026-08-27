@@ -97,6 +97,15 @@ pub fn fall_through(args: &[String]) -> ! {
 pub fn fall_through_with(strategy: &GitStrategy, args: &[String]) -> ! {
     let str_args: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
+    // Every fall-through records its index delta, so a passthrough that stages
+    // (`nit mv`, `nit rm`, `nit git add`) records the same session intent
+    // `nit add` does. Without it `nit commit` scopes the work out and drops it
+    // silently. Done HERE rather than per-subcommand: this is the single
+    // chokepoint every fall-through crosses, so a future staging subcommand is
+    // covered without anyone extending a list. A read-only subcommand
+    // (`log`, `diff`, `show`) yields an empty delta, so the wrap costs nothing.
+    let staged_before = crate::syncbase::staged_index_snapshot(strategy);
+
     let status = git_command(strategy)
         .args(&str_args)
         .status()
@@ -104,6 +113,10 @@ pub fn fall_through_with(strategy: &GitStrategy, args: &[String]) -> ! {
             eprintln!("nit: failed to exec git: {}", e);
             std::process::exit(1);
         });
+
+    // Record even on failure: a partially-applied `mv` still staged something,
+    // and unrecorded staged work is exactly the failure this closes.
+    crate::syncbase::record_staged_delta(strategy, &staged_before);
 
     std::process::exit(status.code().unwrap_or(1));
 }

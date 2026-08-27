@@ -1100,3 +1100,59 @@ mod tests {
         assert_eq!(out, vec!["a".to_string(), "z".to_string()]);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Session-intent recording for index mutations
+//
+// `nit commit` commits only what THIS session recorded as staged. Anything
+// that stages without recording is therefore silently dropped from the commit
+// — which is what happened on 2026-08-27 when `nit mv` staged both halves of
+// a rename and the commit carried neither. These two live here, beside the
+// store they write, so EVERY staging path can use the same pair.
+//
+// `--no-renames` is load-bearing: with rename detection on (git's default)
+// a staged rename reports as ONE path (the new one), so the delete half is
+// invisible to both the session record and the commit pathspec, and the
+// commit lands as a spurious add with the deletion orphaned in the index.
+// ---------------------------------------------------------------------------
+
+/// Snapshot the staged set (work-tree-root-relative) for delta computation.
+pub fn staged_index_snapshot(
+    strategy: &crate::config::GitStrategy,
+) -> std::collections::BTreeSet<String> {
+    crate::git::git_output_with(
+        strategy,
+        &["diff", "--cached", "--name-only", "--no-renames"],
+    )
+    .unwrap_or_default()
+    .lines()
+    .filter(|l| !l.is_empty())
+    .map(|s| s.to_string())
+    .collect()
+}
+
+/// Record into this session-anchor's store the paths newly staged since
+/// `before`. Delta-based rather than explicit-path-based on purpose: it avoids
+/// path-normalization hazards and conservatively under-records rather than
+/// over-records — an unrecorded path is excluded from commit scope, and a
+/// benign "nothing staged by this session" beats wrongly bundling another
+/// session's work.
+pub fn record_staged_delta(
+    strategy: &crate::config::GitStrategy,
+    before: &std::collections::BTreeSet<String>,
+) {
+    let after = crate::git::git_output_with(
+        strategy,
+        &["diff", "--cached", "--name-only", "--no-renames"],
+    )
+    .unwrap_or_default();
+    let newly: Vec<String> = after
+        .lines()
+        .filter(|l| !l.is_empty())
+        .filter(|l| !before.contains(*l))
+        .map(|s| s.to_string())
+        .collect();
+    if !newly.is_empty() {
+        record_session_staged(&newly);
+    }
+}

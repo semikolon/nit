@@ -1150,6 +1150,12 @@ struct CommitPlan {
     /// while session-intent scoping protects every nit-add flow (the incident
     /// class).
     session_tracking_bypassed: bool,
+    /// Staged in the shared index but OUTSIDE this commit's scope: a
+    /// concurrent session's work, or staging that recorded no session intent
+    /// (raw `git add` run outside nit). Reported at commit time so a partial
+    /// commit can never LOOK complete — the silent half of the 2026-08-27
+    /// half-committed-rename incident.
+    out_of_scope: Vec<String>,
 }
 
 /// See module contract above. `template_source_rels[i]` is the work-tree-
@@ -1186,6 +1192,14 @@ fn plan_commit_scope(
     commit_pathspec.sort();
 
     let scope_set: BTreeSet<&str> = commit_pathspec.iter().map(String::as_str).collect();
+    let mut out_of_scope: Vec<String> = index_staged
+        .iter()
+        .filter(|p| !scope_set.contains(p.as_str()))
+        .cloned()
+        .collect();
+    out_of_scope.sort();
+    out_of_scope.dedup();
+
     let deploy_mapping_idx: Vec<usize> = template_source_rels
         .iter()
         .enumerate()
@@ -1198,6 +1212,7 @@ fn plan_commit_scope(
         commit_pathspec,
         deploy_mapping_idx,
         session_tracking_bypassed,
+        out_of_scope,
     }
 }
 
@@ -1213,17 +1228,7 @@ fn record_session_staged_delta(
     strategy: &crate::config::GitStrategy,
     before: &std::collections::BTreeSet<String>,
 ) {
-    let after =
-        git::git_output_with(strategy, &["diff", "--cached", "--name-only"]).unwrap_or_default();
-    let newly: Vec<String> = after
-        .lines()
-        .filter(|l| !l.is_empty())
-        .filter(|l| !before.contains(*l))
-        .map(|s| s.to_string())
-        .collect();
-    if !newly.is_empty() {
-        syncbase::record_session_staged(&newly);
-    }
+    syncbase::record_staged_delta(strategy, before);
 }
 
 /// Snapshot the currently-staged set (work-tree-root-relative), for delta
@@ -1231,12 +1236,7 @@ fn record_session_staged_delta(
 fn staged_index_snapshot(
     strategy: &crate::config::GitStrategy,
 ) -> std::collections::BTreeSet<String> {
-    git::git_output_with(strategy, &["diff", "--cached", "--name-only"])
-        .unwrap_or_default()
-        .lines()
-        .filter(|l| !l.is_empty())
-        .map(|s| s.to_string())
-        .collect()
+    syncbase::staged_index_snapshot(strategy)
 }
 
 /// Pure: resolve the final commit message from `-m`/`-F` precedence
@@ -1296,7 +1296,10 @@ fn cmd_commit(
     let msg = msg_owned.as_str();
 
     // 1. Check what's staged
-    let staged_output = git::git_output_with(strategy, &["diff", "--cached", "--name-only"])?;
+    let staged_output = git::git_output_with(
+        strategy,
+        &["diff", "--cached", "--name-only", "--no-renames"],
+    )?;
     let staged_files: Vec<&str> = staged_output.lines().filter(|l| !l.is_empty()).collect();
 
     if staged_files.is_empty() {
@@ -1340,6 +1343,26 @@ fn cmd_commit(
                     session staged are no longer staged (already committed, or \
                     unstaged). Run `nit add <paths>` first."
             .into());
+    }
+
+    // Fail loud on a partial commit. Scoping means the index can hold staged
+    // work this commit will NOT include; reporting only the committed count
+    // makes a half-finished operation look finished (2026-08-27: a `git mv`
+    // rename committed its add half and left the delete half staged, reported
+    // as "1 file changed").
+    if !plan.out_of_scope.is_empty() {
+        eprintln!(
+            "nit: \u{26a0} {} staged path(s) NOT in this commit's scope:",
+            plan.out_of_scope.len()
+        );
+        for p in &plan.out_of_scope {
+            eprintln!("nit:     {}", p);
+        }
+        eprintln!(
+            "nit: staged by another session, or staged without recording session \
+             intent (raw `git add`). To include them: `nit add <paths>` then commit \
+             again. To drop them: `nit reset <paths>`."
+        );
     }
 
     // Deploy/ack scope = ONLY templates whose source is in this session's
@@ -1924,8 +1947,11 @@ fn cmd_status(
         // verification primitive was missing). Uses the SAME pure
         // `plan_commit_scope` cmd_commit uses, fed the SAME
         // `git diff --cached --name-only` index, so the preview cannot lie.
-        let idx = git::git_output_with(strategy, &["diff", "--cached", "--name-only"])
-            .unwrap_or_default();
+        let idx = git::git_output_with(
+            strategy,
+            &["diff", "--cached", "--name-only", "--no-renames"],
+        )
+        .unwrap_or_default();
         let index_staged: Vec<String> = idx
             .lines()
             .filter(|l| !l.is_empty())
@@ -2755,6 +2781,47 @@ source_dir = "~/dotfiles/templates"
             "a session path no longer in the index drops out of scope"
         );
         assert!(!plan.session_tracking_bypassed);
+    }
+
+    // RED-GREEN for the 2026-08-27 half-committed-rename incident. `git mv`
+    // stages BOTH halves; with `--no-renames` the index view reports both, so
+    // both must reach the pathspec — committing only the new path produces a
+    // spurious add and leaves the delete staged.
+    #[test]
+    fn staged_rename_commits_both_halves() {
+        let both = sv(&["docs/new_name.md", "docs/old_name.md"]);
+        let plan = plan_commit_scope(&both, &both, &[]);
+        assert_eq!(
+            plan.commit_pathspec, both,
+            "both halves of a rename must be in scope, or git records an add \
+             and orphans the deletion in the index"
+        );
+        assert!(plan.out_of_scope.is_empty(), "nothing left staged behind");
+    }
+
+    #[test]
+    fn out_of_scope_reports_what_this_commit_leaves_staged() {
+        let session = sv(&["docs/mine.md"]);
+        let index = sv(&["docs/mine.md", "docs/theirs.md", "docs/old_name.md"]);
+        let plan = plan_commit_scope(&session, &index, &[]);
+        assert_eq!(plan.commit_pathspec, sv(&["docs/mine.md"]));
+        assert_eq!(
+            plan.out_of_scope,
+            sv(&["docs/old_name.md", "docs/theirs.md"]),
+            "staged-but-unscoped paths are reported so a partial commit \
+             cannot look complete"
+        );
+    }
+
+    #[test]
+    fn bypassed_session_has_nothing_out_of_scope() {
+        let index = sv(&["x.txt", "y.txt"]);
+        let plan = plan_commit_scope(&[], &index, &[]);
+        assert!(plan.session_tracking_bypassed);
+        assert!(
+            plan.out_of_scope.is_empty(),
+            "whole-index fallback commits everything staged — no residue to warn about"
+        );
     }
 
     #[test]
