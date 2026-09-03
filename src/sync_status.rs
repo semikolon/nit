@@ -63,6 +63,11 @@ pub struct SyncStatus {
     /// ISO timestamp of the last AbortedDrift result, for staleness tracking.
     #[serde(default)]
     pub last_success_at: Option<String>,
+    /// ISO timestamp of the last deadlock alert sent for this machine. Kept so
+    /// a persistent deadlock re-alerts periodically instead of either nagging
+    /// every night or going silent again.
+    #[serde(default)]
+    pub last_notified_at: Option<String>,
 }
 
 impl SyncStatus {
@@ -80,6 +85,7 @@ impl SyncStatus {
             triggers_failed: 0,
             errors: Vec::new(),
             last_success_at: None,
+            last_notified_at: None,
         }
     }
 }

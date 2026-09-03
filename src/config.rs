@@ -92,6 +92,12 @@ pub struct SyncConfig {
     /// (v2 forward-only-sync feature, 2026-05-17.)
     #[serde(default)]
     pub forward_only: Vec<String>,
+    /// Where to push an alert when this machine's sync has been deadlocked for
+    /// days (see `drift_triage`). Unset means no push, and the deadlock is
+    /// still surfaced locally by `nit status` and by the abort message — a
+    /// missing URL degrades the alert, never the safety.
+    #[serde(default)]
+    pub ntfy_url: Option<String>,
 }
 
 fn default_sync_command() -> String {

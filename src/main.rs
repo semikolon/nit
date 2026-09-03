@@ -6,6 +6,7 @@
 
 mod bootstrap;
 mod config;
+mod drift_triage;
 mod encrypt;
 mod git;
 mod permissions;
@@ -1613,6 +1614,7 @@ fn cmd_update(safe: bool, config: &NitConfig) -> Result<(), Box<dyn std::error::
 
     let mut status = sync_status::SyncStatus::new(machine_name.clone());
     status.last_success_at = prior_success;
+    status.last_notified_at = prior.as_ref().and_then(|s| s.last_notified_at.clone());
 
     // 0. PRE-PULL DRIFT CHECK — sacred: never clobber local state.
     // If any tracked file is modified/deleted, ABORT and write status. Untracked
@@ -1636,17 +1638,75 @@ fn cmd_update(safe: bool, config: &NitConfig) -> Result<(), Box<dyn std::error::
     if !drift.is_empty() {
         status.result = sync_status::SyncResult::AbortedDrift;
         status.drift_files = drift.clone();
-        status.completed_at = chrono::Utc::now().to_rfc3339();
-        sync_status::save_status(&status);
+        // Say WHY each file is dirty, not merely that it is. A file whose exact
+        // bytes are already committed is a stale worktree, not lost work, and it
+        // wants the opposite remedy. See `drift_triage`'s module doc for the
+        // MERIAN deadlock that made this necessary.
+        let triaged = drift_triage::triage(strategy, &drift);
+        let now = chrono::Utc::now();
+        let stale_days = drift_triage::days_since_rfc3339(status.last_success_at.as_deref(), now);
+        let deadlocked = drift_triage::is_deadlock(status.last_success_at.as_deref(), now);
 
         eprintln!(
             "nit update: ABORTED — pre-pull drift detected ({} file(s)):",
             drift.len()
         );
-        for line in &drift {
-            eprintln!("  {}", line);
+        for f in &triaged {
+            eprintln!("  {} {}  [{}]", f.status, f.path, f.kind.label());
         }
         eprintln!();
+
+        if deadlocked {
+            let days = stale_days.unwrap_or(0);
+            let all_stale =
+                !triaged.is_empty() && triaged.iter().all(|f| f.kind.is_safe_to_discard());
+
+            eprintln!(
+                "\u{26a0} DEADLOCKED: no successful sync for {} days. This will NOT clear itself.",
+                days
+            );
+            eprintln!("  The abort refuses to pull while tracked files are dirty, and these files");
+            eprintln!("  can only become clean BY pulling. Every further night repeats this.");
+            if all_stale {
+                eprintln!(
+                    "  Every file above is a stale copy already in git — discarding loses nothing."
+                );
+            }
+            eprintln!();
+
+            let notify_url = drift_triage::should_notify(status.last_notified_at.as_deref(), now)
+                .then(|| {
+                    config
+                        .fleet
+                        .sync
+                        .as_ref()
+                        .and_then(|s| s.ntfy_url.as_deref())
+                })
+                .flatten();
+            if let Some(url) = notify_url {
+                let body = drift_triage::deadlock_message(&machine_name, days, &triaged);
+                // Only stamp on a DELIVERED alert: a failed push (a travel
+                // machine off the VPN, a token without rights to the topic)
+                // must not buy a week of silence.
+                if drift_triage::notify_ntfy(url, "nit sync deadlocked", &body) {
+                    status.last_notified_at = Some(now.to_rfc3339());
+                } else {
+                    // Say so. An alert that fails quietly is the same bug as an
+                    // abort that fails quietly, one layer up — and this exact
+                    // push returned 403 the first time it was wired, because
+                    // the token had no rights to a brand-new topic.
+                    eprintln!(
+                        "  (could not deliver the alert to {} — unreachable, or the ntfy token \
+                         lacks publish rights on that topic)",
+                        url
+                    );
+                }
+            }
+        }
+
+        status.completed_at = chrono::Utc::now().to_rfc3339();
+        sync_status::save_status(&status);
+
         eprintln!("Local edits would be at risk if pull merged. Resolve manually:");
         eprintln!(
             "  - Discard:  git --git-dir={} --work-tree=$HOME checkout -- <file>",
@@ -1903,6 +1963,24 @@ fn cmd_status(
     // Last-sync health summary (from ~/.local/share/nit/last-sync.json).
     if let Some(last) = sync_status::load_status() {
         println!("{}", sync_status::one_line_summary(&last));
+
+        // A machine can abort every night for months and still report a calm
+        // one-liner, which is exactly how MERIAN went 67 nights and 536 commits
+        // unnoticed. Once the abort is old enough to be a deadlock, say so here
+        // too — this is the surface a person actually looks at.
+        if matches!(last.result, sync_status::SyncResult::AbortedDrift) {
+            let now = chrono::Utc::now();
+            if drift_triage::is_deadlock(last.last_success_at.as_deref(), now) {
+                let days = drift_triage::days_since_rfc3339(last.last_success_at.as_deref(), now)
+                    .unwrap_or(0);
+                println!(
+                    "\u{26a0} nit: DEADLOCKED — no successful sync for {} days; drift blocks the \
+                     pull and the pull is what would clear it. Run `nit update` to see the \
+                     per-file triage.",
+                    days
+                );
+            }
+        }
     }
 
     // Verbose: list staged + modified paths after the summary. Untracked is
