@@ -526,3 +526,67 @@ and the push is a no-op that announces itself.
   version possible — discard only what is PROVEN recoverable from a named
   commit — but the shape of that command is a design fork on shared tooling,
   so it is proposed rather than assumed.
+
+## 11. Should the Steward also own hemma overlay drift? (Fredrik, 2026-09-05)
+
+**First, a correction to something said earlier the same day.** nit drift and
+hemma overlay drift were described as "different surfaces with no overlap".
+Measured: **692 files under `dotfiles/system/` are nit-tracked**, 126 of them
+Shannon's. So they are not two surfaces. They are **two layers of one pipeline**:
+
+| layer | compares | watched by |
+|---|---|---|
+| **upper** | the overlay SOURCE in `dotfiles/system/<host>/` vs git | nit — so the Steward, already, for free |
+| **lower** | the DEPLOYED copy on the machine vs that overlay source | `hemma system-diff`, via `shannon-drift-watch` |
+
+The Steward therefore needs no extension at all to cover the upper layer. The
+open question is only the lower one.
+
+### 11.1 The judgment generalises; the plumbing does not
+
+**Generalises cleanly:**
+- The **staleness gate** works unchanged — overlay content lives in the same git
+  history, so "do these exact bytes already exist?" is the same query.
+- The **classification** is the identical question: meaningful edit, stale copy,
+  runtime junk, or secret-bearing.
+- The **escalation** is the same need, and is the strongest argument (§11.2).
+
+**Does NOT generalise:**
+- **Transport.** nit drift is local to the machine running the check. Overlay
+  drift is remote: SSH, unreachable hosts, and "the machine is asleep" becomes a
+  first-class state rather than an error. MERIAN was unreachable three separate
+  times during one evening's work.
+- **Authority direction.** For nit, either side may be right — a config you
+  tuned is as likely correct as the repo. For a deployed system file the overlay
+  is normally the source of truth, so drift there usually means someone
+  hand-edited `/etc` on the box. That is a different and more suspicious event,
+  and it wants a different default.
+- **Write path.** Capturing nit drift is `nit add` + commit. Capturing overlay
+  drift is `hemma system-pull`, which carries interactive prompts — the exact
+  surface a past session patched badly enough to earn the *Consult before
+  shared-infrastructure design changes* directive.
+- **Ownership.** Overlay files are root-owned on the target, so capture needs
+  sudo, and *Push-pull operations must be symmetric* applies in full.
+
+### 11.2 The shape this argues for: one classifier, two adapters
+
+A source-agnostic core that takes `(path, current bytes, tracked bytes, machine)`
+and returns a routing verdict, fed by two adapters: nit's local worktree, and
+hemma's `system-diff` over SSH. `shannon-drift-watch` then becomes a thin
+adapter instead of a parallel implementation.
+
+**The prize is the ESCALATION, not the code reuse.** On 2026-09-05 five
+independent silent breaks were fixed in the hemma-side alert while a fresh
+alerting path was separately built for the nit side — two hand-rolled
+escalations, each free to rot alone, and the hemma one had been incapable of
+delivering anything for months without a single symptom. One path, kept honest
+in one place, is what prevents a third instance. This is §10.3's lesson applied
+one level up: *an alerting path without a report-on-failure inherits the disease
+it was prescribed for* — and the way to keep that honest is to have ONE of them.
+
+### 11.3 What this does NOT make obsolete
+
+The **liveness prober** is untouched by any of this. It answers "is Shannon
+alive", not "does its config match" — and Shannon runs the bedroom lights and
+Home Assistant, where a dead host has woken Fredrik at night. Keep it, and it is
+a third candidate for the same unified escalation path.
