@@ -1821,6 +1821,18 @@ fn cmd_update(safe: bool, config: &NitConfig) -> Result<(), Box<dyn std::error::
         }
     }
     if secrets_drift_count > 0 {
+        // WRITE THE RECORD. Without this the abort was invisible: `last-sync.json`
+        // kept its previous contents, so a machine failing here every night still
+        // reported its last SUCCESS — Shannon showed `ok — 2026-06-27` for ten
+        // weeks. A health check that reads a stale success is worse than one that
+        // reads nothing, because nothing looks wrong.
+        status.result = sync_status::SyncResult::SecretsDrift;
+        status.errors.push(format!(
+            "{} secret tier(s) have unflushed target edits",
+            secrets_drift_count
+        ));
+        status.completed_at = chrono::Utc::now().to_rfc3339();
+        sync_status::save_status(&status);
         return Err(format!(
             "{} secret tier(s) have unflushed target edits — update aborted",
             secrets_drift_count
@@ -1968,7 +1980,9 @@ fn cmd_status(
         // one-liner, which is exactly how MERIAN went 67 nights and 536 commits
         // unnoticed. Once the abort is old enough to be a deadlock, say so here
         // too — this is the surface a person actually looks at.
-        if matches!(last.result, sync_status::SyncResult::AbortedDrift) {
+        // Any non-Ok result, not just pre-pull drift: a machine stuck on secret
+        // drift is exactly as stuck, and that was the one nobody could see.
+        if !matches!(last.result, sync_status::SyncResult::Ok) {
             let now = chrono::Utc::now();
             if drift_triage::is_deadlock(last.last_success_at.as_deref(), now) {
                 let days = drift_triage::days_since_rfc3339(last.last_success_at.as_deref(), now)

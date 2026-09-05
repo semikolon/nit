@@ -27,6 +27,13 @@ pub enum SyncResult {
     PullFailed,
     /// One or more triggers exited non-zero. Templates/secrets did deploy.
     TriggersFailed,
+    /// A deployed secret tier differs from its encrypted source, so the update
+    /// stopped before deploying anything rather than overwrite a possible local
+    /// edit. Added 2026-09-05: this abort previously returned an error WITHOUT
+    /// writing a status record, so `last-sync.json` kept whatever it last said.
+    /// Shannon read `ok — 2026-06-27` for ten weeks while failing every night —
+    /// worse than silence, because every health check saw a success.
+    SecretsDrift,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -149,6 +156,7 @@ pub fn one_line_summary(status: &SyncStatus) -> String {
         SyncResult::AbortedDrift => "ABORTED (drift)",
         SyncResult::PullFailed => "FAILED (pull)",
         SyncResult::TriggersFailed => "ok-with-trigger-failures",
+        SyncResult::SecretsDrift => "ABORTED (secret drift)",
     };
     format!(
         "last sync: {} — {} at {}",
@@ -160,6 +168,39 @@ pub fn one_line_summary(status: &SyncStatus) -> String {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn secrets_drift_has_its_own_label_so_a_stuck_machine_reads_as_stuck() {
+        // Regression guard for the ten-week Shannon blind spot: this abort used
+        // to return an error without writing a status at all, so the file kept
+        // reporting the last SUCCESS and every health check saw "ok".
+        let mut st = SyncStatus::new("shannon".into());
+        st.result = SyncResult::SecretsDrift;
+        let line = one_line_summary(&st);
+        assert!(line.contains("ABORTED (secret drift)"), "{}", line);
+        assert!(
+            !line.contains("ok — "),
+            "a stuck machine must not read as ok: {}",
+            line
+        );
+    }
+
+    #[test]
+    fn every_result_renders_a_distinguishable_label() {
+        let mut st = SyncStatus::new("m".into());
+        let mut seen = std::collections::HashSet::new();
+        for r in [
+            SyncResult::Ok,
+            SyncResult::AbortedDrift,
+            SyncResult::PullFailed,
+            SyncResult::TriggersFailed,
+            SyncResult::SecretsDrift,
+        ] {
+            st.result = r;
+            let line = one_line_summary(&st);
+            assert!(seen.insert(line.clone()), "duplicate label: {}", line);
+        }
+    }
 
     #[test]
     fn test_detect_pre_pull_drift_modified_file() {
