@@ -43,7 +43,7 @@ file that is NOT stale — tuned setting, machine-written junk, per-machine-dive
 or secret-bearing → commit / commit-locally / skip / ask), the trigger and timing,
 and per-machine routing.
 
-### 🆕 Two findings from the MERIAN recovery that change the design (doc §10, §11)
+### 🆕 Two findings from the MERIAN recovery that change the design (doc §11, §12)
 
 - [ ] **Add a SILENCE condition, not just a refusal condition.** The deadlock
   detector fires on an abort. A machine whose nightly simply stops running never
@@ -51,7 +51,7 @@ and per-machine routing.
   with zero drift and status `ok`. Condition wanted: *last success older than N days
   regardless of outcome*.
 - [ ] **hemma overlay drift is the LOWER LAYER of the same pipeline, not a second
-  surface** (doc §11 — corrects an earlier same-day claim). 692 files under
+  surface** (doc §12 — corrects an earlier same-day claim). 692 files under
   `dotfiles/system/` are nit-tracked, so the Steward already owns the overlay
   SOURCE layer for free; only the deployed-copy layer is hemma's. Judgment
   generalises, plumbing does not → one classifier, two adapters, and
@@ -60,7 +60,7 @@ and per-machine routing.
   months across five independent breaks, while a second alert was being built for
   the nit side.
 
-### Decisions to pin first (doc §10 — rationale there)
+### Decisions to pin first (doc §11 — rationale there)
 - [ ] Nudge fires in **any** live session vs **designated** session only.
 - [ ] Per-machine-history mechanism: namespaced local ref vs isolated local repo vs `skip-worktree`.
 - [ ] Pure-runtime caches: local-only git history vs gitignore.

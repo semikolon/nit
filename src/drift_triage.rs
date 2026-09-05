@@ -43,7 +43,7 @@
 //! protection it provides becomes the outage it was meant to prevent.
 //!
 //! Design + the full MERIAN post-mortem:
-//! `docs/forward_only_drift_steward_design_2026-07-11.md` § 10.
+//! `docs/forward_only_drift_steward_design_2026-07-11.md` § 11.
 
 use crate::config::GitStrategy;
 use crate::git;

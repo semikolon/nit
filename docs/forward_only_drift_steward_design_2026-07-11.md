@@ -408,7 +408,7 @@ deliberate reconciliation to make, not a free win. Treat as a candidate mechanis
 
 ---
 
-## 10. The drift deadlock — a bucket this design did not have (found 2026-09-03 on MERIAN)
+## 11. The drift deadlock — a bucket this design did not have (found 2026-09-03 on MERIAN)
 
 *Added while triaging real drift as test data for the Steward's classifier, per the
 fixture rule. The real data disagreed with the imagined data, which is the whole
@@ -438,7 +438,7 @@ were already safe in git. It was never wrong; it was never *heard*. The abort wr
 `last-sync.json` and stops. Nothing surfaces to Fredrik, nothing surfaces to a session,
 and a travel machine drifts 536 commits behind in silence.
 
-### 10.1 Why the Steward as designed would have got this wrong
+### 11.1 Why the Steward as designed would have got this wrong
 
 §6.2 routes a drifted file by asking whether the change is *meaningful config* or *pure
 runtime append*. These 19 are neither. They are **stale** — a frozen worktree from a
@@ -456,7 +456,7 @@ A second deterministic signal, nearly free: **identical mtimes across many drift
 means one process wrote them all at once, which is a machine event rather than human
 editing. Nineteen files sharing a timestamp to the second is not eighteen decisions.
 
-### 10.2 What this adds to the build list
+### 11.2 What this adds to the build list
 
 1. **A staleness gate** (deterministic, above) ahead of the classifier.
 2. **A deadlock detector**: drift + behind-by-N + last-successful-pull older than a few
@@ -475,7 +475,7 @@ before fixable* covers the diagnosis; this is its scheduling half — **a recurr
 successful refusal needs an escalation path, or the protection it provides becomes the
 outage it was meant to prevent.**
 
-### 10.3 Built 2026-09-03 — and what building it found
+### 11.3 Built 2026-09-03 — and what building it found
 
 Shipped in `src/drift_triage.rs` (248 tests green, clippy and fmt clean):
 the staleness gate, the deadlock detector, and the ntfy escalation. Wired into
@@ -511,7 +511,7 @@ Standing decision for Fredrik: the ntfy ACL needs one grant before the push can
 work. Until then the local surfacing (abort message plus `nit status`) is live
 and the push is a no-op that announces itself.
 
-### 10.4 Still open
+### 11.4 Still open
 
 - **The machine with the problem is the one least able to report it.** MERIAN
   is asleep most nights and often off the VPN. A push fired from the deadlocked
@@ -527,7 +527,7 @@ and the push is a no-op that announces itself.
   commit — but the shape of that command is a design fork on shared tooling,
   so it is proposed rather than assumed.
 
-## 11. Should the Steward also own hemma overlay drift? (Fredrik, 2026-09-05)
+## 12. Should the Steward also own hemma overlay drift? (Fredrik, 2026-09-05)
 
 **First, a correction to something said earlier the same day.** nit drift and
 hemma overlay drift were described as "different surfaces with no overlap".
@@ -542,7 +542,7 @@ Shannon's. So they are not two surfaces. They are **two layers of one pipeline**
 The Steward therefore needs no extension at all to cover the upper layer. The
 open question is only the lower one.
 
-### 11.1 The judgment generalises; the plumbing does not
+### 12.1 The judgment generalises; the plumbing does not
 
 **Generalises cleanly:**
 - The **staleness gate** works unchanged — overlay content lives in the same git
@@ -568,7 +568,7 @@ open question is only the lower one.
 - **Ownership.** Overlay files are root-owned on the target, so capture needs
   sudo, and *Push-pull operations must be symmetric* applies in full.
 
-### 11.2 The shape this argues for: one classifier, two adapters
+### 12.2 The shape this argues for: one classifier, two adapters
 
 A source-agnostic core that takes `(path, current bytes, tracked bytes, machine)`
 and returns a routing verdict, fed by two adapters: nit's local worktree, and
@@ -580,13 +580,49 @@ independent silent breaks were fixed in the hemma-side alert while a fresh
 alerting path was separately built for the nit side — two hand-rolled
 escalations, each free to rot alone, and the hemma one had been incapable of
 delivering anything for months without a single symptom. One path, kept honest
-in one place, is what prevents a third instance. This is §10.3's lesson applied
+in one place, is what prevents a third instance. This is §11.3's lesson applied
 one level up: *an alerting path without a report-on-failure inherits the disease
 it was prescribed for* — and the way to keep that honest is to have ONE of them.
 
-### 11.3 What this does NOT make obsolete
+### 12.3 What this does NOT make obsolete
 
 The **liveness prober** is untouched by any of this. It answers "is Shannon
 alive", not "does its config match" — and Shannon runs the bedroom lights and
 Home Assistant, where a dead host has woken Fredrik at night. Keep it, and it is
 a third candidate for the same unified escalation path.
+
+### 12.4 A third instance of the same disease, found 2026-09-05
+
+Shannon's nightly sync had been dying for ~10 weeks and **reported a success the
+whole time**. `nit update`'s secrets-drift abort returned an error WITHOUT
+writing `last-sync.json`, so the file kept saying `ok — 2026-06-27` while the job
+failed every night. Fixed in nit (`SyncResult::SecretsDrift` + a record at the
+abort + `nit status` flagging any non-ok result).
+
+**Why it belongs in THIS doc rather than only in nit's changelog:** it is the
+third distinct way the fleet's health reporting lied inside three days, and the
+Steward inherits all three.
+
+| # | what happened | why nothing noticed |
+|---|---|---|
+| 1 | MERIAN's pre-pull abort, 67 nights | correct refusal, no escalation path |
+| 2 | shannon-drift-watch, months | correct detection, five broken alert layers |
+| 3 | Shannon's secrets abort, ~10 weeks | **no record written at all — the file reported the last SUCCESS** |
+
+The third is the worst of the three and the least likely to be caught by
+instinct: silence prompts eventual suspicion, a stale *success* does not. So the
+Steward's escalation needs BOTH conditions, and they are not the same test:
+
+- **refusal** — an abort happened, and here is its record;
+- **silence** — no successful sync for N days *regardless of what the last record
+  claims*, because the record may be months old and cheerful.
+
+Design consequence: **never derive health from the last record's `result` alone.
+Derive it from the AGE of the last SUCCESS.** A status file is a claim by a
+process that may have died before writing.
+
+Related, and settled 2026-09-05: fleet alerts now publish to a single `fleet`
+ntfy topic rather than a topic per purpose. A new topic silently drops alerts
+until someone subscribes on their phone, which is how `fleet-sync` spent its
+first morning publishing into a void. The Steward should publish there too, and
+should not invent its own.
