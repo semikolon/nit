@@ -378,33 +378,57 @@ deliberate reconciliation to make, not a free win. Treat as a candidate mechanis
 
 ---
 
-## 10. Open decisions for Fredrik (to resolve in the nit repo)
+## 10. Decisions — two RULED 2026-09-12, five still open
 
-1. Nightly = **detect + notify only** (safe), with the steward doing the actual commits
-   in-session? Confirm this is the intended split.
-2. Per-machine history mechanism: **namespaced local ref** (§6.5 option 1) vs local repo vs
-   `skip-worktree`?
-3. Pure-runtime caches: keep **local-only git history** (your stated preference) or gitignore?
-4. `skip-worktree` adoption — worth reconciling against the `3d6bfec` "detect all drift"
-   invariant to also kill the TCC stat + the raw-`add -A` loophole?
-5. codex templatization — now or deferred?
+**Superseded**: this section previously listed five undifferentiated open questions. Two are now
+settled by Fredrik, and the remaining set changed shape once the prior art in §15 was read.
 
----
+### 10.1 Ruled by Fredrik (2026-09-12)
 
-## Appendix — evidence index (hashes + sources)
+- **BUILD IT.** The founding spec (`MIGRATION_CHECKLIST.md:789`) gated this work on friction:
+  *"when manual edit-source flow becomes painful in practice… worth measuring real-world friction
+  before adding complexity."* Fredrik's ruling: *"The friction as build trigger has in my mind
+  proven itself to exist many many times over the months since I built nit. Let's do this."*
+  The gate is discharged. It is not an open question any more and should not be re-asked.
+- **The intelligence lives in a Claude session, not inside nit.** *"I think putting the
+  intelligence in a Claude session seems wise."* This settles the fork §15 surfaces: the 2026-04
+  deferred design proposed piping the fuzzy work to an LLM through `fabric`, to keep nit
+  provider-agnostic. That stays true of nit — nit gets NO LLM call, no HTTP client, no fabric
+  dependency — but the fuzzy half now happens in a live Claude session rather than inside a nit
+  subcommand. nit's job is the deterministic half plus a queue the session reads.
 
-- `3d6bfec` — forward-only sync (original spec; detect-all-then-filter; nit sync = commit).
-- `cd1d18a` — nit sync → local snapshot, not commit (the "frozen baseline" decision + its reason).
-- `02c30db` — session-intent scoping (the concurrent-session keystone).
-- `3cf94eb8` — the 2026-05-17 incident (bulk commit bundled + deployed another session's work).
-- `cb0d179a` — "wip: accumulated drift from other sessions" (the bulk reconcile that swept in
-  superwhisper before it was forward_only — the raw-`add -A` loophole in action).
-- `a0373d23` → `cb0d179a` superwhisper diff — the meaningful `s1-vocab-v2-160MB` edit.
-- `16104d82` — this session's `fleet.toml` forward_only add for superwhisper (to be reverted).
-- Source: `nit/src/{config.rs,syncbase.rs,main.rs}`; snapshot dir `~/.local/share/nit/forward-only/`.
-- Directives (global CLAUDE.md): *Autonomous-commit discipline*, *Unexpected-gate-is-information*,
-  *Deterministic infrastructure*, *Arsenal-and-harness*, *Never push plaintext secrets*,
-  *Search the personal corpus semantically* (forged this session).
+### 10.2 Still open — with a recommendation on each
+
+1. **The per-machine caches: namespaced local ref, or just gitignore them?**
+   *Recommendation: gitignore.* `DOTFILES_STRATEGY.md` decision #8 already ruled that
+   "sessions/logs/caches are machine-specific or ephemeral" and stay ignored; the decisions caches
+   were tracked anyway, which is the departure that created this whole problem. The audit trail
+   for a machine-written cache is close to worthless — the decisions themselves live in
+   `DECISIONS.md` and Graphiti, and the cache is derived from them. Choosing this **deletes the
+   entire per-machine-namespacing mechanism from the build**, which is the largest simplification
+   available, and it removes the only part of the design that cuts against the fleet's stated
+   "mirror everything everywhere" principle (§14). If a cache is ever the ONLY copy of something,
+   that is a bug in the cache's owner, not a problem for nit to solve.
+2. **Nightly = detect + notify only.** *Recommendation: yes, unchanged.* Already Fredrik's
+   recorded position, and the escalation half now exists (the `fleet` ntfy topic, 2026-09-05), so
+   the nightly can refuse loudly instead of silently.
+3. **`skip-worktree` adoption?** *Recommendation: no.* It overrides the `3d6bfec` "detect all
+   drift" invariant that stopped a real 2026-05-04 clobber, and if decision 1 goes to gitignore,
+   the problem `skip-worktree` was solving disappears with it.
+4. **codex/config.toml templatization** — still deferred; it is a separate careful job (8
+   secret-ish MCP tokens), not part of the Steward.
+5. **The hemma-overlay adapter (§12) — build now or later?** *Recommendation: later.* Ship the nit
+   adapter first; keep the classifier's interface able to accept a second adapter without a rewrite.
+
+### 10.3 A fourth verdict the classifier needs (added 2026-09-05)
+
+The design's verdicts were commit / commit-locally / skip / ask. A fifth kind of drift exists and
+resolves differently: **a deploy TARGET tracked as if it were a SOURCE.** `~/.local/bin/macmini` on
+MERIAN was one — a file a trigger writes, tracked as though a human authored it, so it drifts every
+time the trigger runs and no commit can ever settle it. **The fix is to UNTRACK, not to commit.**
+This is mechanically detectable (the path is written by a declared trigger) and the April notes
+predicted more of them: *"Other similar vestiges would show up as persistent nit-update drift
+aborts and resolve the same way."* A sweep for the rest is owed.
 
 ---
 
@@ -626,3 +650,100 @@ ntfy topic rather than a topic per purpose. A new topic silently drops alerts
 until someone subscribes on their phone, which is how `fleet-sync` spent its
 first morning publishing into a void. The Steward should publish there too, and
 should not invent its own.
+
+---
+
+## 13. The hook, concretely (2026-09-12)
+
+Written down because "an in-session hook" was agreed in the abstract and never drawn.
+
+The detection cannot be event-driven from inside Claude Code: app-caused drift happens with no
+session running and no tool call to intercept. So the split is the three-role model of §9b, with
+one concrete piece per role:
+
+- **Hold** — the drift sits in the working tree. Durable, needs nothing.
+- **Detect** — `nit drift-triage`, a nit subcommand. Enumerates drifted tracked files, runs the
+  deterministic gates (the staleness check built 2026-09-03, the secret scan, the machine-marker
+  grep, the deploy-target check of §10.3) and writes a queue to
+  `~/.local/share/nit/drift-queue.json`. No LLM. Safe to run from cron **because it never commits**.
+- **Act** — `drift-steward-nudge`, a `UserPromptSubmit` hook, a shape-clone of the six existing
+  conditional-silent nudges. Reads that one JSON file; emits nothing when it is empty. When it is
+  not: a few lines naming the count and the files needing a verdict, so Claude picks it up in the
+  session with full context. A `--dismiss` path so it cannot nag.
+
+Rejected alternatives, with reasons: **SessionStart** (fires on every unrelated session — a spela
+evening should not open with a dotfiles detour); **a filesystem watcher** (the nightly `nit update`
+and its abort already detect; a watcher adds a second always-on process for no new information).
+
+---
+
+## 14. Per-machine history cuts against a stated fleet principle
+
+Recorded because it was raised as an objection and deserves to stay visible if decision 10.2.1 ever
+goes the other way. `DOTFILES_STRATEGY.md § Per-Machine Scope` states the guiding principle as
+cross-OS isomorphism — *"when in doubt, mirror it"* — and decision #11 quotes Fredrik directly:
+*"the closer each environment automagically mirrors all other environments, the happier I will be.
+The less surprises, the better."* A `refs/nit/runtime/<host>` namespace would be the first mechanism
+in the fleet that deliberately institutionalises divergence. Defensible for machine-written caches,
+but it should be adopted as a NAMED exception with that principle quoted, never as a default.
+
+---
+
+## 15. Prior art — what was already designed, and what others hit (2026-09-12)
+
+### 15.1 In our own repo: `nit pick --apply` (MIGRATION_CHECKLIST.md:723, Apr 2026)
+
+A deferred v2 design already exists for the closest neighbouring problem — promoting VALUABLE drift
+back into a TEMPLATE source, where this design handles PLAIN files. It was never mentioned in §§1–12
+and should have been. Its algorithm is worth reusing directly, and its core idea is the
+**verification step**: apply the drift diff to the source, **re-render, and accept only if the
+re-render reproduces the drifted file byte-for-byte**; otherwise revert and refuse. That converts a
+plausible-looking merge into a checked one. It also documents its own limitation honestly — when
+the drift lands inside one conditional branch, only that machine's branch is updated.
+
+The sibling `nit pick --apply --with-llm` proposed piping source + rendered + drifted target through
+`fabric` when the plain patch fails, explicitly *"keeps nit LLM-agnostic and reuses the existing
+fabric infrastructure rather than embedding a Rust HTTP client per provider."* Fredrik's 10.1 ruling
+supersedes the delivery mechanism while keeping the constraint: **nit itself stays LLM-free.**
+
+### 15.2 Outside: three findings that shaped the design
+
+- **chezmoi's `autoCommit` cannot see this drift at all.** Its own docs state it fires only when
+  chezmoi already knows the SOURCE changed — after `chezmoi add`/`edit`/`import` — and not from
+  general file modification in the home directory. That is precisely our gap, independently
+  confirmed: the mature tool in this space does not solve app-written drift either.
+- **Nobody has solved strip-secrets-before-auto-commit.** chezmoi issue #3745 asks for exactly the
+  capability our secret-bearing verdict needs (a chance to templatize before an automatic commit)
+  and it is open. Our answer — commit those locally and never push — is a legitimate design choice,
+  not a shortcut around a solved problem.
+- **etckeeper's central warning is the same hazard.** Its README's own caution about versioning
+  `/etc` is that it creates copies of files that must stay secret (`/etc/shadow`). A decade-old tool
+  doing daily automatic config commits names secret propagation as the principal risk, which is why
+  the secret gate here is deterministic (the pre-commit hook) rather than a judgment call.
+- **Why the LLM half belongs in a live session rather than a standalone tool**: an empirical study
+  of LLM commit-message generation attributes **10.5% of underperformance to missing context** —
+  the diff alone does not carry the *why*. A session that just watched the change happen has that
+  context; a cron job invoking a model over a bare diff does not. This is the measured form of the
+  argument §6.3 made from intuition. (arXiv:2502.18904)
+
+
+---
+
+---
+
+## Appendix — evidence index (hashes + sources)
+
+- `3d6bfec` — forward-only sync (original spec; detect-all-then-filter; nit sync = commit).
+- `cd1d18a` — nit sync → local snapshot, not commit (the "frozen baseline" decision + its reason).
+- `02c30db` — session-intent scoping (the concurrent-session keystone).
+- `3cf94eb8` — the 2026-05-17 incident (bulk commit bundled + deployed another session's work).
+- `cb0d179a` — "wip: accumulated drift from other sessions" (the bulk reconcile that swept in
+  superwhisper before it was forward_only — the raw-`add -A` loophole in action).
+- `a0373d23` → `cb0d179a` superwhisper diff — the meaningful `s1-vocab-v2-160MB` edit.
+- `16104d82` — this session's `fleet.toml` forward_only add for superwhisper (to be reverted).
+- Source: `nit/src/{config.rs,syncbase.rs,main.rs}`; snapshot dir `~/.local/share/nit/forward-only/`.
+- Directives (global CLAUDE.md): *Autonomous-commit discipline*, *Unexpected-gate-is-information*,
+  *Deterministic infrastructure*, *Arsenal-and-harness*, *Never push plaintext secrets*,
+  *Search the personal corpus semantically* (forged this session).
+
+---
