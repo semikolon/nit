@@ -9,6 +9,17 @@
 
 ---
 
+## `nit commit` commits a staged path whole, so a hunk-level stage cannot survive it (2026-09-30)
+
+Two CC sessions edited `~/.claude/glossary/deliberus.md` at once. One staged only its own two rows
+(`git apply --cached`, since nit has no partial-stage or unstage wrapper) and ran `nit commit`, which
+reported `1 file changed, 5 insertions(+), 2 deletions(-)`: the whole working-tree file, the other
+session's three uncommitted rows included, under the first session's message (commit `b72f4b6c`,
+pushed). Harmless this time (the rows were ready and belong to the same owner), but it is the
+same mechanism as the documented untrack gotcha: a pathspec commit takes the path's worktree
+content and overrides the index. **Wanted**: `nit commit` honours the index as staged (or a
+`--staged` flag that does), plus `nit restore --staged <path>` so unstaging needs no raw git.
+
 ## 🆕 forward_only redesign + Drift Steward — design doc (2026-07-11)
 
 Exhaustive design + prior-reasoning capture at **`docs/forward_only_drift_steward_design_2026-07-11.md`**.
