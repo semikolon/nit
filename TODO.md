@@ -9,6 +9,10 @@
 
 ---
 
+## `nit commit` cannot conclude a merge, and says it committed (2026-10-04)
+
+When `nit update` stops on a merge conflict, the conflict is resolved and staged, and `nit commit -m …` is run, git refuses with *"fatal: cannot do a partial commit during a merge"*, because the wrapper commits by pathspec. nit still prints *"committed 3 path(s)"*, `MERGE_HEAD` stays, and the next `nit push` is rejected as non-fast-forward. The way out today is a raw `git --git-dir=… --work-tree=$HOME commit` with no paths. Wanted: when `MERGE_HEAD` exists, `nit commit` concludes the merge with a plain commit of the index, and it never reports success when git exited non-zero. Anchor: a TODO.md conflict between a local and a cloud session on 2026-10-04.
+
 ## `nit commit` commits a staged path whole, so a hunk-level stage cannot survive it (2026-09-30)
 
 Two CC sessions edited `~/.claude/glossary/deliberus.md` at once. One staged only its own two rows
