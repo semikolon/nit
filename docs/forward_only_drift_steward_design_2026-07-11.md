@@ -409,6 +409,19 @@ settled by Fredrik, and the remaining set changed shape once the prior art in §
    available, and it removes the only part of the design that cuts against the fleet's stated
    "mirror everything everywhere" principle (§14). If a cache is ever the ONLY copy of something,
    that is a bug in the cache's owner, not a problem for nit to solve.
+
+   **Checked 2026-10-10, and the premise above is only half right.** `decisions_state.json` is
+   derived: a list of the latest titles, rebuilt from the other file. `decisions_graphiti_cache.jsonl`
+   is NOT derived. `decision_logger.py` appends each decision to it first-hand (title, decision,
+   rationale; 54 on the Mac Mini, the last on 2026-08-31), and two things read it: `/recall`
+   (its list of recent decisions) and the search for an older decision that a new one replaces.
+   The same decision also goes to the project's `DECISIONS.md`, and to Graphiti only when its
+   paid model has credit, which it often has not. So ignoring this file would leave a rebuilt
+   machine with an empty recent-decisions list and no supersession search, and for decisions
+   made while Graphiti was dry it is one of two copies. It is an append-only log, one line per
+   decision, which suggests a third option this section did not weigh: keep it tracked and let
+   git join two machines' appended lines by itself (`merge=union` for that one path).
+   Put to Fredrik 2026-10-10; not ruled.
 2. **Nightly = detect + notify only.** *Recommendation: yes, unchanged.* Already Fredrik's
    recorded position, and the escalation half now exists (the `fleet` ntfy topic, 2026-09-05), so
    the nightly can refuse loudly instead of silently.
