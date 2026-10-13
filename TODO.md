@@ -13,7 +13,8 @@
 
 `nit commit` now fails when git does, reads staged names with `-z`, concludes a merge, has
 `--amend`, and refuses a session that staged nothing (`tests/commit_flow.rs` runs the built binary
-against a throwaway `$HOME`). Three things it did not close:
+against a throwaway `$HOME`). It is on the Mac, Darwin and Shannon since the same evening (pin `bca2bd6`).
+Two things it did not close:
 
 - **`bootstrap.rs` still drops git's exit status** in three places (the pull, the clone step and
   `checkout --force`), written `exec_git_with(..)?` like the commit was. Bootstrap runs once per
@@ -24,7 +25,6 @@ against a throwaway `$HOME`). Three things it did not close:
   erased by a commit git had refused. Such a path aborts every nightly `nit update` as drift, and
   `nit status` shows it as staged like any other. Wanted: `nit status` and the abort message name
   the staged paths that are in no live session's record, since those wait for nobody.
-- **The fleet still runs the nit before this fix** until `dotfiles/.nit-version` is bumped.
 
 ## `nit commit` commits a staged path whole, so a hunk-level stage cannot survive it (2026-09-30)
 
@@ -55,9 +55,9 @@ intent via per-machine namespacing, not new scope.
 
 ### ✅ Partly BUILT 2026-09-05 — what exists vs what is still design
 
-Shipped in `src/drift_triage.rs` (in master + installed on macmini; **fleet rollout
-deliberately HELD** at Fredrik's request while another session debugs the Mac Mini —
-no `.nit-version` bump, so every other machine still runs the previous nit):
+Shipped in `src/drift_triage.rs` (in master, and on the fleet since the pin moved to `7d69057` in
+September 2026; this line said until 2026-10-13 that the rollout was held, which stopped being true
+with that pin):
 
 - **The staleness gate** — *do these exact bytes already exist in this path's git
   history?* Stale / Unique / Deleted / Unknown, with the matching commit named.
