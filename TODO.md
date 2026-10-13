@@ -9,9 +9,22 @@
 
 ---
 
-## `nit commit` cannot conclude a merge, and says it committed (2026-10-04)
+## Left open by the commit fix of 2026-10-13
 
-When `nit update` stops on a merge conflict, the conflict is resolved and staged, and `nit commit -m …` is run, git refuses with *"fatal: cannot do a partial commit during a merge"*, because the wrapper commits by pathspec. nit still prints *"committed 3 path(s)"*, `MERGE_HEAD` stays, and the next `nit push` is rejected as non-fast-forward. The way out today is a raw `git --git-dir=… --work-tree=$HOME commit` with no paths. Wanted: when `MERGE_HEAD` exists, `nit commit` concludes the merge with a plain commit of the index, and it never reports success when git exited non-zero. Anchor: a TODO.md conflict between a local and a cloud session on 2026-10-04.
+`nit commit` now fails when git does, reads staged names with `-z`, concludes a merge, has
+`--amend`, and refuses a session that staged nothing (`tests/commit_flow.rs` runs the built binary
+against a throwaway `$HOME`). Three things it did not close:
+
+- **`bootstrap.rs` still drops git's exit status** in three places (the pull, the clone step and
+  `checkout --force`), written `exec_git_with(..)?` like the commit was. Bootstrap runs once per
+  machine and overwrites files, so it wants its own tests before the calls are swapped for
+  `git::run_git_with`.
+- **A staged path that no live session owns is not told apart from one a session is working on.**
+  The record of what a session staged dies with the session, and until 2026-10-13 it was also
+  erased by a commit git had refused. Such a path aborts every nightly `nit update` as drift, and
+  `nit status` shows it as staged like any other. Wanted: `nit status` and the abort message name
+  the staged paths that are in no live session's record, since those wait for nobody.
+- **The fleet still runs the nit before this fix** until `dotfiles/.nit-version` is bumped.
 
 ## `nit commit` commits a staged path whole, so a hunk-level stage cannot survive it (2026-09-30)
 

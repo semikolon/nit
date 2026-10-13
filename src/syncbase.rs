@@ -449,10 +449,14 @@ pub fn staged_file_path(anchor: u32) -> PathBuf {
 /// Read the work-tree-relative paths this anchor recorded as staged.
 /// Empty Vec if none (fresh session, or `nit add` never used by this anchor).
 pub fn read_session_staged(anchor: u32) -> Vec<String> {
-    match fs::read_to_string(staged_file_path(anchor)) {
+    let stored: Vec<String> = match fs::read_to_string(staged_file_path(anchor)) {
         Ok(c) => serde_json::from_str(&c).unwrap_or_default(),
         Err(_) => Vec::new(),
-    }
+    };
+    // A record written before paths were read with `-z` holds git's quoted
+    // form for a name with non-ASCII letters. Read it as the name it means,
+    // so a session that staged before an upgrade still owns what it staged.
+    stored.iter().map(|p| unquote_c_path(p)).collect()
 }
 
 /// Union `paths` into the CURRENT session anchor's staged set (atomic).
@@ -564,6 +568,35 @@ fn atomic_write(path: &PathBuf, content: &str) {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn nul_separated_names_come_back_as_they_are() {
+        assert_eq!(
+            parse_nul_paths("docs/plain.txt\0docs/räk smörgås.txt\0"),
+            vec![
+                "docs/plain.txt".to_string(),
+                "docs/räk smörgås.txt".to_string()
+            ]
+        );
+        assert!(parse_nul_paths("").is_empty());
+    }
+
+    #[test]
+    fn a_quoted_name_from_an_older_record_is_read_as_the_name_it_means() {
+        // What `git diff --cached --name-only` printed, without -z, for a
+        // file whose name holds ä and ö (copied from git's own output).
+        assert_eq!(
+            unquote_c_path(r#""r\303\244ksm\303\266rg\303\245s.txt""#),
+            "räksmörgås.txt"
+        );
+        assert_eq!(unquote_c_path(r#""a\tb\"c\\d.txt""#), "a\tb\"c\\d.txt");
+        assert_eq!(
+            unquote_c_path("docs/plain.txt"),
+            "docs/plain.txt",
+            "an unquoted name is left alone"
+        );
+        assert_eq!(unquote_c_path("\""), "\"", "a lone quote is a name");
+    }
 
     /// Helper: create a test sync-base/drift/acks environment in a temp dir.
     /// Returns the temp dir (must be kept alive for the test duration).
@@ -1116,19 +1149,134 @@ mod tests {
 // commit lands as a spurious add with the deletion orphaned in the index.
 // ---------------------------------------------------------------------------
 
+/// Pure: split git's NUL-separated path list (`-z`).
+///
+/// `-z` is the only form in which git prints a path as its own bytes. Without
+/// it, a name holding a non-ASCII letter, a quote or a control character
+/// comes back C-quoted (`"r\303\244k.txt"`), and that string is not a path git
+/// takes back: as a pathspec it is refused outright, and with it the whole
+/// commit (2026-10-11).
+pub fn parse_nul_paths(output: &str) -> Vec<String> {
+    output
+        .split('\0')
+        .filter(|p| !p.is_empty())
+        .map(|p| p.to_string())
+        .collect()
+}
+
+/// Pure: undo git's C-quoting of a path (`"r\303\244k.txt"` → `räk.txt`).
+/// A string that is not wrapped in double quotes is returned as it is.
+pub fn unquote_c_path(path: &str) -> String {
+    let inner = match path
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+    {
+        Some(inner) if path.len() >= 2 => inner.as_bytes(),
+        _ => return path.to_string(),
+    };
+    let mut out: Vec<u8> = Vec::with_capacity(inner.len());
+    let mut i = 0;
+    while i < inner.len() {
+        if inner[i] != b'\\' || i + 1 >= inner.len() {
+            out.push(inner[i]);
+            i += 1;
+            continue;
+        }
+        let escaped = inner[i + 1];
+        let simple = match escaped {
+            b'a' => Some(0x07),
+            b'b' => Some(0x08),
+            b'f' => Some(0x0c),
+            b'n' => Some(b'\n'),
+            b'r' => Some(b'\r'),
+            b't' => Some(b'\t'),
+            b'v' => Some(0x0b),
+            b'"' | b'\\' => Some(escaped),
+            _ => None,
+        };
+        if let Some(byte) = simple {
+            out.push(byte);
+            i += 2;
+            continue;
+        }
+        let octal = inner.get(i + 1..i + 4).filter(|digits| {
+            digits.len() == 3
+                && digits[0] <= b'3'
+                && digits.iter().all(|d| (b'0'..=b'7').contains(d))
+        });
+        match octal {
+            Some(d) => {
+                out.push((d[0] - b'0') * 64 + (d[1] - b'0') * 8 + (d[2] - b'0'));
+                i += 4;
+            }
+            None => {
+                out.push(b'\\');
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+const STAGED_NAMES: [&str; 5] = ["diff", "--cached", "--name-only", "--no-renames", "-z"];
+
+/// Every staged path (work-tree-root-relative), as its real name.
+pub fn staged_paths(
+    strategy: &crate::config::GitStrategy,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    crate::git::git_output_with(strategy, &STAGED_NAMES).map(|out| parse_nul_paths(&out))
+}
+
+/// The staged paths that fall under `pathspecs`. An empty `pathspecs` answers
+/// with nothing: without that guard git would read "no pathspec" as "all of
+/// the index", and a caller recording the result would claim every staged
+/// path for its session.
+pub fn staged_paths_under(
+    strategy: &crate::config::GitStrategy,
+    pathspecs: &[String],
+) -> Vec<String> {
+    if pathspecs.is_empty() {
+        return Vec::new();
+    }
+    let mut args: Vec<&str> = STAGED_NAMES.to_vec();
+    args.push("--");
+    args.extend(pathspecs.iter().map(String::as_str));
+    crate::git::git_output_with(strategy, &args)
+        .map(|out| parse_nul_paths(&out))
+        .unwrap_or_default()
+}
+
+/// Paths still in conflict in a merge that is under way.
+pub fn unmerged_paths(
+    strategy: &crate::config::GitStrategy,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    crate::git::git_output_with(strategy, &["diff", "--name-only", "--diff-filter=U", "-z"])
+        .map(|out| parse_nul_paths(&out))
+}
+
 /// Snapshot the staged set (work-tree-root-relative) for delta computation.
 pub fn staged_index_snapshot(
     strategy: &crate::config::GitStrategy,
 ) -> std::collections::BTreeSet<String> {
-    crate::git::git_output_with(
-        strategy,
-        &["diff", "--cached", "--name-only", "--no-renames"],
-    )
-    .unwrap_or_default()
-    .lines()
-    .filter(|l| !l.is_empty())
-    .map(|s| s.to_string())
-    .collect()
+    staged_paths(strategy)
+        .unwrap_or_default()
+        .into_iter()
+        .collect()
+}
+
+/// Record every staged path under `pathspecs` as this session's.
+///
+/// The delta alone cannot see a path that was staged before this `nit add`
+/// ran: a file two sessions both edit, or a path staged by a session that is
+/// gone. Its name is in the index before and after, so the delta is empty,
+/// the path is never recorded, and `nit commit` keeps answering "not in this
+/// commit's scope: `nit add` it", which the session has just done. Naming a
+/// path is the claim.
+pub fn record_staged_named(strategy: &crate::config::GitStrategy, pathspecs: &[String]) {
+    let named = staged_paths_under(strategy, pathspecs);
+    if !named.is_empty() {
+        record_session_staged(&named);
+    }
 }
 
 /// Record into this session-anchor's store the paths newly staged since
@@ -1141,16 +1289,10 @@ pub fn record_staged_delta(
     strategy: &crate::config::GitStrategy,
     before: &std::collections::BTreeSet<String>,
 ) {
-    let after = crate::git::git_output_with(
-        strategy,
-        &["diff", "--cached", "--name-only", "--no-renames"],
-    )
-    .unwrap_or_default();
-    let newly: Vec<String> = after
-        .lines()
-        .filter(|l| !l.is_empty())
-        .filter(|l| !before.contains(*l))
-        .map(|s| s.to_string())
+    let newly: Vec<String> = staged_paths(strategy)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|p| !before.contains(p))
         .collect();
     if !newly.is_empty() {
         record_session_staged(&newly);

@@ -60,6 +60,40 @@ pub fn exec_git_with(strategy: &GitStrategy, args: &[&str]) -> Result<ExitStatus
     git_command(strategy).args(args).status()
 }
 
+/// Run a git command and fail when git does.
+///
+/// `exec_git_with` hands back the exit status, and a caller that writes
+/// `exec_git_with(..)?` has only handled "git could not be started". On
+/// 2026-10-11 that reported a commit git had refused as "committed 18
+/// path(s)". Use this wherever the next line assumes git did what was asked.
+pub fn run_git_with(
+    strategy: &GitStrategy,
+    args: &[&str],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let status = exec_git_with(strategy, args)?;
+    check_status(
+        args.first().copied().unwrap_or("git"),
+        status.code(),
+        status.success(),
+    )
+}
+
+/// The verdict half of `run_git_with`, pure so the refusal is testable.
+fn check_status(
+    subcommand: &str,
+    code: Option<i32>,
+    success: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if success {
+        return Ok(());
+    }
+    let how = match code {
+        Some(c) => format!("exit {c}"),
+        None => "ended by a signal".to_string(),
+    };
+    Err(format!("git {subcommand} failed ({how})").into())
+}
+
 /// Execute a git command with Strategy B (bare) — used when no config loaded yet
 #[allow(dead_code)]
 pub fn exec_git(args: &[&str]) -> Result<ExitStatus, std::io::Error> {
@@ -124,6 +158,17 @@ pub fn fall_through_with(strategy: &GitStrategy, args: &[String]) -> ! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_git_that_exits_non_zero_is_an_error_and_names_the_command() {
+        assert!(check_status("commit", Some(0), true).is_ok());
+        let refused = check_status("commit", Some(128), false)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(refused, "git commit failed (exit 128)");
+        let killed = check_status("add", None, false).unwrap_err().to_string();
+        assert_eq!(killed, "git add failed (ended by a signal)");
+    }
 
     #[test]
     fn test_bare_git_dir_location() {

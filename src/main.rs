@@ -87,7 +87,9 @@ enum NitCommand {
         edit: bool,
     },
 
-    /// Render + deploy + git commit + triggers
+    /// Commit what THIS session staged with `nit add` (templates in it are
+    /// rendered and deployed, triggers run). Paths other sessions staged are
+    /// left staged and named. During a merge it concludes the merge.
     Commit {
         /// Commit message. Repeatable like `git commit -m … -m …` —
         /// multiple values become paragraphs joined by a blank line.
@@ -98,6 +100,12 @@ enum NitCommand {
         /// (mirrors `git commit -F`). Mutually exclusive with -m.
         #[arg(short = 'F', long = "file")]
         file: Option<String>,
+
+        /// Fold this session's staged paths into the last commit, or with
+        /// nothing staged by this session only reword it. Without -m/-F the
+        /// message is kept. Refused once the commit is on the remote.
+        #[arg(long)]
+        amend: bool,
     },
 
     /// Pull + render + deploy + triggers (fleet sync, no commit)
@@ -369,7 +377,11 @@ fn run_command(cmd: NitCommand, config: &NitConfig) -> Result<(), Box<dyn std::e
             diff,
             edit,
         } => cmd_pick(file.as_deref(), dismiss, diff, edit, config),
-        NitCommand::Commit { message, file } => cmd_commit(&message, file.as_deref(), config),
+        NitCommand::Commit {
+            message,
+            file,
+            amend,
+        } => cmd_commit(&message, file.as_deref(), amend, config),
         NitCommand::Update { safe } => cmd_update(safe, config),
         NitCommand::Status {
             show_untracked,
@@ -550,17 +562,19 @@ fn cmd_add(paths: &[String], config: &NitConfig) -> Result<(), Box<dyn std::erro
         // Handle "." and "-A" as bulk operations
         if path_str == "." || path_str == "-A" {
             // Stage all modified tracked files via git
-            git::exec_git_with(strategy, &["add", path_str])?;
+            let added = git::run_git_with(strategy, &["add", path_str]);
 
             // Scan all templates for drift awareness + write acks
-            if !mappings.is_empty() {
+            if added.is_ok() && !mappings.is_empty() {
                 eprintln!("nit: scanning {} templates for drift...", mappings.len());
                 for mapping in &mappings {
                     report_template_drift(mapping, config);
                 }
             }
+            // Recorded even when git failed part-way: whatever it did stage
+            // is this session's.
             record_session_staged_delta(strategy, &staged_before);
-            return Ok(());
+            return added;
         }
 
         // Resolve the path
@@ -574,16 +588,23 @@ fn cmd_add(paths: &[String], config: &NitConfig) -> Result<(), Box<dyn std::erro
         }
     }
 
+    // What the caller named, as pathspecs git resolves itself: the plain
+    // paths, and for a template target the source it redirects to.
+    let mut named: Vec<String> = git_add_paths
+        .iter()
+        .map(|p| p.to_string_lossy().to_string())
+        .collect();
+    // The first thing git refused. Staging goes on past it and the record is
+    // still written, so a partial `nit add` leaves nothing staged unrecorded.
+    let mut refused: Option<Box<dyn std::error::Error>> = None;
+
     // Stage plain files via git add
-    if !git_add_paths.is_empty() {
-        let path_strs: Vec<String> = git_add_paths
-            .iter()
-            .map(|p| p.to_string_lossy().to_string())
-            .collect();
+    if !named.is_empty() {
         let mut args = vec!["add"];
-        let refs: Vec<&str> = path_strs.iter().map(|s| s.as_str()).collect();
-        args.extend(refs);
-        git::exec_git_with(strategy, &args)?;
+        args.extend(named.iter().map(String::as_str));
+        if let Err(e) = git::run_git_with(strategy, &args) {
+            refused = Some(e);
+        }
     }
 
     // Handle template target redirects
@@ -596,7 +617,11 @@ fn cmd_add(paths: &[String], config: &NitConfig) -> Result<(), Box<dyn std::erro
 
         // Stage the template source instead
         let source_str = source.to_string_lossy().to_string();
-        git::exec_git_with(strategy, &["add", &source_str])?;
+        if let Err(e) = git::run_git_with(strategy, &["add", &source_str]) {
+            refused.get_or_insert(e);
+            continue;
+        }
+        named.push(source_str);
 
         // Write ack for this template target
         if target.exists() {
@@ -612,8 +637,13 @@ fn cmd_add(paths: &[String], config: &NitConfig) -> Result<(), Box<dyn std::erro
     }
 
     record_session_staged_delta(strategy, &staged_before);
+    // Naming a path claims it, also when it was staged before this call.
+    syncbase::record_staged_named(strategy, &named);
 
-    Ok(())
+    match refused {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 /// Report template drift for a mapping and write ack
@@ -1146,10 +1176,10 @@ struct CommitPlan {
     /// (skip all ack checks) even if another session staged/modified a template.
     plain_only: bool,
     /// True when this session recorded NO staged paths (raw `git add` bypassing
-    /// `nit add`, or a fresh session). Caller falls back to legacy whole-index
-    /// behavior and warns — preserves backward-compat for non-nit-add flows
-    /// while session-intent scoping protects every nit-add flow (the incident
-    /// class).
+    /// `nit add`, or a fresh session). The scope is then empty and the caller
+    /// refuses, naming what is staged. Until 2026-10-13 this fell back to
+    /// committing the whole index with a warning, which was the one path left
+    /// on which a commit could carry another session's work.
     session_tracking_bypassed: bool,
     /// Staged in the shared index but OUTSIDE this commit's scope: a
     /// concurrent session's work, or staging that recorded no session intent
@@ -1175,19 +1205,16 @@ fn plan_commit_scope(
     //    shared-index entries are absent from `session_staged` → excluded.
     //    This session's since-unstaged paths are absent from the index →
     //    excluded.
-    //  - session recorded nothing → legacy fallback: the whole index, flagged
-    //    `session_tracking_bypassed` so the caller warns (raw `git add`
-    //    bypassing `nit add`, or a fresh session — backward-compat preserved).
+    //  - session recorded nothing → empty scope, flagged
+    //    `session_tracking_bypassed`: nothing in the index is this session's,
+    //    so everything staged is reported as out of scope and the caller
+    //    refuses. `nit add <paths>` claims a path that is already staged.
     let session_tracking_bypassed = session_staged.is_empty();
-    let mut commit_pathspec: Vec<String> = if session_tracking_bypassed {
-        index_staged.to_vec()
-    } else {
-        session_staged
-            .iter()
-            .filter(|p| index_set.contains(p.as_str()))
-            .cloned()
-            .collect()
-    };
+    let mut commit_pathspec: Vec<String> = session_staged
+        .iter()
+        .filter(|p| index_set.contains(p.as_str()))
+        .cloned()
+        .collect();
     // Sort for deterministic output + order-independent pathspec (git treats
     // `git commit -- a b` and `git commit -- b a` identically).
     commit_pathspec.sort();
@@ -1269,9 +1296,83 @@ fn resolve_commit_message(
     }
 }
 
+/// Pure: the argument list for the final `git commit`.
+///
+/// - A merge under way takes the whole index. git refuses a pathspec there
+///   ("cannot do a partial commit during a merge"), so none is passed.
+/// - No message (`None`) keeps the one git already holds: the prepared merge
+///   message, or the amended commit's own.
+/// - No pathspec outside a merge is `--only`, which git accepts solely with
+///   `--amend` and reads as "reword, and leave what is staged out of it". So
+///   an empty scope can never turn into a bare `git commit` of the whole
+///   index: without `--amend` git refuses the call.
+fn commit_git_args(
+    message: Option<&str>,
+    amend: bool,
+    concluding_merge: bool,
+    pathspecs: &[String],
+) -> Vec<String> {
+    let mut args: Vec<String> = vec!["commit".to_string()];
+    if amend {
+        args.push("--amend".to_string());
+    }
+    match message {
+        Some(m) => {
+            args.push("-m".to_string());
+            args.push(m.to_string());
+        }
+        None => args.push("--no-edit".to_string()),
+    }
+    if concluding_merge {
+        return args;
+    }
+    if pathspecs.is_empty() {
+        args.push("--only".to_string());
+    } else {
+        args.push("--".to_string());
+        args.extend(pathspecs.iter().cloned());
+    }
+    args
+}
+
+/// Run the final `git commit` and fail when git does. The caller clears the
+/// session's staged record only after this returns `Ok`, so a refused commit
+/// leaves the index and the record as they were and the same `nit commit`
+/// can be run again.
+fn run_git_commit(
+    strategy: &config::GitStrategy,
+    args: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    git::run_git_with(strategy, &refs).map_err(|e| {
+        format!(
+            "{e}. Nothing was committed: what was staged is still staged, and this \
+             session's record of it is kept."
+        )
+        .into()
+    })
+}
+
+/// Is a merge under way (a `nit update` or pull that stopped on a conflict)?
+fn merge_in_progress(strategy: &config::GitStrategy) -> bool {
+    git::git_output_with(strategy, &["rev-parse", "-q", "--verify", "MERGE_HEAD"]).is_ok()
+}
+
+/// Is the last commit already on the branch's remote? Read from the local
+/// remote-tracking ref, so it is as fresh as the last push or fetch. A branch
+/// with no upstream answers no.
+fn head_is_on_upstream(strategy: &config::GitStrategy) -> bool {
+    git::git_output_with(
+        strategy,
+        &["merge-base", "--is-ancestor", "HEAD", "@{upstream}"],
+    )
+    .is_ok()
+}
+
 fn cmd_commit(
     messages: &[String],
     file: Option<&str>,
+    amend: bool,
     config: &NitConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let strategy = config.git_strategy();
@@ -1293,19 +1394,69 @@ fn cmd_commit(
         ),
         None => None,
     };
-    let msg_owned = resolve_commit_message(messages, file, loaded.as_deref())?;
-    let msg = msg_owned.as_str();
+    // With neither -m nor -F a plain commit keeps the historical "nit commit"
+    // message, while a merge or an amend keeps the message git already holds.
+    let explicit_msg: Option<String> = if messages.is_empty() && file.is_none() {
+        None
+    } else {
+        Some(resolve_commit_message(messages, file, loaded.as_deref())?)
+    };
 
-    // 1. Check what's staged
-    let staged_output = git::git_output_with(
-        strategy,
-        &["diff", "--cached", "--name-only", "--no-renames"],
-    )?;
-    let staged_files: Vec<&str> = staged_output.lines().filter(|l| !l.is_empty()).collect();
+    // 1. Check what's staged (as real names: see syncbase::parse_nul_paths)
+    let index_staged = syncbase::staged_paths(strategy)?;
+    let my_anchor = syncbase::get_session_anchor();
 
-    if staged_files.is_empty() {
+    // 1a. A merge under way is concluded, whole. git accepts nothing else, so
+    //     the session scope cannot apply; say so and name the size of it.
+    if merge_in_progress(strategy) {
+        if amend {
+            return Err(
+                "a merge is under way: conclude it with `nit commit` before amending".into(),
+            );
+        }
+        let unmerged = syncbase::unmerged_paths(strategy)?;
+        if !unmerged.is_empty() {
+            eprintln!("nit: {} path(s) still in conflict:", unmerged.len());
+            for p in &unmerged {
+                eprintln!("nit:     {}", p);
+            }
+            return Err(
+                "resolve the conflicts, `nit add` the files, then `nit commit` again".into(),
+            );
+        }
+        eprintln!(
+            "nit: a merge is under way. git commits a merge whole, so all {} staged \
+             path(s) go into it.",
+            index_staged.len()
+        );
+        run_git_commit(
+            strategy,
+            &commit_git_args(explicit_msg.as_deref(), false, true, &[]),
+        )?;
+        syncbase::clear_session_staged(my_anchor);
+        syncbase::prune_dead_staged();
+        eprintln!(
+            "nit: merge concluded. Templates and triggers were not run: `nit update` \
+             finishes the sync."
+        );
+        return Ok(());
+    }
+
+    if index_staged.is_empty() && !amend {
         return Err("nothing staged to commit".into());
     }
+    if amend && head_is_on_upstream(strategy) {
+        return Err(
+            "the last commit is already on the remote, and amending it would need a \
+             forced push. Make a new commit instead."
+                .into(),
+        );
+    }
+    let msg: Option<&str> = match (explicit_msg.as_deref(), amend) {
+        (Some(m), _) => Some(m),
+        (None, true) => None,
+        (None, false) => Some("nit commit"),
+    };
 
     // 2. Discover templates + their work-tree-root-relative source paths
     //    (parallel to `mappings`, fed to the pure scope planner).
@@ -1328,18 +1479,27 @@ fn cmd_commit(
     //    THIS session staged; scope commit + template-deploy to that set so a
     //    concurrent session's shared-index entries are never bundled or
     //    live-deployed (the 2026-05-17 incident class).
-    let my_anchor = syncbase::get_session_anchor();
     let session_staged = syncbase::read_session_staged(my_anchor);
-    let index_staged: Vec<String> = staged_files.iter().map(|s| s.to_string()).collect();
     let plan = plan_commit_scope(&session_staged, &index_staged, &template_source_rels);
 
-    if plan.session_tracking_bypassed {
-        eprintln!(
-            "nit: \u{26a0} no nit-add staging recorded for this session — committing the \
-             whole index (legacy behavior). Prefer `nit add <paths>` so commits are \
-             scoped to this session and cannot bundle a concurrent session's work."
-        );
-    } else if plan.commit_pathspec.is_empty() {
+    // An empty scope is a refusal, unless this is an amend, which may reword
+    // the last commit with nothing of its own staged.
+    if plan.commit_pathspec.is_empty() && !amend {
+        if plan.session_tracking_bypassed {
+            eprintln!(
+                "nit: this session has staged nothing with `nit add`. Staged by another \
+                 session, or with raw git ({}):",
+                plan.out_of_scope.len()
+            );
+            for p in &plan.out_of_scope {
+                eprintln!("nit:     {}", p);
+            }
+            eprintln!(
+                "nit: to commit some of them from here, name them: `nit add <paths>`, \
+                 then `nit commit`."
+            );
+            return Err("nothing staged by this session to commit".into());
+        }
         return Err("nothing staged by THIS session to commit — the paths this \
                     session staged are no longer staged (already committed, or \
                     unstaged). Run `nit add <paths>` first."
@@ -1386,14 +1546,17 @@ fn cmd_commit(
         .collect();
 
     // 4. AC-5.7: only plain files in scope → zero-friction, scoped commit.
+    let did = if amend { "amended with" } else { "committed" };
     if plan.plain_only {
-        let mut args: Vec<&str> = vec!["commit", "-m", msg, "--"];
-        args.extend(commit_pathspecs.iter().map(String::as_str));
-        git::exec_git_with(strategy, &args)?;
+        run_git_commit(
+            strategy,
+            &commit_git_args(msg, amend, false, &commit_pathspecs),
+        )?;
         syncbase::clear_session_staged(my_anchor);
         syncbase::prune_dead_staged();
         eprintln!(
-            "nit: committed {} path(s) (plain files only, no templates)",
+            "nit: {} {} path(s) (plain files only, no templates)",
+            did,
             plan.commit_pathspec.len()
         );
         return Ok(());
@@ -1545,10 +1708,17 @@ fn cmd_commit(
 
     // 7. Git commit — scoped to exactly this session's staged paths via
     //    `:/`-anchored pathspec (never another session's shared-index entry).
-    {
-        let mut args: Vec<&str> = vec!["commit", "-m", msg, "--"];
-        args.extend(commit_pathspecs.iter().map(String::as_str));
-        git::exec_git_with(strategy, &args)?;
+    if let Err(e) = run_git_commit(
+        strategy,
+        &commit_git_args(msg, amend, false, &commit_pathspecs),
+    ) {
+        eprintln!(
+            "nit: {} template(s) in scope were rendered and deployed before git \
+             refused, so the deployed files are ahead of history until the commit \
+             goes through.",
+            scoped_templates.len()
+        );
+        return Err(e);
     }
     syncbase::clear_session_staged(my_anchor);
     syncbase::prune_dead_staged();
@@ -1585,7 +1755,8 @@ fn cmd_commit(
     }
 
     eprintln!(
-        "nit: committed {} path(s), {} template(s) deployed",
+        "nit: {} {} path(s), {} template(s) deployed",
+        did,
         plan.commit_pathspec.len(),
         scoped_templates.len()
     );
@@ -2039,16 +2210,7 @@ fn cmd_status(
         // verification primitive was missing). Uses the SAME pure
         // `plan_commit_scope` cmd_commit uses, fed the SAME
         // `git diff --cached --name-only` index, so the preview cannot lie.
-        let idx = git::git_output_with(
-            strategy,
-            &["diff", "--cached", "--name-only", "--no-renames"],
-        )
-        .unwrap_or_default();
-        let index_staged: Vec<String> = idx
-            .lines()
-            .filter(|l| !l.is_empty())
-            .map(|s| s.to_string())
-            .collect();
+        let index_staged: Vec<String> = syncbase::staged_paths(strategy).unwrap_or_default();
         if !index_staged.is_empty() {
             let home = dirs::home_dir().expect("cannot determine home directory");
             let tmpl_rels: Vec<String> = mappings
@@ -2066,9 +2228,9 @@ fn cmd_status(
             println!();
             if plan.session_tracking_bypassed {
                 println!(
-                    "Commit scope: \u{26a0} no `nit add` record for this session — \
-                     `nit commit` would commit the WHOLE index ({} path(s), legacy). \
-                     Use `nit add <paths>` to scope to this session.",
+                    "Commit scope: this session has staged nothing with `nit add`, so \
+                     `nit commit` would refuse. {} path(s) are staged by another session \
+                     or with raw git; `nit add <paths>` claims the ones that are yours.",
                     index_staged.len()
                 );
             } else {
@@ -2140,8 +2302,7 @@ fn cmd_passthrough(
     let strategy = config.git_strategy();
     let mut all_args: Vec<&str> = vec![subcmd];
     all_args.extend(args.iter().map(|s| s.as_str()));
-    git::exec_git_with(strategy, &all_args)?;
-    Ok(())
+    git::run_git_with(strategy, &all_args)
 }
 
 // ---------------------------------------------------------------------------
@@ -2905,37 +3066,79 @@ source_dir = "~/dotfiles/templates"
         );
     }
 
+    // Until 2026-10-13 a session with no record committed the whole index
+    // with a warning. That was the one path left on which a commit could
+    // carry another session's work, and its template with it.
     #[test]
-    fn bypassed_session_has_nothing_out_of_scope() {
-        let index = sv(&["x.txt", "y.txt"]);
-        let plan = plan_commit_scope(&[], &index, &[]);
-        assert!(plan.session_tracking_bypassed);
-        assert!(
-            plan.out_of_scope.is_empty(),
-            "whole-index fallback commits everything staged — no residue to warn about"
-        );
-    }
-
-    #[test]
-    fn empty_session_record_falls_back_to_index_flagged_bypassed() {
+    fn a_session_with_no_record_has_an_empty_scope_and_everything_is_out_of_it() {
         let index = sv(&["x.txt", "y.txt", "dotfiles/templates/.zshenv.tmpl"]);
         let tmpl_rels = sv(&["dotfiles/templates/.zshenv.tmpl"]);
         let plan = plan_commit_scope(&[], &index, &tmpl_rels);
         assert!(
             plan.session_tracking_bypassed,
-            "no session record → bypass flag so caller warns"
+            "no session record → flagged, so the caller's refusal can say why"
+        );
+        assert!(
+            plan.commit_pathspec.is_empty(),
+            "nothing in the index is this session's"
         );
         assert_eq!(
-            plan.commit_pathspec,
+            plan.out_of_scope,
             sv(&["dotfiles/templates/.zshenv.tmpl", "x.txt", "y.txt"]),
-            "legacy whole-index (sorted) preserved for non-nit-add flows"
+            "the refusal names every staged path"
+        );
+        assert!(
+            plan.deploy_mapping_idx.is_empty() && plan.plain_only,
+            "another session's staged template is never deployed from here"
+        );
+    }
+
+    // ── The final `git commit` argument list ──────────────────────────────
+
+    #[test]
+    fn a_scoped_commit_names_its_paths_after_the_separator() {
+        assert_eq!(
+            commit_git_args(Some("msg"), false, false, &sv(&[":/a.txt", ":/b c.txt"])),
+            sv(&["commit", "-m", "msg", "--", ":/a.txt", ":/b c.txt"])
+        );
+    }
+
+    #[test]
+    fn concluding_a_merge_passes_no_pathspec() {
+        // git: "cannot do a partial commit during a merge"
+        assert_eq!(
+            commit_git_args(Some("merge"), false, true, &sv(&[":/a.txt"])),
+            sv(&["commit", "-m", "merge"])
         );
         assert_eq!(
-            plan.deploy_mapping_idx,
-            vec![0usize],
-            "legacy: index template still deploys (EARS:43)"
+            commit_git_args(None, false, true, &[]),
+            sv(&["commit", "--no-edit"]),
+            "no message given → git's prepared merge message"
         );
-        assert!(!plan.plain_only);
+    }
+
+    #[test]
+    fn an_amend_with_no_paths_rewords_and_takes_nothing_staged() {
+        assert_eq!(
+            commit_git_args(Some("better"), true, false, &[]),
+            sv(&["commit", "--amend", "-m", "better", "--only"])
+        );
+    }
+
+    #[test]
+    fn an_amend_with_paths_keeps_the_message_unless_one_is_given() {
+        assert_eq!(
+            commit_git_args(None, true, false, &sv(&[":/a.txt"])),
+            sv(&["commit", "--amend", "--no-edit", "--", ":/a.txt"])
+        );
+    }
+
+    #[test]
+    fn an_empty_scope_never_becomes_a_commit_of_the_whole_index() {
+        // `--only` with no pathspec is refused by git unless `--amend` is
+        // there, so this call fails and commits nothing.
+        let args = commit_git_args(Some("msg"), false, false, &[]);
+        assert_eq!(args, sv(&["commit", "-m", "msg", "--only"]));
     }
 
     #[test]
