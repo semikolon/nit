@@ -464,8 +464,12 @@ settled by Fredrik, and the remaining set changed shape once the prior art in §
 
 Found while checking the above. On 2026-10-15 the Mac's nightly had been deadlocked 3 days, and
 none of the three blocking files was app-written: a glossary, `.hammerspoon/init.lua` and
-`dotfiles/docs/connections.md`, each another session's uncommitted edit. The real blocker class
-is unfinished session work, which §6.2's sorting rules do not cover.
+`dotfiles/docs/connections.md`, each another session's uncommitted edit. The design already
+covers such files: §2 puts the Steward in-session because of concurrent sessions, and §9b keeps
+them outside the auto-commit set, surfaced and never committed blind. What it lacked was (a) a
+way for the nightly to keep syncing while such edits sit there, and (b) the evidence the Steward
+needs to judge them, namely which session made the edit and whether it is still open.
+(Corrected 2026-10-15: a first draft of this paragraph said the design did not cover them.)
 
 1. **Narrow the pre-pull abort to files the pull would touch.** Why it exists (`164513c3`): a
    pull over dirty files could merge badly. Git itself refuses to overwrite an uncommitted file
