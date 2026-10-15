@@ -842,7 +842,8 @@ supersedes the delivery mechanism while keeping the constraint: **nit itself sta
 - `src/drift_queue.rs` — `nit drift-triage` and the queue file. Writer evidence comes from Claude
   Code transcripts (`~/.claude/projects/**/*.jsonl`) and running-session records
   (`~/.claude/sessions/<pid>.json`), searched from the path's last commit, at most 21 days back.
-  An editing tool call is "edited"; any other tool input naming the path is "named".
+  An editing tool call is "edited"; any other tool input naming the path is "named". Codex
+  transcripts (`~/.codex/sessions`) are read too since the same evening; see Later the same day.
 - `nit commit -m … -- <paths>` commits only those of the session's staged paths; `nit discard`
   puts back HEAD's version only when nothing is lost (stale content already in history, or a
   deletion), never for staged or new content.

@@ -52,6 +52,11 @@ the 2026-10-15 rulings). Built: `pull_gate` (the nightly pulls around edits it d
 - [ ] **Add a SILENCE condition** (doc §11.4, §12.4): health from the AGE of the last success,
   not the last record; ideally a fleet check on Darwin that also sees a machine gone quiet.
   Shannon's last successful sync was 2026-06-27 with status `ok`.
+- [ ] **Is a Codex thread still open?** The queue reads Codex transcripts since 2026-10-15 but
+  prints such writers as `codex`, neither running nor ended, because no record of open threads
+  was found. Looked at and ruled out: `~/.codex/process_manager/chat_processes.json` lists shell
+  processes Codex started (its entries were months old), not open threads. Unread so far:
+  `~/.codex/logs_2.sqlite` and `queue_1.sqlite`.
 - [ ] **hemma overlay adapter** (doc §12): one classifier, two adapters, one escalation path.
 - [ ] **Deploy targets tracked as sources** (doc §10.3): a mechanical signal (a trigger declares
   its outputs) would let the queue flag them; today the steward recognises them by judgement.
