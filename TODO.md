@@ -45,9 +45,7 @@ the 2026-10-15 rulings). Built: `pull_gate` (the nightly pulls around edits it d
 `nit commit -- <paths>`, `nit discard`; in dotfiles the `drift-steward-nudge` hook, the
 `drift-steward` skill, and the decisions log committed by its writer with a union merge.
 
-- [ ] **Roll out**: push semikolon/nit (public: audit first), bump `~/dotfiles/.nit-version`, stage
-  a Darwin-cross-built aarch64 binary for Shannon (`no_local_build`). Until then only the Mac
-  runs the new nit, and Darwin's decision logger cannot use `nit commit -- <path>`.
+- [ ] **Confirm the rollout** (pin `e5eecbec`, pushed 2026-10-15; Shannon's aarch64 copy staged on Darwin): `hemma status` after the next nightly should show every machine on it.
 - [ ] **Watch the first nights**: the Mac's 03:00 sync should now pull around the three edited
   files that blocked it 2026-10-12..15 (`last-sync.json` `pulled_around`); `edit_touched` must
   stay absent. Review from 2026-10-17.

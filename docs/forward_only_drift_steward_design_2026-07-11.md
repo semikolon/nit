@@ -864,6 +864,24 @@ supersedes the delivery mechanism while keeping the constraint: **nit itself sta
 5. **Per-machine namespacing (§ 6.5) is not built.** With the decisions log merged by union and
    the titles file gone, no remaining tracked file needs it.
 
+**Later the same day** (each found by using the steward on the real queue):
+- **Spellings.** The writer search matched only absolute paths and found no session for two of
+  the three blocking files; sessions write `~/…` and `$HOME/…` too. Fixed in `e5eecbec`.
+- **"Own work" means edited, not named.** The hook first hid a file because only the steward
+  session itself had named it in a shell command; only an edit by this session now counts.
+- **Codex is invisible.** `.hammerspoon/init.lua` and its untracked `spela.lua` came from a Codex
+  session (Fredrik knew; nit could not see it). Reading `~/.codex/sessions` is on nit's TODO.
+- **A directive plus a second hook trigger** (his request: make the skill load when a session
+  elsewhere meets drift). Global CLAUDE.md, Nit section: committing, discarding or restoring a
+  tracked file this session did not edit goes through the `drift-steward` skill, cued on nit's own
+  output strings. The hook reads the previous turn's tool output in any session and names the
+  skill and the never-rules when one of those strings appears. Every firing is logged to
+  `~/.local/share/drift-steward/fired.jsonl`, so whether the skill really loads can be measured.
+- **Rollout.** Pin `e5eecbec`. A hand-installed nit is replaced by the pinned one at the next
+  `nit update` (`rebuild-nit`), so testing a build means moving the pin. Shannon's aarch64 copy
+  is staged on Darwin; `stage-nit-prebuilt.sh` had a check that refused correct builds (`grep -q`
+  under `pipefail`), fixed.
+
 ---
 
 ---

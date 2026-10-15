@@ -87,6 +87,9 @@ nit enforces this structurally:
 | `nit pick --dismiss <file>` | Dismiss saved drift (shows diff before removing) |
 | `nit commit -m "..."` | Commit what this session staged: render + deploy + ack check + git commit + triggers |
 | `nit commit --amend [-m "..."]` | Fold this session's staged paths into the last commit, or reword it (refused once pushed) |
+| `nit commit -m "..." -- <paths>` | Commit only these of this session's staged paths; the rest stay staged |
+| `nit discard <file>` | Restore a file to HEAD only when nothing is lost (its bytes are in an earlier commit, or it was deleted) |
+| `nit drift-triage` | Write the drift queue: each edited tracked file, whether it is already in git, and which agent sessions touched it |
 | `nit update` | Pull + render + deploy + triggers (fleet sync) |
 | `nit update --safe` | Same, but skip service-restarting triggers |
 | `nit status` | One-line summary |
@@ -337,6 +340,10 @@ nit update --safe  # same, but skip service-restarting triggers (for production)
 ```
 
 Key safety behavior: **drifted template targets are SKIPPED, not overwritten**. If someone SSH'd into a server and hotfixed a config, `nit update` preserves that fix and reports it. The reasoning: clobbering a production hotfix could cause an outage. The drift is saved for later review with `nit pick`.
+
+**Edited plain files are pulled around, never over.** Before pulling, `nit update` fetches and asks git what the pull would change. It stops only when the pull would touch a file you have edited, when something is staged and the pull needs a real merge (git refuses that), or when it cannot tell what is coming. Every other edit stays exactly as it was: nit copies it aside first, checks it afterwards, and reports `edit_touched` if anything changed it anyway. Triggers that watch an edited file wait until the edit is committed. Until October 2026 any edit stopped the whole sync, and one unfinished edit could keep a machine from syncing for days.
+
+What to do with the edits is a judgement call, so nit leaves it to whoever has the context. `nit drift-triage` writes `~/.local/share/nit/drift-queue.json` with the evidence: whether each file's content is already in git history (then `nit discard` is lossless), when it was last committed, and which agent sessions edited or named it since then and whether they are still running (read from Claude Code's transcripts). An agent session reads the queue and decides; nit itself makes no judgement and calls no model.
 
 You can run `nit update` manually via SSH, schedule it via cron, or let a fleet orchestrator like [hemma](https://github.com/semikolon/hemma) trigger it across all your machines in parallel.
 
