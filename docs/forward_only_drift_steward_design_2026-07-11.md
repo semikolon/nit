@@ -883,7 +883,7 @@ supersedes the delivery mechanism while keeping the constraint: **nit itself sta
   output strings. The hook reads the previous turn's tool output in any session and names the
   skill and the never-rules when one of those strings appears. Every firing is logged to
   `~/.local/share/drift-steward/fired.jsonl`, so whether the skill really loads can be measured.
-- **Rollout.** Pin `e5eecbec`. A hand-installed nit is replaced by the pinned one at the next
+- **Rollout.** Pin `e5eecbec`, then `b6e3822e` (the Codex reader). A hand-installed nit is replaced by the pinned one at the next
   `nit update` (`rebuild-nit`), so testing a build means moving the pin. Shannon's aarch64 copy
   is staged on Darwin; `stage-nit-prebuilt.sh` had a check that refused correct builds (`grep -q`
   under `pipefail`), fixed.
