@@ -385,3 +385,43 @@ fn amend_is_refused_once_the_commit_is_on_the_remote() {
         "a pushed commit must not be rewritten"
     );
 }
+
+#[test]
+fn a_path_list_commits_only_those_paths_and_keeps_the_rest_staged() {
+    // The decision logger commits its own line from inside a session that
+    // may have other work staged; that work must stay staged and stay the
+    // session's (2026-10-15, drift steward).
+    let sb = Sandbox::new();
+    sb.write(".claude/log.jsonl", "{\"a\":1}\n");
+    sb.write("docs/draft.md", "half done\n");
+    assert!(
+        sb.nit(&["add", ".claude/log.jsonl", "docs/draft.md"])
+            .status
+            .success()
+    );
+
+    let abs = sb.home.join(".claude/log.jsonl");
+    let commit = sb.nit(&["commit", "-m", "log line", "--", abs.to_str().unwrap()]);
+
+    assert!(commit.status.success(), "{}", said(&commit));
+    assert_eq!(sb.committed(), names(&[".claude/log.jsonl"]));
+    assert_eq!(sb.staged(), names(&["docs/draft.md"]));
+    // The rest is still this session's: a plain commit now takes it.
+    let rest = sb.nit(&["commit", "-m", "the draft"]);
+    assert!(rest.status.success(), "{}", said(&rest));
+    assert_eq!(sb.committed(), names(&["docs/draft.md"]));
+}
+
+#[test]
+fn a_path_list_naming_a_path_this_session_did_not_stage_is_refused() {
+    let sb = Sandbox::new();
+    sb.write("a.md", "a\n");
+    sb.write("b.md", "b\n");
+    assert!(sb.nit(&["add", "a.md"]).status.success());
+    sb.git_ok(&["add", "b.md"]); // staged without nit: nobody's
+
+    let commit = sb.nit(&["commit", "-m", "x", "--", "b.md"]);
+
+    assert!(!commit.status.success(), "{}", said(&commit));
+    assert_eq!(sb.commit_count(), 0);
+}

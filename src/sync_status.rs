@@ -34,6 +34,11 @@ pub enum SyncResult {
     /// Shannon read `ok — 2026-06-27` for ten weeks while failing every night —
     /// worse than silence, because every health check saw a success.
     SecretsDrift,
+    /// The pull went around edited files, and something later in the run
+    /// (a template, a secret, a trigger) changed one of them anyway. The
+    /// edited version is kept under ~/.local/share/nit/pulled-around/ and
+    /// named in `errors`. Added 2026-10-15 with the pull gate.
+    EditTouched,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,6 +80,11 @@ pub struct SyncStatus {
     /// every night or going silent again.
     #[serde(default)]
     pub last_notified_at: Option<String>,
+    /// Edited tracked files the pull went around and left as they were, as
+    /// porcelain lines. A successful sync can still carry edits nobody has
+    /// committed; this is where the drift steward reads them from.
+    #[serde(default)]
+    pub pulled_around: Vec<String>,
 }
 
 impl SyncStatus {
@@ -93,6 +103,7 @@ impl SyncStatus {
             errors: Vec::new(),
             last_success_at: None,
             last_notified_at: None,
+            pulled_around: Vec::new(),
         }
     }
 }
@@ -157,10 +168,19 @@ pub fn one_line_summary(status: &SyncStatus) -> String {
         SyncResult::PullFailed => "FAILED (pull)",
         SyncResult::TriggersFailed => "ok-with-trigger-failures",
         SyncResult::SecretsDrift => "ABORTED (secret drift)",
+        SyncResult::EditTouched => "DONE, BUT AN EDITED FILE WAS CHANGED",
+    };
+    let around = if status.pulled_around.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " (pulled around {} uncommitted edit(s))",
+            status.pulled_around.len()
+        )
     };
     format!(
-        "last sync: {} — {} at {}",
-        result_label, status.machine, status.completed_at
+        "last sync: {} — {} at {}{}",
+        result_label, status.machine, status.completed_at, around
     )
 }
 
@@ -195,6 +215,7 @@ mod tests {
             SyncResult::PullFailed,
             SyncResult::TriggersFailed,
             SyncResult::SecretsDrift,
+            SyncResult::EditTouched,
         ] {
             st.result = r;
             let line = one_line_summary(&st);

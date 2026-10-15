@@ -6,11 +6,13 @@
 
 mod bootstrap;
 mod config;
+mod drift_queue;
 mod drift_triage;
 mod encrypt;
 mod git;
 mod permissions;
 mod pick;
+mod pull_gate;
 mod sync_status;
 mod syncbase;
 mod template;
@@ -106,6 +108,13 @@ enum NitCommand {
         /// message is kept. Refused once the commit is on the remote.
         #[arg(long)]
         amend: bool,
+
+        /// Commit only these of the paths this session staged, after `--`
+        /// (`nit commit -m … -- <path>…`). The rest stay staged and stay this
+        /// session's. Lets a tool that writes one file commit just that file
+        /// from inside a session with other work staged.
+        #[arg(last = true)]
+        paths: Vec<String>,
     },
 
     /// Pull + render + deploy + triggers (fleet sync, no commit)
@@ -251,10 +260,28 @@ enum NitCommand {
         comment: Option<String>,
     },
 
-    /// Flush forward-only runtime files (decisions state/cache, spela
-    /// config) to git: pathspec-scoped commit of the declared
-    /// `[sync] forward_only` paths. Never `-A`; does NOT push.
+    /// Snapshot the declared forward-only runtime files (fleet.toml
+    /// `[sync] forward_only`) to ~/.local/share/nit/forward-only/. Local
+    /// only: no commit, no push (since `cd1d18a`).
     Sync {},
+
+    /// Write the drift queue (~/.local/share/nit/drift-queue.json): every
+    /// edited tracked file, whether its bytes are already in git, and which
+    /// agent sessions touched it since its last commit. No judgement; a
+    /// session reads the queue and decides. Also runs after `nit update`.
+    DriftTriage {
+        /// Leave this file out of the queue while its content stays as it is.
+        #[arg(long)]
+        dismiss: Vec<String>,
+        /// Write the queue without printing it.
+        #[arg(long)]
+        quiet: bool,
+    },
+
+    /// Restore edited tracked files to HEAD, but only when nothing is lost:
+    /// the file's current bytes already exist in an earlier commit (a stale
+    /// copy), or it was deleted. Refuses new content and anything staged.
+    Discard { paths: Vec<String> },
 
     /// Any unrecognized subcommand falls through to git
     #[command(external_subcommand)]
@@ -381,8 +408,15 @@ fn run_command(cmd: NitCommand, config: &NitConfig) -> Result<(), Box<dyn std::e
             message,
             file,
             amend,
-        } => cmd_commit(&message, file.as_deref(), amend, config),
-        NitCommand::Update { safe } => cmd_update(safe, config),
+            paths,
+        } => cmd_commit(&message, file.as_deref(), amend, &paths, config),
+        NitCommand::Update { safe } => {
+            let result = cmd_update(safe, config);
+            // Whatever the update did, leave the drift steward an up-to-date
+            // queue. Its own failure must not change the update's result.
+            drift_queue::refresh(config);
+            result
+        }
         NitCommand::Status {
             show_untracked,
             verbose,
@@ -402,6 +436,8 @@ fn run_command(cmd: NitCommand, config: &NitConfig) -> Result<(), Box<dyn std::e
         NitCommand::List => cmd_list(config),
         NitCommand::Run { name } => cmd_run(&name, config),
         NitCommand::Sync {} => cmd_sync(config),
+        NitCommand::DriftTriage { dismiss, quiet } => drift_queue::cmd(config, &dismiss, quiet),
+        NitCommand::Discard { paths } => cmd_discard(&paths, config),
         NitCommand::FleetAddRecipient {
             tier,
             pubkey,
@@ -1244,6 +1280,67 @@ fn plan_commit_scope(
     }
 }
 
+/// Narrow a commit plan to the paths named after `--`. Every named path must
+/// already be in the plan (staged by this session), or the commit is refused
+/// with the missing ones, since committing a path nobody claimed is the
+/// bundling the session scope exists to prevent. Returns the narrowed plan and
+/// this session's other staged paths, which stay staged.
+fn limit_commit_plan(
+    plan: CommitPlan,
+    only: &[String],
+    template_source_rels: &[String],
+) -> Result<(CommitPlan, Vec<String>), Vec<String>> {
+    use std::collections::BTreeSet;
+    let in_scope: BTreeSet<&str> = plan.commit_pathspec.iter().map(String::as_str).collect();
+    let missing: Vec<String> = only
+        .iter()
+        .filter(|p| !in_scope.contains(p.as_str()))
+        .cloned()
+        .collect();
+    if !missing.is_empty() {
+        return Err(missing);
+    }
+    let wanted: BTreeSet<&str> = only.iter().map(String::as_str).collect();
+    let own_left: Vec<String> = plan
+        .commit_pathspec
+        .iter()
+        .filter(|p| !wanted.contains(p.as_str()))
+        .cloned()
+        .collect();
+    let mut commit_pathspec: Vec<String> = wanted.iter().map(|p| p.to_string()).collect();
+    commit_pathspec.sort();
+    let deploy_mapping_idx: Vec<usize> = template_source_rels
+        .iter()
+        .enumerate()
+        .filter(|(_, src)| wanted.contains(src.as_str()))
+        .map(|(i, _)| i)
+        .collect();
+    Ok((
+        CommitPlan {
+            plain_only: deploy_mapping_idx.is_empty(),
+            commit_pathspec,
+            deploy_mapping_idx,
+            session_tracking_bypassed: plan.session_tracking_bypassed,
+            out_of_scope: plan.out_of_scope,
+        },
+        own_left,
+    ))
+}
+
+/// A path as the user or a tool wrote it, as the work-tree-relative name the
+/// index uses: an absolute path under $HOME loses the prefix, a leading `./`
+/// or `:/` goes.
+fn normalize_commit_path(p: &str, home: &Path) -> String {
+    let path = Path::new(p);
+    let rel = path
+        .strip_prefix(home)
+        .map(|r| r.to_string_lossy().to_string())
+        .unwrap_or_else(|_| p.to_string());
+    rel.trim_start_matches(":/")
+        .trim_start_matches("./")
+        .to_string()
+}
+
 /// Record into the current session-anchor's staged store the paths THIS
 /// `nit add` invocation newly staged (index delta vs `before`). Union
 /// semantics across invocations accumulate the session's full staging
@@ -1373,9 +1470,18 @@ fn cmd_commit(
     messages: &[String],
     file: Option<&str>,
     amend: bool,
+    only_paths: &[String],
     config: &NitConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let strategy = config.git_strategy();
+    let home_dir = dirs::home_dir().expect("cannot determine home directory");
+    let only: Vec<String> = only_paths
+        .iter()
+        .map(|p| normalize_commit_path(p, &home_dir))
+        .collect();
+    if !only.is_empty() && amend {
+        return Err("`--amend` and a path list do not go together; amend without paths".into());
+    }
 
     // Resolve -m / -F (file or `-`=stdin). IO here; precedence/validation is
     // the pure `resolve_commit_message` (RED-GREEN tested).
@@ -1409,6 +1515,13 @@ fn cmd_commit(
     // 1a. A merge under way is concluded, whole. git accepts nothing else, so
     //     the session scope cannot apply; say so and name the size of it.
     if merge_in_progress(strategy) {
+        if !only.is_empty() {
+            return Err(
+                "a merge is under way, and git commits a merge whole: conclude it with \
+                 `nit commit` and no path list"
+                    .into(),
+            );
+        }
         if amend {
             return Err(
                 "a merge is under way: conclude it with `nit commit` before amending".into(),
@@ -1481,6 +1594,41 @@ fn cmd_commit(
     //    live-deployed (the 2026-05-17 incident class).
     let session_staged = syncbase::read_session_staged(my_anchor);
     let plan = plan_commit_scope(&session_staged, &index_staged, &template_source_rels);
+    let (plan, own_left_staged) = if only.is_empty() {
+        (plan, Vec::new())
+    } else {
+        match limit_commit_plan(plan, &only, &template_source_rels) {
+            Ok(pair) => pair,
+            Err(missing) => {
+                for p in &missing {
+                    eprintln!("nit:     {}", p);
+                }
+                return Err(format!(
+                    "{} named path(s) are not staged by this session: `nit add` them first",
+                    missing.len()
+                )
+                .into());
+            }
+        }
+    };
+    // After the commit: forget only what was committed when a path list was
+    // given, so the rest of this session's staging stays its own.
+    let finish_staged = || {
+        if only.is_empty() {
+            syncbase::clear_session_staged(my_anchor);
+        } else {
+            syncbase::remove_session_staged(my_anchor, &only);
+        }
+    };
+    if !own_left_staged.is_empty() {
+        eprintln!(
+            "nit: {} other path(s) this session staged stay staged (not named):",
+            own_left_staged.len()
+        );
+        for p in &own_left_staged {
+            eprintln!("nit:     {}", p);
+        }
+    }
 
     // An empty scope is a refusal, unless this is an amend, which may reword
     // the last commit with nothing of its own staged.
@@ -1552,7 +1700,7 @@ fn cmd_commit(
             strategy,
             &commit_git_args(msg, amend, false, &commit_pathspecs),
         )?;
-        syncbase::clear_session_staged(my_anchor);
+        finish_staged();
         syncbase::prune_dead_staged();
         eprintln!(
             "nit: {} {} path(s) (plain files only, no templates)",
@@ -1720,7 +1868,7 @@ fn cmd_commit(
         );
         return Err(e);
     }
-    syncbase::clear_session_staged(my_anchor);
+    finish_staged();
     syncbase::prune_dead_staged();
 
     // Run triggers (skip drifted files)
@@ -1764,6 +1912,147 @@ fn cmd_commit(
     Ok(())
 }
 
+/// What `nit discard` may do with one drifted file: restore it, or refuse
+/// and say why. Pure, so the refusal rules are tested without git.
+#[derive(Debug, PartialEq)]
+enum DiscardVerdict {
+    Restore(String),
+    Refuse(String),
+}
+
+fn discard_verdict(status: &str, kind: &drift_triage::DriftKind) -> DiscardVerdict {
+    let staged = matches!(status.chars().next(), Some(c) if c != ' ' && c != '?');
+    if staged {
+        return DiscardVerdict::Refuse(
+            "it has staged changes; unstage them first (`nit reset <path>`) so nothing staged is lost"
+                .into(),
+        );
+    }
+    match kind {
+        drift_triage::DriftKind::Stale { commit, date } => DiscardVerdict::Restore(format!(
+            "its content matches {} ({}), so nothing is lost",
+            commit, date
+        )),
+        drift_triage::DriftKind::Deleted => {
+            DiscardVerdict::Restore("it was deleted; HEAD's version comes back".into())
+        }
+        drift_triage::DriftKind::Unique => DiscardVerdict::Refuse(
+            "its content was never committed; commit it, or ask whoever made it".into(),
+        ),
+        drift_triage::DriftKind::Unknown => DiscardVerdict::Refuse(
+            "could not prove its content is in git history, so it counts as new".into(),
+        ),
+    }
+}
+
+fn cmd_discard(paths: &[String], config: &NitConfig) -> Result<(), Box<dyn std::error::Error>> {
+    if paths.is_empty() {
+        return Err("name the files to discard".into());
+    }
+    let strategy = config.git_strategy();
+    let home = dirs::home_dir().expect("cannot determine home directory");
+    let rels: Vec<String> = paths
+        .iter()
+        .map(|p| normalize_commit_path(p, &home))
+        .collect();
+    let mut args: Vec<String> = vec!["status".into(), "--porcelain".into(), "--".into()];
+    args.extend(rels.iter().map(|r| drift_triage::root_pathspec(r)));
+    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    let porcelain = git::git_output_with(strategy, &argv)?;
+    let drift = sync_status::detect_pre_pull_drift(&porcelain);
+    let triaged = drift_triage::triage(strategy, &drift);
+    let mut refused = 0usize;
+    for rel in &rels {
+        let Some(t) = triaged.iter().find(|t| &t.path == rel) else {
+            eprintln!("nit: {} has no local changes; nothing to discard", rel);
+            continue;
+        };
+        match discard_verdict(&t.status, &t.kind) {
+            DiscardVerdict::Restore(why) => {
+                git::run_git_with(
+                    strategy,
+                    &["checkout", "HEAD", "--", &drift_triage::root_pathspec(rel)],
+                )?;
+                eprintln!("nit: restored {} to HEAD: {}", rel, why);
+            }
+            DiscardVerdict::Refuse(why) => {
+                refused += 1;
+                eprintln!("nit: NOT discarding {}: {}", rel, why);
+            }
+        }
+    }
+    drift_queue::refresh(config);
+    if refused > 0 {
+        return Err(format!("{} file(s) not discarded", refused).into());
+    }
+    Ok(())
+}
+
+/// Copies of the edited files a pull went around, taken before the pull.
+///
+/// The pull itself leaves them alone (git guarantees that, see `pull_gate`),
+/// but the steps after it (templates, secrets, triggers) are nit's own and
+/// are only drift-checked one by one. This guard makes the promise hold for
+/// the whole run: the bytes are copied aside first, and any file whose bytes
+/// differ afterwards keeps its copy and is reported.
+struct PulledAroundGuard {
+    dir: PathBuf,
+    kept: Vec<(String, Option<Vec<u8>>)>,
+}
+
+impl PulledAroundGuard {
+    fn dir() -> PathBuf {
+        dirs::home_dir()
+            .expect("cannot determine home directory")
+            .join(".local/share/nit/pulled-around")
+    }
+
+    fn take(paths: &[String]) -> Self {
+        Self::take_in(&Self::dir(), &dirs::home_dir().expect("home"), paths)
+    }
+
+    fn take_in(dir: &Path, home: &Path, paths: &[String]) -> Self {
+        let kept: Vec<(String, Option<Vec<u8>>)> = paths
+            .iter()
+            .map(|p| {
+                let bytes = std::fs::read(home.join(p)).ok();
+                if let Some(b) = &bytes {
+                    let dest = dir.join(p);
+                    if let Some(parent) = dest.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    let _ = std::fs::write(&dest, b);
+                }
+                (p.clone(), bytes)
+            })
+            .collect();
+        PulledAroundGuard {
+            dir: dir.to_path_buf(),
+            kept,
+        }
+    }
+
+    fn verify(&self) -> Vec<(String, PathBuf)> {
+        self.verify_in(&dirs::home_dir().expect("home"))
+    }
+
+    /// The paths whose bytes changed, each with where its edited copy is.
+    /// Unchanged files have their copy removed.
+    fn verify_in(&self, home: &Path) -> Vec<(String, PathBuf)> {
+        let mut changed = Vec::new();
+        for (p, before) in &self.kept {
+            let now = std::fs::read(home.join(p)).ok();
+            let copy = self.dir.join(p);
+            if &now == before {
+                let _ = std::fs::remove_file(&copy);
+            } else if before.is_some() {
+                changed.push((p.clone(), copy));
+            }
+        }
+        changed
+    }
+}
+
 // ---------------------------------------------------------------------------
 // T-12: cmd_update — Pull + render + deploy + triggers (fleet sync)
 // ---------------------------------------------------------------------------
@@ -1802,10 +2091,24 @@ fn cmd_update(safe: bool, config: &NitConfig) -> Result<(), Box<dyn std::error::
         .as_ref()
         .map(|s| s.forward_only.as_slice())
         .unwrap_or(&[]);
-    let drift = crate::config::filter_forward_only_drift(
+    let all_drift = crate::config::filter_forward_only_drift(
         sync_status::detect_pre_pull_drift(&porcelain),
         forward_only,
     );
+    // Since 2026-10-15 edited files block the pull only when the pull would
+    // touch them (or a staged entry would stop a true merge). Anything else is
+    // pulled around and left exactly as it is. See `pull_gate`.
+    let gate = if all_drift.is_empty() {
+        pull_gate::PullGate::Proceed {
+            pulled_around: Vec::new(),
+        }
+    } else {
+        pull_gate::decide(&all_drift, pull_gate::incoming(strategy).as_ref())
+    };
+    let (drift, block_reason, pulled_around) = match gate {
+        pull_gate::PullGate::Block { reason, files } => (files, Some(reason), Vec::new()),
+        pull_gate::PullGate::Proceed { pulled_around } => (Vec::new(), None, pulled_around),
+    };
     if !drift.is_empty() {
         status.result = sync_status::SyncResult::AbortedDrift;
         status.drift_files = drift.clone();
@@ -1822,6 +2125,10 @@ fn cmd_update(safe: bool, config: &NitConfig) -> Result<(), Box<dyn std::error::
             "nit update: ABORTED — pre-pull drift detected ({} file(s)):",
             drift.len()
         );
+        if let Some(reason) = &block_reason {
+            eprintln!("  why: {}", reason.explain());
+            status.errors.push(reason.explain().to_string());
+        }
         for f in &triaged {
             eprintln!("  {} {}  [{}]", f.status, f.path, f.kind.label());
         }
@@ -1890,9 +2197,28 @@ fn cmd_update(safe: bool, config: &NitConfig) -> Result<(), Box<dyn std::error::
         return Err("aborted: pre-pull drift detected".into());
     }
 
+    // 0b. Edited files the pull leaves alone: keep a copy of each first, so
+    //     that if any later step (a template, a secret, a trigger) changes one
+    //     after all, the edit is still on disk and the change is reported.
+    let pulled_around_paths: Vec<String> = pulled_around
+        .iter()
+        .filter_map(|l| drift_triage::parse_porcelain_entry(l).map(|(_, p)| p))
+        .collect();
+    let guard = PulledAroundGuard::take(&pulled_around_paths);
+    if !pulled_around_paths.is_empty() {
+        eprintln!(
+            "nit: pulling around {} edited file(s) the pull does not touch:",
+            pulled_around_paths.len()
+        );
+        for p in &pulled_around_paths {
+            eprintln!("nit:     {}", p);
+        }
+    }
+    status.pulled_around = pulled_around.clone();
+
     // 1. git pull
     eprintln!("nit: pulling latest...");
-    let pull_status = git::exec_git_with(strategy, &["pull"])?;
+    let pull_status = git::exec_git_with(strategy, &["pull", "--no-rebase", "--no-edit"])?;
     if !pull_status.success() {
         status.result = sync_status::SyncResult::PullFailed;
         status.errors.push("git pull failed".to_string());
@@ -2014,8 +2340,17 @@ fn cmd_update(safe: bool, config: &NitConfig) -> Result<(), Box<dyn std::error::
     // 4. Run triggers (skip drifted files; --safe skips all)
     let log_dir = default_log_dir();
     let mut trigger_state = trigger::load_trigger_state();
-    let trigger_results =
-        trigger::run_applicable_triggers(config, &mut trigger_state, &drifted_rels, safe, &log_dir);
+    // A trigger watching a file that is being edited would run on half-done
+    // input; skip it like a drifted template, and it runs once the edit lands.
+    let mut skip_for_triggers = drifted_rels.clone();
+    skip_for_triggers.extend(pulled_around_paths.iter().cloned());
+    let trigger_results = trigger::run_applicable_triggers(
+        config,
+        &mut trigger_state,
+        &skip_for_triggers,
+        safe,
+        &log_dir,
+    );
     trigger::save_trigger_state(&trigger_state);
 
     for tr in &trigger_results {
@@ -2037,6 +2372,18 @@ fn cmd_update(safe: bool, config: &NitConfig) -> Result<(), Box<dyn std::error::
         }
     }
 
+    // 4b. Did anything touch an edited file after all? Then its edit is kept
+    //     aside and the run is reported as failed, never as a quiet success.
+    for changed in guard.verify() {
+        let msg = format!(
+            "{} changed during the update; your edited version is kept at {}",
+            changed.0,
+            changed.1.display()
+        );
+        eprintln!("nit: \u{26a0} {}", msg);
+        status.errors.push(msg);
+    }
+
     // 5. Write final sync status (no git commit — we're pulling others' changes).
     status.templates_deployed = deployed_count;
     status.templates_skipped_drift = skipped_count;
@@ -2049,6 +2396,12 @@ fn cmd_update(safe: bool, config: &NitConfig) -> Result<(), Box<dyn std::error::
     }
     status.result = if status.triggers_failed > 0 {
         sync_status::SyncResult::TriggersFailed
+    } else if status
+        .errors
+        .iter()
+        .any(|e| e.contains("changed during the update"))
+    {
+        sync_status::SyncResult::EditTouched
     } else {
         sync_status::SyncResult::Ok
     };
@@ -2644,6 +2997,149 @@ fn read_identity_pubkey(identity_path: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── discard_verdict: discard only what is provably in git ─────────
+    #[test]
+    fn a_stale_copy_may_be_discarded() {
+        let k = drift_triage::DriftKind::Stale {
+            commit: "abc123".into(),
+            date: "2026-06-28".into(),
+        };
+        assert!(matches!(
+            discard_verdict(" M", &k),
+            DiscardVerdict::Restore(_)
+        ));
+    }
+
+    #[test]
+    fn new_or_unprovable_content_is_never_discarded() {
+        for k in [
+            drift_triage::DriftKind::Unique,
+            drift_triage::DriftKind::Unknown,
+        ] {
+            assert!(matches!(
+                discard_verdict(" M", &k),
+                DiscardVerdict::Refuse(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn anything_staged_is_never_discarded_even_when_stale() {
+        let k = drift_triage::DriftKind::Stale {
+            commit: "abc123".into(),
+            date: "2026-06-28".into(),
+        };
+        assert!(matches!(
+            discard_verdict("MM", &k),
+            DiscardVerdict::Refuse(_)
+        ));
+    }
+
+    // ─── limit_commit_plan: commit only the named paths ────────────────
+    fn plan_of(session: &[&str], index: &[&str]) -> CommitPlan {
+        let s: Vec<String> = session.iter().map(|x| x.to_string()).collect();
+        let i: Vec<String> = index.iter().map(|x| x.to_string()).collect();
+        plan_commit_scope(&s, &i, &[])
+    }
+
+    #[test]
+    fn a_path_list_commits_only_those_and_leaves_the_rest_this_sessions() {
+        let plan = plan_of(
+            &[".claude/log.jsonl", "docs/a.md"],
+            &[".claude/log.jsonl", "docs/a.md"],
+        );
+        let (limited, left) = limit_commit_plan(plan, &[".claude/log.jsonl".into()], &[]).unwrap();
+        assert_eq!(
+            limited.commit_pathspec,
+            vec![".claude/log.jsonl".to_string()]
+        );
+        assert_eq!(left, vec!["docs/a.md".to_string()]);
+        assert!(limited.plain_only);
+    }
+
+    #[test]
+    fn a_path_list_naming_an_unclaimed_path_is_refused() {
+        // Another session staged b.md; naming it must not commit it.
+        let plan = plan_of(&["a.md"], &["a.md", "b.md"]);
+        let err = limit_commit_plan(plan, &["b.md".into()], &[]).unwrap_err();
+        assert_eq!(err, vec!["b.md".to_string()]);
+    }
+
+    #[test]
+    fn a_named_template_source_is_still_deployed() {
+        let src = vec!["dotfiles/templates/.zshenv.tmpl".to_string()];
+        let s = vec![
+            "dotfiles/templates/.zshenv.tmpl".to_string(),
+            "x.md".to_string(),
+        ];
+        let plan = plan_commit_scope(&s, &s, &src);
+        let (limited, _) = limit_commit_plan(plan, &[src[0].clone()], &src).unwrap();
+        assert_eq!(limited.deploy_mapping_idx, vec![0]);
+        assert!(!limited.plain_only);
+    }
+
+    #[test]
+    fn commit_paths_are_normalized_to_index_names() {
+        let home = Path::new("/Users/someone");
+        assert_eq!(
+            normalize_commit_path("/Users/someone/.claude/log.jsonl", home),
+            ".claude/log.jsonl"
+        );
+        assert_eq!(normalize_commit_path("./docs/a.md", home), "docs/a.md");
+        assert_eq!(normalize_commit_path(":/docs/a.md", home), "docs/a.md");
+        assert_eq!(normalize_commit_path("docs/a.md", home), "docs/a.md");
+    }
+
+    // ─── PulledAroundGuard: an edit the pull went around stays safe ────
+    #[test]
+    fn guard_drops_the_copy_of_an_untouched_edit() {
+        let home = tempfile::TempDir::new().unwrap();
+        let keep = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(home.path().join("docs")).unwrap();
+        std::fs::write(home.path().join("docs/a.md"), b"my edit").unwrap();
+        let g = PulledAroundGuard::take_in(keep.path(), home.path(), &["docs/a.md".into()]);
+        assert!(
+            keep.path().join("docs/a.md").exists(),
+            "copy taken before the pull"
+        );
+        assert!(g.verify_in(home.path()).is_empty());
+        assert!(
+            !keep.path().join("docs/a.md").exists(),
+            "copy removed when unchanged"
+        );
+    }
+
+    #[test]
+    fn guard_keeps_and_reports_an_edit_something_changed() {
+        let home = tempfile::TempDir::new().unwrap();
+        let keep = tempfile::TempDir::new().unwrap();
+        std::fs::write(home.path().join("a.lua"), b"my edit").unwrap();
+        let g = PulledAroundGuard::take_in(keep.path(), home.path(), &["a.lua".into()]);
+        std::fs::write(home.path().join("a.lua"), b"a trigger wrote this").unwrap();
+        let changed = g.verify_in(home.path());
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0].0, "a.lua");
+        assert_eq!(std::fs::read(&changed[0].1).unwrap(), b"my edit");
+    }
+
+    #[test]
+    fn guard_reports_an_edited_file_that_vanished() {
+        let home = tempfile::TempDir::new().unwrap();
+        let keep = tempfile::TempDir::new().unwrap();
+        std::fs::write(home.path().join("a.md"), b"my edit").unwrap();
+        let g = PulledAroundGuard::take_in(keep.path(), home.path(), &["a.md".into()]);
+        std::fs::remove_file(home.path().join("a.md")).unwrap();
+        assert_eq!(g.verify_in(home.path()).len(), 1);
+    }
+
+    #[test]
+    fn guard_ignores_a_locally_deleted_file_that_stays_deleted() {
+        let home = tempfile::TempDir::new().unwrap();
+        let keep = tempfile::TempDir::new().unwrap();
+        let g = PulledAroundGuard::take_in(keep.path(), home.path(), &["gone.md".into()]);
+        assert!(g.verify_in(home.path()).is_empty());
+    }
 
     // ─── is_real_drift: self-healing drift detection ──────────────────
     #[test]

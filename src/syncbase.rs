@@ -492,6 +492,21 @@ pub fn clear_session_staged(anchor: u32) {
     let _ = fs::remove_file(staged_file_path(anchor));
 }
 
+/// Forget these paths from an anchor's staged record, keeping the rest. Used
+/// after a commit limited to a path list; the record goes when it is empty.
+pub fn remove_session_staged(anchor: u32, paths: &[String]) {
+    let kept: Vec<String> = read_session_staged(anchor)
+        .into_iter()
+        .filter(|p| !paths.contains(p))
+        .collect();
+    if kept.is_empty() {
+        clear_session_staged(anchor);
+    } else {
+        let json = serde_json::to_string_pretty(&kept).expect("failed to serialize staged set");
+        atomic_write(&staged_file_path(anchor), &json);
+    }
+}
+
 /// Prune staged-record files whose anchor PID is no longer running
 /// (mirrors `prune_dead_acks` — pure housekeeping).
 pub fn prune_dead_staged() {
