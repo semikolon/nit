@@ -483,7 +483,26 @@ is unfinished session work, which §6.2's sorting rules do not cover.
 5. **A canonical `nit discard`** (§11.4) — discard only content proven present in a named
    commit. Shape is a shared-tooling choice.
 
-Decided without him (reversible, implementation-level): `skip-worktree` stays out (10.2.3,
+**Ruled by Fredrik 2026-10-15:**
+- 10.2.1 with the three changes above: *"All sound reasonable!"* Build it.
+- Item 1 (narrow the abort): *"Sensible, go ahead."* Verified first in a scratch repo: a merge-mode
+  pull refuses with "would be overwritten by merge" when incoming touches a dirty file, and
+  leaves an untouched dirty file intact.
+- Items 2 and 3 (dead sessions' edits, pushing) are NOT fixed rules. His words: *"Claude is the
+  steward… should have some insight and be able to find out, in talking with me and inspecting
+  the state of the session that made edits, whether the changes are unfinished or not ready to
+  spread/push… what the prudent and wise course of action is."* So the Steward judges per case,
+  and asks him when the evidence does not settle it. Consequence for the mechanical half: the
+  queue must hand over that evidence. For each drifted file, `nit drift-triage` records the
+  sessions whose transcripts wrote the path (Edit/Write `file_path` in
+  `~/.claude/projects/**/*.jsonl`) and whether each is still running; a file with no writing
+  session was edited by hand or by an app, and the Steward asks. Checked on the 2026-10-15
+  blockers: all three trace to Deliberus sessions that day or to a hand edit.
+- Item 4 is his recorded position already (*"completely acceptable if the nightly sync fails with
+  a notification… I do not want to risk machine-local edits being clobbered"*): closed.
+
+Decided without him (reversible, implementation-level): `nit discard` refuses unless the exact
+bytes are in a named commit, and names that commit (item 5); `skip-worktree` stays out (10.2.3,
 moot once the caches are committed); hemma adapter later (10.2.5); codex config is a separate
 job (10.2.4).
 2. **Nightly = detect + notify only.** *Recommendation: yes, unchanged.* Already Fredrik's
