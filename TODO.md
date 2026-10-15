@@ -37,90 +37,29 @@ same mechanism as the documented untrack gotcha: a pathspec commit takes the pat
 content and overrides the index. **Wanted**: `nit commit` honours the index as staged (or a
 `--staged` flag that does), plus `nit restore --staged <path>` so unstaging needs no raw git.
 
-## 🆕 forward_only redesign + Drift Steward — design doc (2026-07-11)
+## Drift Steward — built 2026-10-15; what is left
 
-Exhaustive design + prior-reasoning capture at **`docs/forward_only_drift_steward_design_2026-07-11.md`**.
-Core: `forward_only` currently freezes the git copy + snapshots locally (no audit history, latest
-never reaches the repo, still trips TCC/raw-`add -A`). Fredrik wants config drift **in** git/nit
-history but with zero cognitive load — delegated to Claude in-session with full context (a "Drift
-Steward"), never a blind nightly job (see the 2026-05-17 concurrent-session incident below for
-why). Includes the 5-file audit (superwhisper was mis-filed → plain-track), the 5-bucket taxonomy,
-the two real constraints (per-machine namespacing / never-push-secrets), the `skip-worktree`
-finding, and open decisions. Immediate low-risk action: revert superwhisper out of `forward_only`.
+Design, rulings and history: `docs/forward_only_drift_steward_design_2026-07-11.md` (§ 10.4 for
+the 2026-10-15 rulings). Built: `pull_gate` (the nightly pulls around edits it does not touch),
+`drift_queue` (`nit drift-triage`, the evidence per edited file, refreshed after every update),
+`nit commit -- <paths>`, `nit discard`; in dotfiles the `drift-steward-nudge` hook, the
+`drift-steward` skill, and the decisions log committed by its writer with a union merge.
 
-**Founding-intent finding (2026-07-12, doc §5.5):** forward_only was MEANT to reach git (flush =
-commit, originally pushable); frozen-baseline is a double-regression from a false "target always
-ahead" premise that breaks only for per-machine-divergent files. The Steward *restores* founding
-intent via per-machine namespacing, not new scope.
-
-### ✅ Partly BUILT 2026-09-05 — what exists vs what is still design
-
-Shipped in `src/drift_triage.rs` (in master, and on the fleet since the pin moved to `7d69057` in
-September 2026; this line said until 2026-10-13 that the rollout was held, which stopped being true
-with that pin):
-
-- **The staleness gate** — *do these exact bytes already exist in this path's git
-  history?* Stale / Unique / Deleted / Unknown, with the matching commit named.
-  This is the FIRST piece of the classifier and currently the only piece.
-- **The deadlock detector** — drift plus no successful sync for ≥3 days is a
-  distinct condition with the OPPOSITE remedy (discard and pull, never commit).
-- **The ntfy escalation** — once on entry, then at most weekly, to `fleet-sync`.
-
-**Still design, and this IS the Steward work:** the rest of the classifier (for a
-file that is NOT stale — tuned setting, machine-written junk, per-machine-divergent,
-or secret-bearing → commit / commit-locally / skip / ask), the trigger and timing,
-and per-machine routing.
-
-### 🆕 Two findings from the MERIAN recovery that change the design (doc §11, §12)
-
-- [ ] **Add a SILENCE condition, not just a refusal condition.** The deadlock
-  detector fires on an abort. A machine whose nightly simply stops running never
-  aborts and so is invisible: **Shannon's last successful nit sync was 2026-06-27**,
-  with zero drift and status `ok`. Condition wanted: *last success older than N days
-  regardless of outcome*.
-- [ ] **hemma overlay drift is the LOWER LAYER of the same pipeline, not a second
-  surface** (doc §12 — corrects an earlier same-day claim). 692 files under
-  `dotfiles/system/` are nit-tracked, so the Steward already owns the overlay
-  SOURCE layer for free; only the deployed-copy layer is hemma's. Judgment
-  generalises, plumbing does not → one classifier, two adapters, and
-  `shannon-drift-watch` shrinks to a thin feed. **The prize is one escalation path**:
-  on 2026-09-05 its hand-rolled alert was found to have been undeliverable for
-  months across five independent breaks, while a second alert was being built for
-  the nit side.
-
-### Decisions to pin first (doc §11 — rationale there)
-- [ ] Nudge fires in **any** live session vs **designated** session only.
-- [ ] Per-machine-history mechanism: namespaced local ref vs isolated local repo vs `skip-worktree`.
-- [ ] Pure-runtime caches: local-only git history vs gitignore.
-- [ ] Adopt `skip-worktree`? (kills raw-`add -A` loophole + TCC stat; reconcile vs the `3d6bfec`
-  "detect all drift" invariant first).
-- [ ] codex `config.toml` templatization: now vs deferred (8 secret-ish MCP tokens → careful).
-
-### Build (nit source — RED-GREEN + fleet-roll via `.nit-version`/`rebuild-nit`)
-- [ ] `nit-drift-steward-nudge` sibling hook: UserPromptSubmit, conditional-silent, reads durable
-  drift (`nit status` scoped to declared set / `last-sync.json` `drift_files`), surfaces at next turn.
-  (~90% shape-clone of `fleet-drift-nudge`; different body — see doc §9b correction.)
-- [ ] Per-machine namespacing mechanism (whichever the decision picks) so divergent caches reach git
-  without cross-machine conflict.
-- [ ] Steward classify+commit: meaningful-vs-cosmetic gate + machine-marker grep + no-op hash skip;
-  commits via session-intent-scoped `nit commit` (explicit paths, **never** `add -A`).
-- [ ] Nightly `nit update` = **detect + notify only** (ntfy from `last-sync.json` `drift_files`;
-  never auto-commit context-blind — doc §2).
-
-### Test targets (doc §9b — pin these behaviors)
-- [ ] Meaningful edit to a runtime file gets committed (not skipped).
-- [ ] Cosmetic-only rewrite (reordered JSON, bumped timestamp) is skipped/squashed.
-- [ ] Secret-bearing runtime file committed **locally**, **never pushed** (pre-commit hook = gate).
-- [ ] Per-machine-divergent file commits to its namespaced ref with **no cross-machine conflict**
-  on another machine's pull (headline regression, mirrors `02c30db`).
-- [ ] Steward **never** runs whole-index `add -A` (assert scoped commit).
-
-### Independent low-risk action (no build needed)
-- [ ] Revert superwhisper out of `fleet.toml` `forward_only` → plain-track + push (backs out the
-  mitigation-as-deferral in nit-bare-repo commit `16104d82`).
-
-### Docs housekeeping
-- [ ] Commit the untracked design doc `docs/forward_only_drift_steward_design_2026-07-11.md`.
+- [ ] **Roll out**: push semikolon/nit (public: audit first), bump `~/dotfiles/.nit-version`, stage
+  a Darwin-cross-built aarch64 binary for Shannon (`no_local_build`). Until then only the Mac
+  runs the new nit, and Darwin's decision logger cannot use `nit commit -- <path>`.
+- [ ] **Watch the first nights**: the Mac's 03:00 sync should now pull around the three edited
+  files that blocked it 2026-10-12..15 (`last-sync.json` `pulled_around`); `edit_touched` must
+  stay absent. Review from 2026-10-17.
+- [ ] **Add a SILENCE condition** (doc §11.4, §12.4): health from the AGE of the last success,
+  not the last record; ideally a fleet check on Darwin that also sees a machine gone quiet.
+  Shannon's last successful sync was 2026-06-27 with status `ok`.
+- [ ] **Codex transcripts** in the writer search (`~/.codex/sessions`): today an edit made in
+  Codex reads as "no session found".
+- [ ] **hemma overlay adapter** (doc §12): one classifier, two adapters, one escalation path.
+- [ ] **Deploy targets tracked as sources** (doc §10.3): a mechanical signal (a trigger declares
+  its outputs) would let the queue flag them; today the steward recognises them by judgement.
+- [ ] **codex `config.toml` templatization**: separate careful job (MCP bearer tokens).
 
 ---
 

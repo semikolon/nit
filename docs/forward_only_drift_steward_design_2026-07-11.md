@@ -1,7 +1,7 @@
 # forward_only redesign + the Drift Steward — design doc
 
 **Date:** 2026-07-11
-**Status:** design / handoff. No code changed. Feeds a nit-side decision + build.
+**Status:** BUILT 2026-10-15 (§ 16). The sections before § 16 are the design as it was argued; § 10.4 holds the final rulings.
 **Author:** Claude (Opus 4.8) with Fredrik, in a sarpetorp session.
 **Why it lives here:** the reasoning was excavated from nit git history + the personal
 corpus (`mannaminne`) during a long session; capturing it verbatim so a fresh nit-repo
@@ -826,6 +826,43 @@ supersedes the delivery mechanism while keeping the constraint: **nit itself sta
   context; a cron job invoking a model over a bare diff does not. This is the measured form of the
   argument §6.3 made from intuition. (arXiv:2502.18904)
 
+
+
+## 16. Built 2026-10-15 — what exists, and the calls made without asking
+
+**nit** (commit `bbb1274`):
+- `src/pull_gate.rs` — the narrowed pre-pull gate (§ 10.4 item 1). Blocks on: an edit the
+  incoming commits touch; anything staged when the pull is a true merge; and, when what is coming
+  cannot be determined, any edit at all. Everything else is pulled around. Behaviour measured in
+  scratch repos before writing it; pinned by unit tests and five real-git end-to-end tests
+  (`tests/update_flow.rs`).
+- `PulledAroundGuard` in `main.rs` — copies each pulled-around edit aside before the pull and
+  compares afterwards; a changed one keeps its copy under `~/.local/share/nit/pulled-around/` and
+  the run reports `edit_touched`. Triggers that watch an edited file are skipped for that run.
+- `src/drift_queue.rs` — `nit drift-triage` and the queue file. Writer evidence comes from Claude
+  Code transcripts (`~/.claude/projects/**/*.jsonl`) and running-session records
+  (`~/.claude/sessions/<pid>.json`), searched from the path's last commit, at most 21 days back.
+  An editing tool call is "edited"; any other tool input naming the path is "named".
+- `nit commit -m … -- <paths>` commits only those of the session's staged paths; `nit discard`
+  puts back HEAD's version only when nothing is lost (stale content already in history, or a
+  deletion), never for staged or new content.
+
+**dotfiles**: the decisions log committed by its writer and merged by union (§ 10.2.1, commit
+`f34328fe`); the `drift-steward-nudge` hook; the `drift-steward` skill (the sorting rules of
+§ 6.2, rewritten as judgement per his ruling rather than fixed routes).
+
+**Calls made without asking, each reversible** (stated so they can be overruled):
+1. **Who hears the nudge** (the old open question "any live session vs a designated one"): a
+   session working in `~/dotfiles` or `~/Projects/nit` always; any other session only when the
+   last nightly sync was blocked. One session at a time holds a two-hour claim; each session
+   hears a given queue once. Reason: § 13's objection to interrupting unrelated work.
+2. **A session's own edits are not shown to it**: that is its work in progress.
+3. **The queue is refreshed** after every `nit update`, and by the hook in the background when it
+   is over an hour old (one-shot process, ten-minute lock).
+4. **`git pull --no-rebase --no-edit`** in `nit update`, explicit rather than relying on branch
+   config, and so that a merge never opens an editor.
+5. **Per-machine namespacing (§ 6.5) is not built.** With the decisions log merged by union and
+   the titles file gone, no remaining tracked file needs it.
 
 ---
 
