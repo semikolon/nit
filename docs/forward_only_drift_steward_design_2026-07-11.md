@@ -433,6 +433,59 @@ settled by Fredrik, and the remaining set changed shape once the prior art in §
    from the merged log (its last 20 entries), and whatever still conflicts goes to the drift
    queue for a session to resolve. **Recommended: track and auto-commit both on that basis.**
    Awaiting his yes.
+
+   **Details checked the same day (2026-10-15), which change the recommendation's shape:**
+   - **The log is not purely append-only.** `supersede_decision()` rewrites the old decision's
+     line in place (adds `superseded_by`). It has never run (0 of 54 rows superseded), but under
+     a union merge a rewritten line next to another machine's new line comes out twice. Fix:
+     supersession appends its own line, and readers fold by `decision_id`.
+   - **The titles file needs no merge driver; it can go.** A custom merge driver needs git config
+     set on every machine (config is not versioned), while `merge=union` is built in. The titles
+     file's two readers (`claude_decisions_cli.py` list/status, `user_prompt_detector.py`) go
+     through `get_recent_decisions()`; point that at the log's last 20 rows and delete the file.
+     One source, nothing to merge.
+   - **Who commits: the writer, right after writing.** The decision logger knows exactly what it
+     wrote, so no judgment is needed and the file is never dirty at 03:00. But `nit commit`
+     commits everything THIS session staged, so a logger commit from inside a busy session would
+     sweep that session's other staged work in. nit needs a path-limited form
+     (`nit commit -m … -- <path>`). Small, but a change to shared tooling.
+   - **Nothing pushes automatically.** `nit update` never pushes; the Mac sat 1 commit ahead on
+     2026-10-15. Other machines see new decisions only after some session pushes. An automatic
+     push from the logger would also publish any other unpushed local commit, so: no auto-push.
+   - **No secrets.** trufflehog read the whole file (128,827 bytes, 0 findings); the July audit's
+     "7 secret-ish" were word matches. The file has been on the private remote since April.
+   - **One writer today.** All 54 rows carry `/Users/…` paths (Mac Mini). Darwin has the logger
+     and the files but has never logged a decision; Shannon only has the copies.
+   - **The switch is one commit:** remove both paths from `fleet.toml` `forward_only`, add
+     `~/.gitattributes` (new tracked file at `$HOME` root, read only by the nit repo), and commit
+     the live log, or the next nightly aborts on it.
+
+### 10.4 Decisions still owed for the Steward as a whole (2026-10-15)
+
+Found while checking the above. On 2026-10-15 the Mac's nightly had been deadlocked 3 days, and
+none of the three blocking files was app-written: a glossary, `.hammerspoon/init.lua` and
+`dotfiles/docs/connections.md`, each another session's uncommitted edit. The real blocker class
+is unfinished session work, which §6.2's sorting rules do not cover.
+
+1. **Narrow the pre-pull abort to files the pull would touch.** Why it exists (`164513c3`): a
+   pull over dirty files could merge badly. Git itself refuses to overwrite an uncommitted file
+   that incoming commits change; files the pull does not touch are left alone. So: fetch, list
+   files changed between HEAD and upstream, abort only if that list meets the dirty set. Keeps
+   "never clobber" exactly, ends most deadlocks. Changes the sacred invariant, so his call.
+   (Post-pull steps that write files — templates, secrets, triggers — are already drift-checked
+   individually; confirm each before building.)
+2. **A dead session's uncommitted edits.** The Steward must never commit a live session's work
+   (`3cf94eb8`). When the session that made the edit has ended: commit as `wip:` after some
+   hours, or only ever surface? His call.
+3. **May the Steward push?** Private repo, non-secret files, but "push only on explicit ask"
+   stands today. Without pushes the fleet does not converge.
+4. **Nightly = detect + notify only** (10.2.2) — recommended yes, unchanged; needs his yes.
+5. **A canonical `nit discard`** (§11.4) — discard only content proven present in a named
+   commit. Shape is a shared-tooling choice.
+
+Decided without him (reversible, implementation-level): `skip-worktree` stays out (10.2.3,
+moot once the caches are committed); hemma adapter later (10.2.5); codex config is a separate
+job (10.2.4).
 2. **Nightly = detect + notify only.** *Recommendation: yes, unchanged.* Already Fredrik's
    recorded position, and the escalation half now exists (the `fleet` ntfy topic, 2026-09-05), so
    the nightly can refuse loudly instead of silently.
