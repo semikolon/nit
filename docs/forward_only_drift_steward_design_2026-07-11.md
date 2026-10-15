@@ -869,8 +869,14 @@ supersedes the delivery mechanism while keeping the constraint: **nit itself sta
   the three blocking files; sessions write `~/…` and `$HOME/…` too. Fixed in `e5eecbec`.
 - **"Own work" means edited, not named.** The hook first hid a file because only the steward
   session itself had named it in a shell command; only an edit by this session now counts.
-- **Codex is invisible.** `.hammerspoon/init.lua` and its untracked `spela.lua` came from a Codex
-  session (Fredrik knew; nit could not see it). Reading `~/.codex/sessions` is on nit's TODO.
+- **Codex was invisible, then read.** `.hammerspoon/init.lua` and its untracked `spela.lua` came
+  from a Codex session (Fredrik knew; nit could not see it). The queue now searches
+  `~/.codex/sessions` too. Codex edits through Python and shell inside its `exec` tool, often
+  building the path in pieces, so its touches are "named in Codex shell", or "edited? (Codex
+  shell)" when that command visibly writes; whether a Codex thread is still open is unknown.
+  A transcript reads with `codexdistill <id>`, the same program as `ccdistill` under a second
+  name (its default store is Codex; either name reads either format). Subagent threads carry
+  no request of their own; their task is in the parent's spawn call.
 - **A directive plus a second hook trigger** (his request: make the skill load when a session
   elsewhere meets drift). Global CLAUDE.md, Nit section: committing, discarding or restoring a
   tracked file this session did not edit goes through the `drift-steward` skill, cued on nit's own
