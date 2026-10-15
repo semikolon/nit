@@ -117,10 +117,31 @@ type Touch = (String, String, String, String);
 
 const EDIT_TOOLS: &[&str] = &["Write", "Edit", "MultiEdit", "NotebookEdit"];
 
+/// The ways a session writes a home-relative path in a command: absolute,
+/// `~/…` and `$HOME/…`. The first version searched only the absolute form and
+/// found no session for two of the three files that blocked the Mac on
+/// 2026-10-15; the sessions had written `~/.claude/glossary/…`.
+pub fn spellings(abs_path: &str, home: &Path) -> Vec<String> {
+    let mut out = vec![abs_path.to_string()];
+    if let Ok(rel) = Path::new(abs_path).strip_prefix(home) {
+        let rel = rel.to_string_lossy();
+        out.push(format!("~/{}", rel));
+        out.push(format!("$HOME/{}", rel));
+    }
+    out
+}
+
 /// Every touch of `abs_path` on one transcript line, if the line is an
-/// assistant message with tool calls. `project` is the transcript's directory.
-pub fn touches_on_line(line: &str, abs_path: &str, project: &str) -> Vec<Touch> {
-    if !line.contains(abs_path) || !line.contains("tool_use") {
+/// assistant message with tool calls. An editing tool must name the absolute
+/// path; any other tool input counts when it holds any of `spellings`.
+/// `project` is the transcript's directory.
+pub fn touches_on_line(
+    line: &str,
+    abs_path: &str,
+    spellings: &[String],
+    project: &str,
+) -> Vec<Touch> {
+    if !line.contains("tool_use") || !spellings.iter().any(|s| line.contains(s.as_str())) {
         return Vec::new();
     }
     let v: serde_json::Value = match serde_json::from_str(line) {
@@ -151,12 +172,14 @@ pub fn touches_on_line(line: &str, abs_path: &str, project: &str) -> Vec<Touch> 
             Some(i) => i,
             None => continue,
         };
+        let input_text = input.to_string();
+        let named = spellings.iter().any(|s| input_text.contains(s.as_str()));
         let edits = EDIT_TOOLS.contains(&name)
             && (input.get("file_path").and_then(|p| p.as_str()) == Some(abs_path)
                 || input.get("notebook_path").and_then(|p| p.as_str()) == Some(abs_path));
         let how = if edits {
             format!("edited ({})", name)
-        } else if input.to_string().contains(abs_path) {
+        } else if named {
             format!("named in {}", name)
         } else {
             continue;
@@ -207,9 +230,11 @@ pub fn fold_writers(
 /// touches of each wanted path.
 fn search_transcripts(
     projects_dir: &Path,
+    home: &Path,
     wanted: &[String],
     oldest: SystemTime,
 ) -> HashMap<String, Vec<Touch>> {
+    let forms: Vec<Vec<String>> = wanted.iter().map(|w| spellings(w, home)).collect();
     let mut found: HashMap<String, Vec<Touch>> = HashMap::new();
     if wanted.is_empty() || !projects_dir.exists() {
         return found;
@@ -236,9 +261,10 @@ fn search_transcripts(
             Err(_) => continue,
         };
         let text = String::from_utf8_lossy(&bytes);
-        let present: Vec<&String> = wanted
+        let present: Vec<(&String, &Vec<String>)> = wanted
             .iter()
-            .filter(|w| text.contains(w.as_str()))
+            .zip(forms.iter())
+            .filter(|(_, f)| f.iter().any(|s| text.contains(s.as_str())))
             .collect();
         if present.is_empty() {
             continue;
@@ -252,8 +278,8 @@ fn search_transcripts(
             .map(|c| c.as_os_str().to_string_lossy().to_string())
             .unwrap_or_default();
         for line in text.lines() {
-            for w in &present {
-                let t = touches_on_line(line, w, &project);
+            for (w, f) in &present {
+                let t = touches_on_line(line, w, f, &project);
                 if !t.is_empty() {
                     found.entry((*w).clone()).or_default().extend(t);
                 }
@@ -410,7 +436,7 @@ pub fn build(config: &NitConfig) -> Queue {
         .iter()
         .map(|(t, _, _)| home.join(&t.path).to_string_lossy().to_string())
         .collect();
-    let touches = search_transcripts(&home.join(".claude/projects"), &wanted, oldest);
+    let touches = search_transcripts(&home.join(".claude/projects"), &home, &wanted, oldest);
     let running = running_sessions(&home.join(".claude/sessions"));
 
     let files = pending
@@ -560,9 +586,38 @@ mod tests {
     const BASH_LINE: &str = r#"{"type":"assistant","sessionId":"69180500-a653-4765-8cc0-4a30c51a8f65","timestamp":"2026-10-15T11:26:53.646Z","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"ls -l /Users/u/.hammerspoon/init.lua","description":"x"}}]}}"#;
     const RESULT_LINE: &str = r#"{"type":"user","sessionId":"s","timestamp":"2026-10-15T11:27:00Z","message":{"content":[{"type":"tool_result","content":"/Users/u/.hammerspoon/init.lua"}]}}"#;
 
+    fn forms() -> Vec<String> {
+        spellings("/Users/u/.hammerspoon/init.lua", Path::new("/Users/u"))
+    }
+
+    #[test]
+    fn a_tilde_path_in_a_command_is_found() {
+        let line = BASH_LINE.replace("/Users/u/.hammerspoon/init.lua", "~/.hammerspoon/init.lua");
+        let t = touches_on_line(&line, "/Users/u/.hammerspoon/init.lua", &forms(), "proj");
+        assert_eq!(t.len(), 1, "{:?}", t);
+        assert_eq!(t[0].3, "named in Bash");
+    }
+
+    #[test]
+    fn spellings_cover_tilde_and_home_variable() {
+        assert_eq!(
+            forms(),
+            vec![
+                "/Users/u/.hammerspoon/init.lua".to_string(),
+                "~/.hammerspoon/init.lua".to_string(),
+                "$HOME/.hammerspoon/init.lua".to_string(),
+            ]
+        );
+    }
+
     #[test]
     fn an_editing_tool_call_is_an_edit() {
-        let t = touches_on_line(EDIT_LINE, "/Users/u/.hammerspoon/init.lua", "proj");
+        let t = touches_on_line(
+            EDIT_LINE,
+            "/Users/u/.hammerspoon/init.lua",
+            &forms(),
+            "proj",
+        );
         assert_eq!(t.len(), 1);
         assert_eq!(t[0].0, "1a58d50c-3310-4e15-a14c-92d711b86190");
         assert_eq!(t[0].3, "edited (Edit)");
@@ -570,19 +625,27 @@ mod tests {
 
     #[test]
     fn a_path_named_in_a_command_is_only_named() {
-        let t = touches_on_line(BASH_LINE, "/Users/u/.hammerspoon/init.lua", "proj");
+        let t = touches_on_line(
+            BASH_LINE,
+            "/Users/u/.hammerspoon/init.lua",
+            &forms(),
+            "proj",
+        );
         assert_eq!(t[0].3, "named in Bash");
     }
 
     #[test]
     fn a_tool_result_is_not_a_touch() {
-        assert!(touches_on_line(RESULT_LINE, "/Users/u/.hammerspoon/init.lua", "p").is_empty());
+        assert!(
+            touches_on_line(RESULT_LINE, "/Users/u/.hammerspoon/init.lua", &forms(), "p")
+                .is_empty()
+        );
     }
 
     #[test]
     fn a_longer_path_sharing_the_prefix_is_not_an_edit_of_this_one() {
         let line = EDIT_LINE.replace("init.lua\"", "init.lua.bak\"");
-        let t = touches_on_line(&line, "/Users/u/.hammerspoon/init.lua", "proj");
+        let t = touches_on_line(&line, "/Users/u/.hammerspoon/init.lua", &forms(), "proj");
         assert_eq!(t[0].3, "named in Edit", "{:?}", t);
     }
 
@@ -645,7 +708,7 @@ mod tests {
         std::fs::create_dir_all(&sub).unwrap();
         std::fs::write(sub.join("agent-1.jsonl"), format!("{}\n", EDIT_LINE)).unwrap();
         let wanted = vec!["/Users/u/.hammerspoon/init.lua".to_string()];
-        let found = search_transcripts(dir.path(), &wanted, UNIX_EPOCH);
+        let found = search_transcripts(dir.path(), Path::new("/Users/u"), &wanted, UNIX_EPOCH);
         let t = &found[&wanted[0]];
         assert_eq!(t.len(), 1);
         assert_eq!(t[0].1, "-Users-u-dotfiles");
