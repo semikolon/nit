@@ -884,6 +884,13 @@ supersedes the delivery mechanism while keeping the constraint: **nit itself sta
   output strings. The hook reads the previous turn's tool output in any session and names the
   skill and the never-rules when one of those strings appears. Every firing is logged to
   `~/.local/share/drift-steward/fired.jsonl`, so whether the skill really loads can be measured.
+- **Reshaped 2026-10-17 from that log** (30 firings in three days, four led to work). nit's
+  ordinary `Modified` status list is no longer a cue: 18 reminders on it led to nothing, since
+  seeing another's file in a list is harmless. The hook reads only `nit`/`hemma` command output
+  (reading its own source or log had set it off). The moment of risk moved to a new PreToolUse
+  guard, `~/.claude/hooks/foreign-edit-guard`: once per command it denies staging, discarding,
+  removing, restoring or stashing a changed tracked file this session did not write, naming whose
+  edit it is from the queue; the same command again within 30 minutes goes through.
 - **Rollout.** Pin `e5eecbec`, then `b6e3822e` (the Codex reader). A hand-installed nit is replaced by the pinned one at the next
   `nit update` (`rebuild-nit`), so testing a build means moving the pin. Shannon's aarch64 copy
   is staged on Darwin; `stage-nit-prebuilt.sh` had a check that refused correct builds (`grep -q`
