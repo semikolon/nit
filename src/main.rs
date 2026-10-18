@@ -260,11 +260,6 @@ enum NitCommand {
         comment: Option<String>,
     },
 
-    /// Snapshot the declared forward-only runtime files (fleet.toml
-    /// `[sync] forward_only`) to ~/.local/share/nit/forward-only/. Local
-    /// only: no commit, no push (since `cd1d18a`).
-    Sync {},
-
     /// Write the drift queue (~/.local/share/nit/drift-queue.json): every
     /// edited tracked file, whether its bytes are already in git, and which
     /// agent sessions touched it since its last commit. No judgement; a
@@ -435,7 +430,6 @@ fn run_command(cmd: NitCommand, config: &NitConfig) -> Result<(), Box<dyn std::e
         NitCommand::Rekey => cmd_rekey(config),
         NitCommand::List => cmd_list(config),
         NitCommand::Run { name } => cmd_run(&name, config),
-        NitCommand::Sync {} => cmd_sync(config),
         NitCommand::DriftTriage { dismiss, quiet } => drift_queue::cmd(config, &dismiss, quiet),
         NitCommand::Discard { paths } => cmd_discard(&paths, config),
         NitCommand::FleetAddRecipient {
@@ -1116,77 +1110,12 @@ fn detect_live_drift(mapping: &template::TemplateMapping, _config: &NitConfig) -
 // T-10: cmd_commit — Render + deploy + ack gate + git commit + triggers
 // ---------------------------------------------------------------------------
 
-// cmd_sync — Flush forward-only runtime files (v2 forward-only-sync, 2026-05-17)
-// ---------------------------------------------------------------------------
-// Forward-only paths are tracked-for-backup but never deployed source->target
-// (the machine copy is authoritative). This is the explicit "flush" that
-// captures their current runtime content into git. Pathspec-scoped commit —
-// never `-A`, never sweeps another session's staged changes (contamination-
-// safe, per the "commit caution scales with reversibility" directive). Does
-// NOT push (push is an explicit boundary the user owns).
-/// Pure: which declared forward-only paths are present on this machine.
-/// A declared path may legitimately be absent here (e.g. spela config on a
-/// server); exclude it so `nit sync` never snapshots/errors on a missing
-/// file. RED-GREEN testable (inject the presence predicate).
-fn present_forward_only(forward_only: &[String], is_present: impl Fn(&str) -> bool) -> Vec<String> {
-    forward_only
-        .iter()
-        .filter(|p| is_present(p))
-        .cloned()
-        .collect()
-}
-
-fn cmd_sync(config: &NitConfig) -> Result<(), Box<dyn std::error::Error>> {
-    let forward_only: Vec<String> = config
-        .fleet
-        .sync
-        .as_ref()
-        .map(|s| s.forward_only.clone())
-        .unwrap_or_default();
-    if forward_only.is_empty() {
-        eprintln!(
-            "nit sync: no forward-only paths declared (fleet.toml [sync] forward_only) — nothing to flush"
-        );
-        return Ok(());
-    }
-    // Snapshot to a LOCAL dir (restic-covered), NOT a git commit. A git
-    // commit here would ride the push lineage onto origin and merge-conflict
-    // every fleet machine's pull of its own runtime-drifted copy. Per-machine
-    // runtime state must never enter shared/pushable history (keeping origin's
-    // forward-only files static also means bootstrap seeds from baseline,
-    // not from another machine's live state).
-    let home = dirs::home_dir().expect("cannot determine home directory");
-    let present = present_forward_only(&forward_only, |p| home.join(p).exists());
-    if present.is_empty() {
-        eprintln!(
-            "nit sync: no declared forward-only files present on this machine — nothing to snapshot"
-        );
-        return Ok(());
-    }
-    let mut n = 0usize;
-    for rel in &present {
-        match std::fs::read_to_string(home.join(rel)) {
-            Ok(content) => {
-                syncbase::write_forward_only_snapshot(rel, &content);
-                n += 1;
-            }
-            Err(e) => eprintln!("nit sync: skipped {rel} (read failed: {e})"),
-        }
-    }
-    eprintln!(
-        "nit sync: snapshotted {n} forward-only path(s) → {} — local only, NOT a git commit \
-         (restic-covered; never pushed → never conflicts fleet pulls)",
-        syncbase::forward_only_dir().display()
-    );
-    Ok(())
-}
-
 // ---------------------------------------------------------------------------
 // Session-intent commit scoping (2026-05-17 keystone)
 //
 // Pure decision function — no git, no $HOME, no I/O — so the entire keystone
 // contract is RED-GREEN testable in isolation (mirrors the codebase pure-fn
-// idiom: filter_forward_only_drift, resolve_path_with, add_recipient_to_toml).
+// idiom: resolve_path_with, add_recipient_to_toml).
 //
 // CONTRACT: a `nit commit` includes ONLY paths THIS session-anchor recorded
 // via `nit add` (`session_staged`), intersected with what is still staged in
@@ -2057,6 +1986,24 @@ impl PulledAroundGuard {
 // T-12: cmd_update — Pull + render + deploy + triggers (fleet sync)
 // ---------------------------------------------------------------------------
 
+/// The always_commit paths that `git status --porcelain` shows edited in the
+/// work tree and not staged. A staged one belongs to a session that is in the
+/// middle of committing it; a deleted one is a decision, not a settings change.
+fn always_commit_due(porcelain: &str, list: &[String]) -> Vec<String> {
+    porcelain
+        .lines()
+        .filter_map(|l| {
+            let mut c = l.chars();
+            let (x, y) = (c.next()?, c.next()?);
+            if x != ' ' || y != 'M' {
+                return None;
+            }
+            let path = l.get(3..)?.trim().trim_matches('"');
+            list.iter().any(|p| p == path).then(|| path.to_string())
+        })
+        .collect()
+}
+
 fn cmd_update(safe: bool, config: &NitConfig) -> Result<(), Box<dyn std::error::Error>> {
     let strategy = config.git_strategy();
     let machine_name = config.machine_name.clone();
@@ -2076,25 +2023,51 @@ fn cmd_update(safe: bool, config: &NitConfig) -> Result<(), Box<dyn std::error::
     status.last_success_at = prior_success;
     status.last_notified_at = prior.as_ref().and_then(|s| s.last_notified_at.clone());
 
+    // 0a. ALWAYS-COMMIT. Fredrik's standing ruling (2026-10-18): a file on
+    // fleet.toml's `[sync] always_commit` list is committed when it has changed,
+    // so it is never a question for him. Only the listed paths go in (`--only`),
+    // a staged one is left to the session staging it, and a refusal (a hook, a
+    // secret) leaves it as an ordinary edit for the pull gate. Not pushed: the
+    // next push carries it.
+    let always: Vec<String> = config
+        .fleet
+        .sync
+        .as_ref()
+        .map(|s| s.always_commit.clone())
+        .unwrap_or_default();
+    if !always.is_empty() {
+        let before = git::git_output_with(strategy, &["status", "--porcelain"]).unwrap_or_default();
+        let due = always_commit_due(&before, &always);
+        if !due.is_empty() {
+            let msg = format!(
+                "nightly: {} changed on {} (fleet.toml always_commit)",
+                due.join(", "),
+                machine_name
+            );
+            let mut args = vec!["commit", "--only", "-q", "-m", msg.as_str(), "--"];
+            args.extend(due.iter().map(String::as_str));
+            match git::run_git_with(strategy, &args) {
+                Ok(()) => eprintln!(
+                    "nit update: committed {} always-commit path(s): {}",
+                    due.len(),
+                    due.join(", ")
+                ),
+                Err(e) => eprintln!(
+                    "nit update: could not commit {} ({e}); left as an edit",
+                    due.join(", ")
+                ),
+            }
+        }
+    }
+
     // 0. PRE-PULL DRIFT CHECK — sacred: never clobber local state.
     // If any tracked file is modified/deleted, ABORT and write status. Untracked
     // files are fine (gitignored or genuinely new — won't be touched by pull).
     let porcelain = git::git_output_with(strategy, &["status", "--porcelain"]).unwrap_or_default();
-    // `detect_pre_pull_drift` is intentionally NOT modified — it must keep
-    // detecting ALL drift (it prevented the 2026-05-04 clobber). Forward-only
-    // runtime files (decisions state/cache, spela config) are dirty BY DESIGN;
-    // filter them out here — explicitly + auditably, at the call site. Any
-    // non-forward-only drift survives the filter, so the abort still fires.
-    let forward_only = config
-        .fleet
-        .sync
-        .as_ref()
-        .map(|s| s.forward_only.as_slice())
-        .unwrap_or(&[]);
-    let all_drift = crate::config::filter_forward_only_drift(
-        sync_status::detect_pre_pull_drift(&porcelain),
-        forward_only,
-    );
+    // `detect_pre_pull_drift` keeps detecting ALL drift (it prevented the
+    // 2026-05-04 clobber). Until 2026-10-18 forward-only files were filtered out
+    // here; that list is gone, and the pull gate below decides per file.
+    let all_drift = sync_status::detect_pre_pull_drift(&porcelain);
     // Since 2026-10-15 edited files block the pull only when the pull would
     // touch them (or a staged entry would stop a true merge). Anything else is
     // pulled around and left exactly as it is. See `pull_gate`.
@@ -2454,25 +2427,8 @@ fn cmd_status(
         args.push("--untracked-files=normal");
     }
     let git_status = git::git_output_with(strategy, &args).unwrap_or_default();
-    // Forward-only runtime files are dirty BY DESIGN — exclude them from the
-    // scary "modified" count so they stop being perpetual noise; surface them
-    // calmly on their own line below.
-    let forward_only = config
-        .fleet
-        .sync
-        .as_ref()
-        .map(|s| s.forward_only.as_slice())
-        .unwrap_or(&[]);
     let is_modified = |l: &str| l.starts_with(" M") || l.starts_with("M ");
-    let modified_total = git_status.lines().filter(|l| is_modified(l)).count();
-    let fo_modified = git_status
-        .lines()
-        .filter(|l| {
-            is_modified(l)
-                && crate::config::is_forward_only(crate::config::porcelain_path(l), forward_only)
-        })
-        .count();
-    let modified = modified_total - fo_modified;
+    let modified = git_status.lines().filter(|l| is_modified(l)).count();
     let staged = git_status
         .lines()
         .filter(|l| {
@@ -2489,13 +2445,6 @@ fn cmd_status(
         "nit: {} templates ({} drifted), {} triggers | git: {} staged, {} modified, {} untracked",
         template_count, drift_count, trigger_count, staged, modified, untracked
     );
-    if fo_modified > 0 {
-        println!(
-            "nit: forward-only: {} runtime path(s) uncommitted (expected; flush with `nit sync`)",
-            fo_modified
-        );
-    }
-
     // Last-sync health summary (from ~/.local/share/nit/last-sync.json).
     if let Some(last) = sync_status::load_status() {
         println!("{}", sync_status::one_line_summary(&last));
@@ -3751,20 +3700,32 @@ source_dir = "~/dotfiles/templates"
         );
     }
 
-    // ── nit sync: present-forward-only selection (no-git-commit fix) ───────
+    // ── always_commit selection (2026-10-18) ───────────────────────────────
 
     #[test]
-    fn present_forward_only_excludes_absent() {
-        let got = present_forward_only(&av(&["a", "b", "c"]), |p| p != "b");
+    fn always_commit_due_takes_only_listed_unstaged_edits() {
+        let list = av(&[".codex/config.toml", "Documents/a b.json"]);
+        let porcelain = " M .codex/config.toml\n M notes.md\nM  Documents/a b.json\n D x\n";
         assert_eq!(
-            got,
-            av(&["a", "c"]),
-            "a declared-but-absent forward-only path must be excluded"
+            always_commit_due(porcelain, &list),
+            av(&[".codex/config.toml"])
         );
     }
 
     #[test]
-    fn present_forward_only_empty_when_none_present() {
-        assert!(present_forward_only(&av(&["x", "y"]), |_| false).is_empty());
+    fn always_commit_due_reads_a_quoted_path() {
+        let list = av(&["Documents/a b.json"]);
+        assert_eq!(
+            always_commit_due(" M \"Documents/a b.json\"\n", &list),
+            av(&["Documents/a b.json"])
+        );
+    }
+
+    #[test]
+    fn always_commit_due_ignores_deletions_and_an_empty_list() {
+        assert!(
+            always_commit_due(" D .codex/config.toml\n", &av(&[".codex/config.toml"])).is_empty()
+        );
+        assert!(always_commit_due(" M .codex/config.toml\n", &[]).is_empty());
     }
 }

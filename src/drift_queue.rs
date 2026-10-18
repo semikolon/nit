@@ -97,9 +97,6 @@ pub struct Queue {
     pub last_sync_result: Option<String>,
     pub last_success_at: Option<String>,
     pub files: Vec<QueuedFile>,
-    /// Declared runtime files (fleet.toml `forward_only`), dirty by design and
-    /// not queued.
-    pub forward_only_dirty: usize,
     /// Edited files left out because they were dismissed with these exact bytes.
     pub dismissed: usize,
 }
@@ -606,15 +603,7 @@ pub fn build(config: &NitConfig) -> Queue {
     let home = dirs::home_dir().expect("cannot determine home directory");
     let porcelain = git::git_output_with(strategy, &["status", "--porcelain"]).unwrap_or_default();
     let all = crate::sync_status::detect_pre_pull_drift(&porcelain);
-    let forward_only = config
-        .fleet
-        .sync
-        .as_ref()
-        .map(|s| s.forward_only.as_slice())
-        .unwrap_or(&[]);
-    let kept = crate::config::filter_forward_only_drift(all.clone(), forward_only);
-    let forward_only_dirty = all.len() - kept.len();
-    let triaged = drift_triage::triage(strategy, &kept);
+    let triaged = drift_triage::triage(strategy, &all);
     let dismissed = load_dismissed();
 
     let now = SystemTime::now();
@@ -703,7 +692,6 @@ pub fn build(config: &NitConfig) -> Queue {
             .and_then(|v| v.as_str().map(str::to_string)),
         last_success_at: last.and_then(|s| s.last_success_at),
         files,
-        forward_only_dirty,
         dismissed: n_dismissed,
     }
 }

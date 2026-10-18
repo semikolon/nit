@@ -60,20 +60,6 @@ pub fn write_sync_base(target_rel: &str, content: &str) {
     atomic_write(&path, content);
 }
 
-/// Forward-only snapshot directory: ~/.local/share/nit/forward-only/
-pub fn forward_only_dir() -> PathBuf {
-    nit_data_dir().join("forward-only")
-}
-
-/// Write a forward-only runtime snapshot (atomic; mirrors write_sync_base).
-/// LOCAL-only durable capture — deliberately NOT a git commit, so it can
-/// never ride the push lineage onto origin and merge-conflict fleet
-/// machines' pulls of their own runtime-drifted copies. restic backs up
-/// this dir (same tier as sync-base/drift).
-pub fn write_forward_only_snapshot(rel: &str, content: &str) {
-    atomic_write(&forward_only_dir().join(rel), content);
-}
-
 // ---------------------------------------------------------------------------
 // Drift detection
 // ---------------------------------------------------------------------------
@@ -478,7 +464,7 @@ pub fn record_session_staged_for_anchor(anchor: u32, paths: &[String]) {
 /// Pure: union `existing` + `new`, sorted + de-duplicated. The sorted on-disk
 /// form is deterministic; the set is what the commit-scope planner intersects
 /// against. Extracted pure so it is RED-GREEN testable without filesystem I/O
-/// (codebase idiom: filter_forward_only_drift, resolve_path_with, …).
+/// (codebase idiom: resolve_path_with, …).
 fn merge_staged(existing: Vec<String>, new: &[String]) -> Vec<String> {
     let mut set: std::collections::BTreeSet<String> = existing.into_iter().collect();
     set.extend(new.iter().cloned());

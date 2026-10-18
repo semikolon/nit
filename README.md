@@ -90,7 +90,7 @@ nit enforces this structurally:
 | `nit commit -m "..." -- <paths>` | Commit only these of this session's staged paths; the rest stay staged |
 | `nit discard <file>` | Restore a file to HEAD only when nothing is lost (its bytes are in an earlier commit, or it was deleted) |
 | `nit drift-triage` | Write the drift queue: each edited tracked file, whether it is already in git, and which agent sessions touched it |
-| `nit update` | Pull + render + deploy + triggers (fleet sync) |
+| `nit update` | Pull + render + deploy + triggers (fleet sync); first commits any edited file on `fleet.toml`'s `[sync] always_commit` list |
 | `nit update --safe` | Same, but skip service-restarting triggers |
 | `nit status` | One-line summary |
 | `nit list` | Inventory of templates, secrets, triggers |

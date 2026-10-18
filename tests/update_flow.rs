@@ -21,6 +21,11 @@ struct Fleet {
 
 impl Fleet {
     fn new() -> Self {
+        Self::with_sync("")
+    }
+
+    /// A fleet whose committed fleet.toml carries a `[sync]` section.
+    fn with_sync(sync: &str) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         let home = root.join("home");
@@ -30,7 +35,7 @@ impl Fleet {
         fs::create_dir_all(home.join(".config/nit")).unwrap();
         fs::write(
             home.join("dotfiles/fleet.toml"),
-            "[machines.testbox]\nssh_host = \"localhost\"\nrole = [\"dev\"]\n",
+            format!("[machines.testbox]\nssh_host = \"localhost\"\nrole = [\"dev\"]\n{sync}"),
         )
         .unwrap();
         fs::write(
@@ -269,5 +274,90 @@ fn without_an_upstream_any_edit_still_blocks() {
         said(&out).contains("could not tell what the pull"),
         "{}",
         said(&out)
+    );
+}
+
+// ─── always_commit: Fredrik's standing ruling, committed by the nightly (2026-10-18) ───
+
+const ALWAYS: &str =
+    "\n[sync]\nalways_commit = [\n  \".hammerspoon/init.lua\",   # app settings\n]\n";
+
+#[test]
+fn the_nightly_commits_an_edited_always_commit_file_and_still_pulls() {
+    let f = Fleet::with_sync(ALWAYS);
+    f.other_pushes("notes.md", "two\n");
+    f.write(".hammerspoon/init.lua", "-- the app rewrote its settings\n");
+
+    let out = f.update();
+
+    assert!(out.status.success(), "{}", said(&out));
+    assert_eq!(f.read("notes.md"), "two\n", "the pull came in");
+    assert_eq!(
+        f.read(".hammerspoon/init.lua"),
+        "-- the app rewrote its settings\n"
+    );
+    let committed = f.git(&["show", "HEAD:.hammerspoon/init.lua"]);
+    assert_eq!(
+        committed, "-- the app rewrote its settings\n",
+        "the edit is in git"
+    );
+    let log = f.git(&["log", "--format=%s", "-3"]);
+    assert!(log.contains("always_commit"), "{log}");
+    assert!(
+        f.git(&["status", "--porcelain", "--untracked-files=no"])
+            .trim()
+            .is_empty(),
+        "nothing tracked is left edited"
+    );
+}
+
+#[test]
+fn a_file_not_on_the_list_is_not_committed() {
+    let f = Fleet::with_sync(ALWAYS);
+    f.write("notes.md", "a session's half-finished edit\n");
+
+    let out = f.update();
+
+    assert!(out.status.success(), "{}", said(&out));
+    assert_eq!(f.git(&["show", "HEAD:notes.md"]), "one\n");
+    assert!(!f.git(&["log", "--format=%s"]).contains("always_commit"));
+}
+
+#[test]
+fn a_staged_always_commit_file_is_left_to_the_session_staging_it() {
+    let f = Fleet::with_sync(ALWAYS);
+    f.write(".hammerspoon/init.lua", "-- staged by a session\n");
+    f.git(&["add", ".hammerspoon/init.lua"]);
+
+    let out = f.update();
+
+    assert!(out.status.success(), "{}", said(&out));
+    assert!(!f.git(&["log", "--format=%s"]).contains("always_commit"));
+    assert!(
+        f.git(&["diff", "--cached", "--name-only"])
+            .contains(".hammerspoon/init.lua")
+    );
+}
+
+#[test]
+fn another_sessions_staged_file_stays_out_of_the_nightly_commit() {
+    let f = Fleet::with_sync(ALWAYS);
+    f.write("notes.md", "staged by another session\n");
+    f.git(&["add", "notes.md"]);
+    f.write(".hammerspoon/init.lua", "-- the app rewrote its settings\n");
+
+    let out = f.update();
+
+    assert!(out.status.success(), "{}", said(&out));
+    let files = f.git(&["show", "--name-only", "--format=", "HEAD"]);
+    assert_eq!(
+        files.trim(),
+        ".hammerspoon/init.lua",
+        "only the listed file"
+    );
+    assert!(
+        f.git(&["diff", "--cached", "--name-only"])
+            .contains("notes.md"),
+        "still staged"
     );
 }
