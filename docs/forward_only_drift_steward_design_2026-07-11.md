@@ -933,8 +933,9 @@ machines. A machine-dependent file becomes a template instead. Who commits: the 
 once (2026-10-18). The nightly commits with `--only`, leaves a staged file to its session, and
 does not push.
 
-**Done the same day:** `forward_only` and `nit sync` removed from nit (`ed56ba15`). **Open:** the
-three commit gaps met on the way (TODO.md, 2026-10-18).
+**Done the same day:** `forward_only` and `nit sync` removed from nit (`ed56ba15`). The three commit gaps met on
+the way were closed the same day by a private staging index per session (`9bbbf995`,
+`docs/session_private_index_design_2026-10-18.md`).
 
 ## Appendix — evidence index (hashes + sources)
 
