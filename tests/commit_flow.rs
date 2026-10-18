@@ -744,3 +744,154 @@ fn a_path_already_committed_exactly_as_staged_is_not_a_conflict() {
     assert!(quiet.contains("nothing left to commit"), "{quiet}");
     assert_eq!(sb.subject(), "D's");
 }
+
+// ---------------------------------------------------------------------------
+// The review gate asks only when a deployed file holds something to lose
+// (2026-10-18). Until then every source edit after a review blocked, and the
+// review a session wrote before a deploy outlived it, so the next commit of the
+// same template was refused with nothing drifted.
+// ---------------------------------------------------------------------------
+
+const SRC: &str = "dotfiles/templates/.config/app/conf.toml.tmpl";
+const TARGET: &str = ".config/app/conf.toml";
+
+impl Sandbox {
+    fn target(&self) -> String {
+        fs::read_to_string(self.home.join(TARGET)).unwrap_or_default()
+    }
+
+    fn commit_template_once(&self, session: &str, value: &str, stage: &str, msg: &str) -> Output {
+        self.write(SRC, value);
+        self.ok_as(session, &["add", stage]);
+        self.nit_as(session, &["commit", "-m", msg])
+    }
+}
+
+#[test]
+fn an_untouched_template_commits_in_one_call_every_time() {
+    let sb = Sandbox::new();
+    sb.base_commit(&[("seed.txt", "s\n")]);
+    for (n, value, stage) in [
+        (1, "a = 1\n", SRC),
+        (2, "a = 2\n", SRC),
+        (3, "a = 3\n", TARGET),
+    ] {
+        let out = sb.commit_template_once("A", value, stage, &format!("edit {n}"));
+        assert!(out.status.success(), "commit {n}: {}", said(&out));
+        assert!(
+            sb.target().contains(value.trim()),
+            "commit {n} deployed: {:?}\n{}",
+            sb.target(),
+            said(&out)
+        );
+    }
+}
+
+#[test]
+fn a_hand_edited_target_is_shown_once_then_the_template_wins() {
+    let sb = Sandbox::new();
+    sb.base_commit(&[("seed.txt", "s\n")]);
+    assert!(
+        sb.commit_template_once("A", "a = 1\n", SRC, "first")
+            .status
+            .success()
+    );
+    sb.write(TARGET, &format!("{}b = 9\n", sb.target()));
+
+    let first = sb.commit_template_once("A", "a = 2\n", SRC, "second");
+    assert!(!first.status.success(), "a hand edit must be shown first");
+    assert!(said(&first).contains("b = 9"), "{}", said(&first));
+    assert!(sb.target().contains("b = 9"), "nothing deployed yet");
+
+    let second = sb.nit_as("A", &["commit", "-m", "second"]);
+    assert!(second.status.success(), "{}", said(&second));
+    assert!(sb.target().contains("a = 2") && !sb.target().contains("b = 9"));
+    let diff = fs::read_to_string(
+        sb.home
+            .join(".local/share/nit/drift/.config/app/conf.toml.diff"),
+    );
+    assert!(
+        diff.unwrap_or_default().contains("b = 9"),
+        "the hand edit is kept as a diff"
+    );
+}
+
+#[test]
+fn a_target_edited_again_after_it_was_shown_is_shown_again() {
+    let sb = Sandbox::new();
+    sb.base_commit(&[("seed.txt", "s\n")]);
+    assert!(
+        sb.commit_template_once("A", "a = 1\n", SRC, "first")
+            .status
+            .success()
+    );
+    sb.write(TARGET, &format!("{}b = 9\n", sb.target()));
+    assert!(
+        !sb.commit_template_once("A", "a = 2\n", SRC, "second")
+            .status
+            .success()
+    );
+    sb.write(TARGET, &format!("{}c = 7\n", sb.target()));
+
+    let again = sb.nit_as("A", &["commit", "-m", "second"]);
+    assert!(!again.status.success(), "the newer edit has not been seen");
+    assert!(said(&again).contains("c = 7"), "{}", said(&again));
+    assert!(sb.nit_as("A", &["commit", "-m", "second"]).status.success());
+}
+
+#[test]
+fn another_sessions_look_at_a_hand_edit_does_not_count() {
+    let sb = Sandbox::new();
+    sb.base_commit(&[("seed.txt", "s\n")]);
+    assert!(
+        sb.commit_template_once("A", "a = 1\n", SRC, "first")
+            .status
+            .success()
+    );
+    sb.write(TARGET, &format!("{}b = 9\n", sb.target()));
+    sb.write(SRC, "a = 2\n");
+    sb.ok_as("B", &["add", SRC]);
+    assert!(
+        !sb.nit_as("B", &["commit", "-m", "B looks"])
+            .status
+            .success()
+    );
+
+    sb.ok_as("A", &["add", SRC]);
+    let a = sb.nit_as("A", &["commit", "-m", "A commits"]);
+    assert!(
+        !a.status.success(),
+        "A has not seen the hand edit: {}",
+        said(&a)
+    );
+}
+
+#[test]
+fn a_file_nit_never_wrote_is_shown_before_it_is_replaced() {
+    let sb = Sandbox::new();
+    sb.base_commit(&[("seed.txt", "s\n")]);
+    sb.write(TARGET, "mine = 1\n");
+
+    let first = sb.commit_template_once("A", "a = 1\n", SRC, "template it");
+    assert!(
+        !first.status.success(),
+        "an existing file must be shown first"
+    );
+    assert!(said(&first).contains("mine = 1"), "{}", said(&first));
+    assert_eq!(sb.target(), "mine = 1\n", "nothing replaced yet");
+
+    assert!(
+        sb.nit_as("A", &["commit", "-m", "template it"])
+            .status
+            .success()
+    );
+    assert!(sb.target().contains("a = 1"));
+    let diff = fs::read_to_string(
+        sb.home
+            .join(".local/share/nit/drift/.config/app/conf.toml.diff"),
+    );
+    assert!(
+        diff.unwrap_or_default().contains("mine = 1"),
+        "the replaced content is kept as a diff"
+    );
+}

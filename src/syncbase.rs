@@ -71,8 +71,13 @@ pub fn detect_drift(target_rel: &str, target_content: &str) -> Option<String> {
     if base_content == target_content {
         return None;
     }
+    Some(diff_text(&base_content, target_content))
+}
 
-    let diff = TextDiff::from_lines(base_content.as_str(), target_content);
+/// A line diff from `old` to `new`: `-` for lines only in `old`, `+` for lines only
+/// in `new`, a space for lines in both.
+pub fn diff_text(old: &str, new: &str) -> String {
+    let diff = TextDiff::from_lines(old, new);
     let mut output = String::new();
     for change in diff.iter_all_changes() {
         let sign = match change.tag() {
@@ -87,7 +92,7 @@ pub fn detect_drift(target_rel: &str, target_content: &str) -> Option<String> {
             output.push('\n');
         }
     }
-    Some(output)
+    output
 }
 
 /// Save a drift diff to the drift directory.
@@ -317,30 +322,30 @@ fn comm_basename(pid: u32) -> String {
     raw.rsplit('/').next().unwrap_or("").to_string()
 }
 
-/// Path to a specific PPID's ack file.
-pub fn ack_file_path(ppid: u32) -> PathBuf {
-    acks_dir().join(format!("{}.json", ppid))
+/// The name a session's reviews are filed under: the session identity staging uses
+/// (`session::Session`, process anchor plus its start time, or `NIT_SESSION_ANCHOR`),
+/// so one session's review never counts for another, and a new process that reuses an
+/// ended one's ID does not inherit its reviews. Until 2026-10-18 reviews were filed
+/// under the bare process ID.
+pub fn ack_key() -> String {
+    let session = crate::session::Session::current();
+    let started = hex::encode(Sha256::digest(session.started.as_bytes()));
+    format!("{}@{}", session.id, &started[..8])
 }
 
-/// Read all ack entries for a given PPID.
-pub fn read_acks(ppid: u32) -> HashMap<String, AckEntry> {
-    let path = ack_file_path(ppid);
+/// This session's reviews.
+pub fn read_acks_current() -> HashMap<String, AckEntry> {
+    let path = acks_dir().join(format!("{}.json", ack_key()));
     match fs::read_to_string(&path) {
         Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
         Err(_) => HashMap::new(),
     }
 }
 
-/// Write an ack entry for the current SESSION ANCHOR (not raw PPID).
-/// Reads existing acks for this anchor, adds/updates the entry, writes atomically.
+/// Record that this session has seen a template target in this state.
 pub fn write_ack(target_rel: &str, target_hash: &str, rendered_hash: &str) {
-    let anchor = get_session_anchor();
-    write_ack_for_ppid(anchor, target_rel, target_hash, rendered_hash);
-}
-
-/// Write an ack entry for a specific PPID (testable).
-pub fn write_ack_for_ppid(ppid: u32, target_rel: &str, target_hash: &str, rendered_hash: &str) {
-    let mut acks = read_acks(ppid);
+    let path = acks_dir().join(format!("{}.json", ack_key()));
+    let mut acks = read_acks_current();
     acks.insert(
         target_rel.to_string(),
         AckEntry {
@@ -350,7 +355,7 @@ pub fn write_ack_for_ppid(ppid: u32, target_rel: &str, target_hash: &str, render
         },
     );
     let json = serde_json::to_string_pretty(&acks).expect("failed to serialize acks");
-    atomic_write(&ack_file_path(ppid), &json);
+    atomic_write(&path, &json);
 }
 
 // NOTE (Apr 21, 2026): `find_cross_session_ack` was removed.
@@ -400,10 +405,22 @@ pub fn prune_dead_acks() {
 
     for entry in entries.filter_map(|e| e.ok()) {
         let name = entry.file_name().to_string_lossy().to_string();
-        if let Some(ppid_str) = name.strip_suffix(".json")
-            && let Ok(pid) = ppid_str.parse::<u32>()
-            && !is_pid_alive(pid)
-        {
+        let Some(stem) = name.strip_suffix(".json") else {
+            continue;
+        };
+        // `<id>@<start>` since 2026-10-18, `<pid>` before.
+        let id = stem.split('@').next().unwrap_or(stem);
+        let dead = match id.parse::<u32>() {
+            Ok(pid) => !is_pid_alive(pid),
+            // A named session (NIT_SESSION_ANCHOR): no process to ask, so age decides.
+            Err(_) => entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age.as_secs() > 7 * 24 * 3600),
+        };
+        if dead {
             let _ = fs::remove_file(entry.path());
         }
     }

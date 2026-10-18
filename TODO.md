@@ -24,7 +24,7 @@ by one: each session stages into its own index. `docs/session_private_index_desi
 
 ## A session's template review outlives the commit that deployed it (found 2026-10-18)
 
-- [ ] **The ack written for a template commit is never refreshed after the deploy.** Seen with
+- [x] **Fixed 2026-10-18 by the proposal below** (review only when something can be lost; acks under the session identity; a missing `[templates]` table no longer disables templates). **The ack written for a template commit is never refreshed after the deploy.** Seen with
   a LaunchAgent template: the first `nit commit` wrote an ack (target and
   render before the change), the second deployed the new render, and the same session's next
   commit of that template, after one more source edit, was refused with *"both source and target
@@ -34,7 +34,7 @@ by one: each session stages into its own index. `docs/session_private_index_desi
   deploys a template, write the ack for the deployed state (target = what was just written),
   or drop the session's ack for it; plus a test that commits the same template twice in one
   session, staged by its source path. (`src/main.rs` around the ack gate and step 6.)
-  **Proposed robust fix (2026-10-18, awaiting his word): ask for a review only when something
+  **The fix (2026-10-18, built on his word "Build it"): ask for a review only when something
   can be lost.** The ack exists so a session never overwrites edits to a deployed file it has
   not seen (design.md § ack). Refreshing the ack after deploy is not enough: the next source
   edit then hits "source changed since review", by design. So: when the target equals what nit

@@ -32,22 +32,42 @@ pub struct MachineConfig {
     pub critical: bool,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Deserialize)]
 pub struct TemplatesConfig {
     #[serde(default = "default_templates_dir")]
     pub source_dir: String,
+}
+
+// Written out by hand: a derived Default gives an empty `source_dir`, so a fleet.toml
+// without a `[templates]` table found no templates at all (found 2026-10-18, when the
+// commit-flow sandbox's template tests deployed nothing).
+impl Default for TemplatesConfig {
+    fn default() -> Self {
+        TemplatesConfig {
+            source_dir: default_templates_dir(),
+        }
+    }
 }
 
 fn default_templates_dir() -> String {
     "~/dotfiles/templates".to_string()
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Deserialize)]
 pub struct SecretsConfig {
     #[serde(default = "default_secrets_dir")]
     pub source_dir: String,
     #[serde(default)]
     pub tiers: HashMap<String, TierConfig>,
+}
+
+impl Default for SecretsConfig {
+    fn default() -> Self {
+        SecretsConfig {
+            source_dir: default_secrets_dir(),
+            tiers: HashMap::new(),
+        }
+    }
 }
 
 fn default_secrets_dir() -> String {
@@ -351,6 +371,14 @@ fn load_triggers(path: &Path) -> Result<Vec<TriggerDef>, Box<dyn std::error::Err
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_fleet_toml_without_templates_or_secrets_tables_uses_the_default_directories() {
+        let fleet: super::FleetConfig =
+            toml::from_str("[machines.a]\nssh_host = \"localhost\"\n").unwrap();
+        assert_eq!(fleet.templates.source_dir, "~/dotfiles/templates");
+        assert_eq!(fleet.secrets.source_dir, "~/dotfiles/secrets");
+    }
+
     use super::*;
 
     #[test]

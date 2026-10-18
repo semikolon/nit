@@ -247,19 +247,28 @@ Imagine this scenario:
 
 Without a safety gate, step 3 silently destroys your hotfix. You might not notice for days.
 
-The ack system ensures **every template change is reviewed before commit**, without requiring a separate review step. It's structural enforcement — the tool refuses, not the process.
+The ack system ensures **a commit never overwrites changes to a deployed file that you have not seen**, without a separate review step. It's structural enforcement — the tool refuses, not the process.
 
 ### How it works
 
-Each session (identified by PPID) writes its own ack file:
+When you `nit commit` a template, nit compares the deployed file with what nit last wrote there:
+
+- **Unchanged**, or already equal to the new render: nothing can be lost, so the commit deploys at once.
+- **Edited since nit wrote it**, or **a file nit never wrote**: nit shows what the template would replace, records that this session has seen it (an *ack*), and refuses. Run `nit commit` again to deploy; what it replaces is saved as a diff for `nit pick`.
+
+An ack covers exactly the version that was shown: edit the deployed file again and it is shown again. Your own edits to the template source are never a reason to stop.
+
+### One session's look does not count for another
+
+Acks are filed per session, under the same identity nit uses for staging (the agent or terminal process plus its start time, or `NIT_SESSION_ANCHOR`):
 
 ```
 ~/.local/share/nit/acks/
-  12345.json    ← Session A's acks
-  67890.json    ← Session B's acks
+  12345@1a2b3c4d.json    ← one session
+  67890@5e6f7a8b.json    ← another
 ```
 
-Each ack entry records what was on disk when reviewed:
+The session that commits must have seen the change itself. A new process that happens to reuse an ended one's ID does not inherit its acks, and the files of ended sessions are pruned. Each entry records the state that was shown:
 
 ```json
 {
@@ -271,36 +280,11 @@ Each ack entry records what was on disk when reviewed:
 }
 ```
 
-- `target_hash`: what was on disk (the target) when reviewed
-- `rendered_hash`: what nit would render from source at review time
-- Together, these detect both target drift AND source changes since review
-
-### Per-PPID: why not a global lock?
-
-A global lock file creates contention between concurrent sessions. Per-PPID acks mean:
-- Each session writes only its own file (atomic rename, no concurrent write risk)
-- Each session reads all ack files (safe — writers use temp-then-rename)
-- Dead sessions are pruned (`kill -0` check on each PPID)
-- No lock, no contention, no deadlocks. Scales to any number of concurrent sessions.
-
-### The commit flow
-
-When you run `nit commit` with staged template sources:
-
-1. **Own ack exists and hashes match current state?** → Proceed. You've reviewed this.
-2. **Own ack exists but hashes changed?** → Block: "target/source changed since review — re-review."
-3. **No own ack, but another session reviewed the same state?** → Proceed in one run. Same content, already reviewed. Drift shown inline as informational note.
-4. **No ack at all?** → Show drift inline, write ack, refuse. Second `nit commit` proceeds.
-
-**Plain-file-only commits skip all ack checks** — zero friction for the common case.
-
-### Why cross-session acks proceed in one run
-
-When Session B commits and finds that Session A already reviewed the identical state (same `target_hash` and `rendered_hash`), it proceeds immediately. The alternative — always requiring two runs — would add pure friction with no safety benefit, since the content is identical. Session B still sees the drift inline.
+**Plain-file-only commits skip all of this.**
 
 ### Every touchpoint writes acks
 
-`nit add`, `nit apply`, `nit pick`, and `nit commit` — all four show drift and write acks. There is no separate "review" step to forget. Interacting with templates at all means reviewing them. This is by design: gates that require discipline fail; gates that resolve themselves protect.
+`nit add` (on a template target), `nit apply`, `nit pick` and `nit commit` show drift and write acks. There is no separate "review" step to forget. This is by design: gates that require discipline fail; gates that resolve themselves protect.
 
 ## Managing Multiple Machines
 

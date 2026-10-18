@@ -536,6 +536,19 @@ fn is_real_drift(base: Option<&str>, target: Option<&str>, render: &str) -> bool
     matches!((base, target), (Some(b), Some(t)) if b != t && t != render)
 }
 
+/// Whether deploying `render` over the target could lose something nobody committed:
+/// an edit made since nit last wrote the file (real drift), or the content of a file
+/// nit never wrote, about to be replaced. Only then does a commit ask the session to
+/// look first (2026-10-18). A target equal to what nit last wrote, or already equal to
+/// the render, holds nothing to lose.
+fn target_at_risk(base: Option<&str>, target: Option<&str>, render: &str) -> bool {
+    match (base, target) {
+        (_, None) => false,
+        (Some(_), Some(_)) => is_real_drift(base, target, render),
+        (None, Some(t)) => t != render,
+    }
+}
+
 /// Prepend a warning comment to rendered content before writing to target.
 /// Returns the content unchanged if no comment is appropriate (e.g., JSON).
 fn prepend_warning(rendered: &str, target: &Path) -> String {
@@ -1466,9 +1479,13 @@ fn cmd_commit(
     let mut drifted_rels: Vec<String> = Vec::new();
     let did = if amend { "amended with" } else { "committed" };
 
-    // 5. AC-5.2: ack-gate each in-scope template source (4-cell matrix).
-    //    Acks are keyed by the same session anchor.
-    let my_acks = syncbase::read_acks(my_anchor);
+    // 5. The review gate (redesigned 2026-10-18): a commit asks the session to look
+    //    first only when the deploy could lose something nobody committed — a hand
+    //    edit to the deployed file, or the content of a file nit never wrote. The
+    //    session's own source edits are not a reason to stop, and a review counts
+    //    for exactly the version of the file it showed. Reviews stay per session
+    //    anchor: one session's look never counts for another (decision 2026-04-21).
+    let my_acks = syncbase::read_acks_current();
 
     // Prune dead-anchor ack/staged files (pure housekeeping; only own-anchor
     // state is load-bearing since cross-session reuse was removed).
@@ -1479,73 +1496,57 @@ fn cmd_commit(
 
     for mapping in &scoped_templates {
         let rel = target_rel_path(&mapping.target);
-
-        // Current rendered content
         let rendered = template::render_template(mapping, config)?;
         let rendered_with_comment = prepend_warning(&rendered, &mapping.target);
-        let current_rendered_hash = syncbase::hash_content(&rendered_with_comment);
+        let target_content = std::fs::read_to_string(&mapping.target).ok();
+        let base_content = syncbase::read_sync_base(&rel);
 
-        // Current target content
-        let current_target_content = std::fs::read_to_string(&mapping.target).unwrap_or_default();
-        let current_target_hash = syncbase::hash_content(&current_target_content);
+        if !target_at_risk(
+            base_content.as_deref(),
+            target_content.as_deref(),
+            &rendered_with_comment,
+        ) {
+            continue;
+        }
+        let target_text = target_content.unwrap_or_default();
+        let current_target_hash = syncbase::hash_content(&target_text);
+        if my_acks
+            .get(&rel)
+            .is_some_and(|ack| ack.target_hash == current_target_hash)
+        {
+            continue; // this session has seen exactly this version
+        }
 
-        if let Some(ack) = my_acks.get(&rel) {
-            // I have an ack — check 4-cell matrix
-            let rendered_match = ack.rendered_hash == current_rendered_hash;
-            let target_match = ack.target_hash == current_target_hash;
-
-            match (rendered_match, target_match) {
-                (true, true) => {
-                    // Nothing changed since review — proceed
-                }
-                (true, false) => {
-                    blocked = true;
-                    block_reasons.push(format!(
-                        "{}: target drift since review — run nit pick or nit apply",
-                        rel
-                    ));
-                }
-                (false, true) => {
-                    blocked = true;
-                    block_reasons.push(format!(
-                        "{}: source changed since review — run nit pick or nit apply",
-                        rel
-                    ));
-                }
-                (false, false) => {
-                    blocked = true;
-                    block_reasons.push(format!(
-                        "{}: both source and target changed since review — run nit pick or nit apply",
-                        rel
-                    ));
-                }
-            }
-        } else {
-            // No ack for my session anchor → show drift inline, write ack, refuse.
-            //
-            // Cross-session ack reuse was removed (Apr 21, 2026). Rationale: the
-            // committing agent should ALWAYS have witnessed the drift themselves.
-            // Output-scrolling-past in another session's review doesn't equal
-            // the committer's deliberate awareness. The "first commit fails,
-            // second proceeds" pattern structurally enforces that this agent
-            // engaged with the drift before persisting it. See spec design.md
-            // § "Why no cross-session ack reuse" for the full rationale.
-            eprintln!("nit: {} — no prior review found, showing drift:", rel);
-            if let Some(drift) = detect_live_drift(mapping, config) {
-                for line in drift.lines() {
+        match base_content.as_deref() {
+            Some(base) => {
+                eprintln!(
+                    "nit: {} was edited since nit last wrote it; the template would replace these edits:",
+                    rel
+                );
+                for line in syncbase::diff_text(base, &target_text).lines() {
                     eprintln!("    {}", line);
                 }
-            } else {
-                eprintln!("    (no drift detected)");
             }
-            // Write ack so second commit (same session anchor) proceeds.
-            syncbase::write_ack(&rel, &current_target_hash, &current_rendered_hash);
-            blocked = true;
-            block_reasons.push(format!(
-                "{}: first commit attempt — ack written, re-run nit commit to proceed",
-                rel
-            ));
+            None => {
+                eprintln!(
+                    "nit: {} exists and nit never wrote it; the template would replace it (+ lines are in the file now):",
+                    rel
+                );
+                for line in syncbase::diff_text(&rendered_with_comment, &target_text).lines() {
+                    eprintln!("    {}", line);
+                }
+            }
         }
+        syncbase::write_ack(
+            &rel,
+            &current_target_hash,
+            &syncbase::hash_content(&rendered_with_comment),
+        );
+        blocked = true;
+        block_reasons.push(format!(
+            "{}: shown above — re-run nit commit to deploy the template over it (what it replaces is kept as a diff for `nit pick`)",
+            rel
+        ));
     }
 
     if blocked {
@@ -1636,6 +1637,18 @@ fn cmd_commit(
             }
             drifted_rels.push(rel.clone());
             eprintln!("nit: \u{26a0} Drift saved for {} — source wins", rel);
+        } else if let (None, Some(t)) = (base_content.as_deref(), target_content.as_deref()) {
+            if t != rendered_with_comment {
+                // A file nit never wrote, replaced now (the gate showed it first):
+                // keep what it held, the way a hand edit is kept.
+                syncbase::save_drift(&rel, &syncbase::diff_text("", t));
+                eprintln!(
+                    "nit: {} held content nit never wrote — kept as a diff (`nit pick`)",
+                    rel
+                );
+            } else {
+                syncbase::clear_drift(&rel);
+            }
         } else {
             // No real drift: clear any stale .diff so a resolved drift (e.g.
             // incorporated into the template source) can't phantom-report forever.
