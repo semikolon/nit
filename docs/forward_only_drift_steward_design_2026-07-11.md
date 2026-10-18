@@ -927,11 +927,14 @@ both machines were checked setting-for-setting against their old files. The list
 `foreign-edit-guard`, ignored by nit itself): files Fredrik ruled are committed without asking,
 so a change is never a weekly question. **Rule for adding one**: its right content is the same
 on every machine that has it, or one machine alone writes it; check by diffing it across the
-machines. A machine-dependent file becomes a template instead. Who commits: the steward, when a
-session passes. The nightly only detects (Fredrik's ruling, § 10.4 decision 2; reconfirmed 2026-10-18).
+machines. A machine-dependent file becomes a template instead. Who commits: the nightly `nit update`
+(nit `ed56ba15`), and the steward sooner when a session passes. This narrows § 10.4 decision 2
+(the nightly only detects) to files that need judgement: for these, Fredrik made the judgement
+once (2026-10-18). The nightly commits with `--only`, leaves a staged file to its session, and
+does not push.
 
-**Open:** removing `forward_only` and `nit sync` from nit's code; the three commit gaps met on the
-way (TODO.md, 2026-10-18).
+**Done the same day:** `forward_only` and `nit sync` removed from nit (`ed56ba15`). **Open:** the
+three commit gaps met on the way (TODO.md, 2026-10-18).
 
 ## Appendix — evidence index (hashes + sources)
 
