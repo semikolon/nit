@@ -49,7 +49,10 @@ Under a lock (`~/.local/share/nit/commit.lock`, also held by `nit update` while 
 1. The paths: this session's staged paths, or the named subset (`nit commit -- <paths>`).
 2. **Path-level compare-and-swap**: for each path, the blob at the session's base must equal the
    blob at HEAD now. If another commit changed that path since this session staged it, refuse and
-   name the path and the commit: stage it again on top of the new version.
+   name the path and the commit: stage it again on top of the new version. If HEAD now holds
+   exactly what this session staged (the nightly committed the same always_commit file, say), it
+   is no conflict: the path is dropped from the commit and the record, and a commit left with
+   nothing to do is a quiet success.
 3. Build a temporary index from HEAD and copy in exactly those paths' entries from the session's
    index (removals included).
 4. Ack gate for in-scope templates, as before.

@@ -1571,7 +1571,23 @@ fn cmd_commit(
         }
         None => commit_args.push("--no-edit".to_string()),
     }
-    session.commit(strategy, &scope, &commit_args, amend)?;
+    let (made, scope) = session.commit(strategy, &scope, &commit_args, amend)?;
+    if made.is_none() {
+        eprintln!("nit: nothing left to commit: HEAD already holds what this session staged");
+        return Ok(());
+    }
+    let scoped_templates: Vec<&template::TemplateMapping> = scoped_templates
+        .into_iter()
+        .filter(|m| {
+            let rel = m
+                .source
+                .strip_prefix(&home)
+                .unwrap_or(&m.source)
+                .to_string_lossy()
+                .to_string();
+            scope.contains(&rel)
+        })
+        .collect();
 
     if scoped_templates.is_empty() {
         eprintln!(

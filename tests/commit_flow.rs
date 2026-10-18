@@ -718,3 +718,29 @@ fn staging_part_of_a_file_on_the_session_index_is_committed_as_staged() {
 
     assert_eq!(sb.show("HEAD:rows.md"), "one\nTWO\n");
 }
+
+#[test]
+fn a_path_already_committed_exactly_as_staged_is_not_a_conflict() {
+    // The nightly commits an always_commit file; a session that had staged the
+    // same content must not be refused for it.
+    let sb = Sandbox::new();
+    sb.base_commit(&[("x.txt", "base\n")]);
+    sb.write("x.txt", "same\n");
+    sb.write("y.txt", "y\n");
+    sb.ok_as("A", &["add", "x.txt", "y.txt"]);
+    sb.ok_as("B", &["add", "x.txt"]);
+    sb.ok_as("B", &["commit", "-m", "B's"]);
+
+    let said = sb.ok_as("A", &["commit", "-m", "A's"]);
+
+    assert!(said.contains("already in HEAD"), "{said}");
+    assert_eq!(sb.committed(), names(&["y.txt"]));
+    // And with nothing else staged, it is a quiet success, not a failure.
+    sb.write("z.txt", "z\n");
+    sb.ok_as("C", &["add", "z.txt"]);
+    sb.ok_as("D", &["add", "z.txt"]);
+    sb.ok_as("D", &["commit", "-m", "D's"]);
+    let quiet = sb.ok_as("C", &["commit", "-m", "C's"]);
+    assert!(quiet.contains("nothing left to commit"), "{quiet}");
+    assert_eq!(sb.subject(), "D's");
+}

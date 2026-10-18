@@ -293,27 +293,42 @@ impl Session {
 
     /// Commit `scope` (paths this session staged) onto HEAD as it is now.
     /// `commit_args` is the full `git commit …` argument list without any
-    /// pathspec. Returns the new HEAD.
+    /// pathspec. Returns the new HEAD and the paths it committed; `None` when
+    /// HEAD already held everything staged (another commit put it there).
     pub fn commit(
         &self,
         strategy: &GitStrategy,
         scope: &[String],
         commit_args: &[String],
         amend: bool,
-    ) -> Res<String> {
+    ) -> Res<(Option<String>, Vec<String>)> {
         let _lock = commit_lock()?;
         let mut meta = self.load();
         self.rebuild(strategy, &mut meta)?;
         let before = head(strategy);
+        let mine = index_entries(strategy, &self.index_path(), Some(scope))?;
 
         // Compare-and-swap per path: what HEAD holds must still be what it held
-        // when this session staged the path.
+        // when this session staged the path. HEAD holding exactly what this
+        // session staged is no conflict either: there is nothing left to do for
+        // that path (2026-10-18: the nightly commits an always_commit file a
+        // session may have staged identically).
+        let mut scope: Vec<String> = scope.to_vec();
         if let Some(h) = before.as_deref() {
-            let now = blobs_at(strategy, h, scope)?;
-            let moved: Vec<&String> = scope
-                .iter()
-                .filter(|p| meta.staged.get(*p).cloned().flatten() != now.get(*p).cloned())
-                .collect();
+            let now = blobs_at(strategy, h, &scope)?;
+            let mut already = Vec::new();
+            let mut moved = Vec::new();
+            for p in &scope {
+                let at_head = now.get(p).cloned();
+                if meta.staged.get(p).cloned().flatten() == at_head {
+                    continue;
+                }
+                if mine.get(p).map(|(_, sha)| sha.clone()) == at_head {
+                    already.push(p.clone());
+                } else {
+                    moved.push(p.clone());
+                }
+            }
             if !moved.is_empty() {
                 for p in &moved {
                     let by = crate::git::git_output_with(
@@ -330,13 +345,30 @@ impl Session {
                 )
                 .into());
             }
+            if !already.is_empty() {
+                eprintln!(
+                    "nit: {} path(s) are already in HEAD exactly as staged; nothing to commit for them:",
+                    already.len()
+                );
+                for p in &already {
+                    eprintln!("nit:     {p}");
+                    meta.staged.remove(p);
+                }
+                scope.retain(|p| !already.contains(p));
+                if scope.is_empty() && !amend {
+                    if !meta.staged.is_empty() {
+                        self.rebuild(strategy, &mut meta)?;
+                    }
+                    self.save(&meta);
+                    return Ok((None, Vec::new()));
+                }
+            }
         }
 
         // The commit's index: HEAD plus exactly the scope's entries.
         let temp = Self::dir().join(format!("{}.commit-index", self.id));
         seed(strategy, &temp)?;
-        let mine = index_entries(strategy, &self.index_path(), Some(scope))?;
-        copy_entries(strategy, &temp, scope, &mine)?;
+        copy_entries(strategy, &temp, &scope, &mine)?;
         let refs: Vec<&str> = commit_args.iter().map(String::as_str).collect();
         let status = crate::git::git_command(strategy)
             .env("GIT_INDEX_FILE", &temp)
@@ -388,7 +420,7 @@ impl Session {
                 .status();
         }
 
-        for p in scope {
+        for p in &scope {
             meta.staged.remove(p);
         }
         meta.last_commit = Some(after.clone());
@@ -396,7 +428,7 @@ impl Session {
             self.rebuild(strategy, &mut meta)?;
         }
         self.save(&meta);
-        Ok(after)
+        Ok((Some(after), scope))
     }
 }
 
