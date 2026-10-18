@@ -46,6 +46,11 @@ by one: each session stages into its own index. `docs/session_private_index_desi
   times in a session, staged by source and by target path; a drifted target still blocks until
   acked; a target edited after the ack blocks again.
 
+- [ ] **Confirm the fleet runs `066fea0`** after the 2026-10-19 nightly syncs: `hemma status`, or
+  `ssh darwin nit --version` and `ssh shannon nit --version`. Shannon fetches the aarch64 copy
+  Darwin builds in the same nightly; if its sync ran first it stays on the old nit and retries
+  the next night (the rebuild trigger exits non-zero until the pin is applied).
+
 ## Left open by the commit fix of 2026-10-13
 
 `nit commit` now fails when git does, reads staged names with `-z`, concludes a merge, has

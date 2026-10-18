@@ -66,7 +66,7 @@ The core safety principle: **no template should be deployed without the person o
 nit enforces this structurally:
 
 - **Drift shown at every touchpoint**: `nit add`, `nit apply`, `nit pick`, `nit commit` — all four show any difference between template source and target on disk. You can't interact with templates without seeing the current state.
-- **Ack-gated commits**: `nit commit` refuses to proceed for template changes until you've reviewed the drift. No flag to bypass this — the tool enforces review, not your discipline.
+- **Ack-gated commits**: when a template commit would replace edits made to the deployed file (or a file nit never wrote), `nit commit` shows them and refuses until you have seen them. An untouched template commits at once. No flag to bypass this — the tool enforces review, not your discipline.
 - **Per-session isolation**: each terminal session tracks its own review state. No lock file, no contention between concurrent sessions. Scales to any number of agents.
 - **A private staging area per session**: each session stages into its own git index (git's `GIT_INDEX_FILE`), not the shared one. `nit add`, `nit rm`, `nit mv`, path-form `nit reset` and `nit restore` write there, and `nit diff --cached` shows it. `nit commit` builds the commit from HEAD as it is now plus exactly what this session staged, so two agents working in parallel can never bundle each other's work, a commit another session made in between is kept, and what was staged is what gets committed even if the file changed since. If another commit changed a path after this session staged it, the commit is refused and names the path. For staging nit does not wrap, `GIT_INDEX_FILE=$(nit session-index) git apply --cached fix.patch`. Design: `docs/session_private_index_design_2026-10-18.md`.
 - **Nothing is dropped silently**: when the shared index holds staged work that is not this session's (raw git), `nit commit` prints it. A partial commit never looks complete.
@@ -450,7 +450,7 @@ strategy = "bare"  # "bare" (default) or "home"
 - **No auto-merge, ever.** "Clean merge" ≠ "correct merge." Source is the single source of truth for templates. Drift is saved, never incorporated automatically.
 - **Every touchpoint shows drift.** You cannot interact with templates without being shown current drift and having your review recorded.
 - **No interactive prompts.** No TTY input, ever. All output to stderr. Agents read errors, use their editor, re-run. Humans and AI agents use the same interface.
-- **Gates that resolve themselves.** Blocking gates get bypassed under pressure. nit's commit gate shows information and writes an ack on first run, then proceeds on second run. No discipline required for safety.
+- **Gates that resolve themselves.** Blocking gates get bypassed under pressure, and a gate that stops for nothing trains people to re-run without reading. nit's commit gate stops only when a deploy could lose something, shows it and writes an ack, then proceeds on the second run. No discipline required for safety.
 - **Proportional friction.** Plain files: zero nit-specific overhead. Templates without drift: auto-proceed. Templates with drift: one extra run. The friction matches the risk.
 - **Source wins is the safe default.** Wrongly discarding drift is recoverable (drift is saved). Wrongly merging junk is contamination (silent, hard to detect). Choose the recoverable failure mode.
 

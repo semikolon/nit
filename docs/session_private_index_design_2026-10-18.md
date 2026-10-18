@@ -55,7 +55,7 @@ Under a lock (`~/.local/share/nit/commit.lock`, also held by `nit update` while 
    nothing to do is a quiet success.
 3. Build a temporary index from HEAD and copy in exactly those paths' entries from the session's
    index (removals included).
-4. Ack gate for in-scope templates, as before.
+4. Ack gate for in-scope templates (since `066fea0` it stops only when the deploy could lose something: a hand edit to the deployed file, or a file nit never wrote; README § The Ack System).
 5. `git commit` with `GIT_INDEX_FILE` set to the temporary index: hooks run as usual (the
    pre-commit secret gate included), and no pathspec, so the work tree can never override what
    was staged. Afterwards HEAD's parent must be the HEAD read in step 2; if not, say so loudly.
