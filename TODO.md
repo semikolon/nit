@@ -9,6 +9,22 @@
 
 ---
 
+## Three commit gaps met while templating spela's config (2026-10-18)
+
+- [ ] **`nit commit -- <path>` records a template target's new render instead of its staged
+  removal.** Untracking a file that a new template renders: `nit rm --cached` it, move it aside,
+  `nit commit -- <template> <path>`. The commit deploys templates first, so the file is back on
+  disk, and git's pathspec commit takes the worktree content over the staged removal (dotfiles
+  `7247078d` tracked the render; `a9043c62` removed it). Fix: deploy templates after the git
+  commit, or commit with the index rather than a pathspec when a named path is a staged removal.
+- [ ] **A removal staged with `nit rm --cached` is not this session's.** `nit commit` with no
+  path list then says nothing to commit, while `nit diff --cached` shows the removal. `nit rm`
+  should record its paths in the session's staged set, as `nit add` does.
+- [ ] **`nit commit --amend` amends whatever HEAD is.** Another session committed between this
+  session's commit and its amend; the amend rewrote that session's commit with this session's
+  message (`44e6a6b5` → `8158cfdf`, restored with `nit reset --soft`). Refuse to amend a HEAD
+  this session did not make, and name whose it is.
+
 ## Left open by the commit fix of 2026-10-13
 
 `nit commit` now fails when git does, reads staged names with `-z`, concludes a merge, has
