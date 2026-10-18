@@ -928,7 +928,7 @@ both machines were checked setting-for-setting against their old files. The list
 so a change is never a weekly question. **Rule for adding one**: its right content is the same
 on every machine that has it, or one machine alone writes it; check by diffing it across the
 machines. A machine-dependent file becomes a template instead. Who commits: the steward, when a
-session passes; whether the nightly should do it for these files is Fredrik's open decision.
+session passes. The nightly only detects (Fredrik's ruling, § 10.4 decision 2; reconfirmed 2026-10-18).
 
 **Open:** removing `forward_only` and `nit sync` from nit's code; the three commit gaps met on the
 way (TODO.md, 2026-10-18).
