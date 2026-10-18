@@ -22,6 +22,19 @@ by one: each session stages into its own index. `docs/session_private_index_desi
   base is recorded wrong. The one known false-refusal case, HEAD already holding exactly what
   was staged, is handled since `e05da1cc`.
 
+## A session's template review outlives the commit that deployed it (found 2026-10-18)
+
+- [ ] **The ack written for a template commit is never refreshed after the deploy.** Seen with
+  a LaunchAgent template: the first `nit commit` wrote an ack (target and
+  render before the change), the second deployed the new render, and the same session's next
+  commit of that template, after one more source edit, was refused with *"both source and target
+  changed since review"* although `nit pick --diff` showed no drift. The ack still held the
+  pre-deploy target hash. `nit add <target>` refreshes it (`write_ack_for_mapping`), `nit add
+  <source>` does not, so the refusal depends on which path was staged. Fix: after a commit
+  deploys a template, write the ack for the deployed state (target = what was just written),
+  or drop the session's ack for it; plus a test that commits the same template twice in one
+  session, staged by its source path. (`src/main.rs` around the ack gate and step 6.)
+
 ## Left open by the commit fix of 2026-10-13
 
 `nit commit` now fails when git does, reads staged names with `-z`, concludes a merge, has
