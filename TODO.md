@@ -34,6 +34,17 @@ by one: each session stages into its own index. `docs/session_private_index_desi
   deploys a template, write the ack for the deployed state (target = what was just written),
   or drop the session's ack for it; plus a test that commits the same template twice in one
   session, staged by its source path. (`src/main.rs` around the ack gate and step 6.)
+  **Proposed robust fix (2026-10-18, awaiting his word): ask for a review only when something
+  can be lost.** The ack exists so a session never overwrites edits to a deployed file it has
+  not seen (design.md § ack). Refreshing the ack after deploy is not enough: the next source
+  edit then hits "source changed since review", by design. So: when the target equals what nit
+  last wrote there (`is_real_drift` false, the test step 6 already uses), commit proceeds with no
+  ack at all; only when the target holds edits nobody committed does the gate require this
+  session's ack, matched on the target hash alone. The session's own source edits stop being a
+  reason to block, the first commit of an undrifted template stops failing once as ceremony, and
+  the Apr-21 rule (no ack reuse across sessions) is unchanged. Tests: commit one template three
+  times in a session, staged by source and by target path; a drifted target still blocks until
+  acked; a target edited after the ack blocks again.
 
 ## Left open by the commit fix of 2026-10-13
 
