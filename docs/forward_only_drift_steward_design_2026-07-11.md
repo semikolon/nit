@@ -902,6 +902,37 @@ supersedes the delivery mechanism while keeping the constraint: **nit itself sta
 
 ---
 
+## 17. forward_only emptied, `always_commit` added, spela templated (2026-10-18)
+
+**What `nit sync` was for.** The May spec (`MIGRATION_CHECKLIST.md`, forward-only section) had
+it copy a constantly-changing file's live version into git, so its history was kept and a new
+machine got the latest; a later watcher was to run it within a minute of every change, to end
+"forgot to commit it for a month". The watcher was never built, and `cd1d18a` (18 May) turned the
+flush into a copy to `~/.local/share/nit/forward-only/`, because the commits merge-conflicted
+other machines' own copies. After that the folder had no reader and no backup, sessions ran it
+by hand six times (last real use 2026-08-31), and its purpose passed to the drift steward.
+
+**Where every listed file went.** Decision log: committed by its writer, union-merged. Decision
+state: `.gitignore`. SuperWhisper's settings (July) and Codex's config (2026-10-18, its MCP tokens
+had moved to env vars): plain-tracked. spela's config: believed runtime-written, but spela writes
+it only during first-run setup; it is hand config whose right content differs by machine (the
+Mac lists the BOHR folders its `serve-library` serves; Darwin points at the Mac and holds the
+server's host list). One shared copy cannot hold both: Darwin's version committed would have
+reached the Mac's unedited copy at the next pull and emptied its library at the next restart.
+It is now `dotfiles/templates/.config/spela/config.toml.tmpl` (`hostname == "darwin"`, else the
+Mac's version, which Shannon also had and does not use), the rendered target is gitignored, and
+both machines were checked setting-for-setting against their old files. The list is empty.
+
+**`[sync] always_commit`** (fleet.toml, read by the drift-steward reminder and
+`foreign-edit-guard`, ignored by nit itself): files Fredrik ruled are committed without asking,
+so a change is never a weekly question. **Rule for adding one**: its right content is the same
+on every machine that has it, or one machine alone writes it; check by diffing it across the
+machines. A machine-dependent file becomes a template instead. Who commits: the steward, when a
+session passes; whether the nightly should do it for these files is Fredrik's open decision.
+
+**Open:** removing `forward_only` and `nit sync` from nit's code; the three commit gaps met on the
+way (TODO.md, 2026-10-18).
+
 ## Appendix — evidence index (hashes + sources)
 
 - `3d6bfec` — forward-only sync (original spec; detect-all-then-filter; nit sync = commit).
