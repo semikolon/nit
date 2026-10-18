@@ -20,7 +20,7 @@ by one: each session stages into its own index. `docs/session_private_index_desi
   since this session staged them" should be rare and always real (another commit put different
   content in that path). A refusal on a path nobody else touched would mean the compare-and-swap
   base is recorded wrong. The one known false-refusal case, HEAD already holding exactly what
-  was staged, is handled since `9fd…` (the commit after `9bbbf995`).
+  was staged, is handled since `e05da1cc`.
 
 ## Left open by the commit fix of 2026-10-13
 
