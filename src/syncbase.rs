@@ -420,6 +420,9 @@ pub fn prune_dead_acks() {
 // staged paths" — staged BY THIS SESSION) + design.md "No auto-staging — each
 // agent accountable for exactly the files they stage". See
 // ~/Projects/nit/TODO.md § "Archaeology reframe" + "Session-intent scoping".
+//
+// Since 2026-10-18 staging lives in a private index per session (session.rs);
+// this store is only read, once, to adopt what the earlier nit recorded.
 // ---------------------------------------------------------------------------
 
 /// Staged-paths directory: ~/.local/share/nit/staged/
