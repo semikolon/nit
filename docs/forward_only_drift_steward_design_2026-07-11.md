@@ -62,6 +62,8 @@ Two commits define it:
   e.g. at bootstrap). nit **never re-commits it.**
 - `nit sync` writes the live version to `~/.local/share/nit/forward-only/<path>` (local,
   restic-covered, never pushed). Source: `syncbase.rs:63` `write_forward_only_snapshot`.
+  *Corrected 2026-10-18:* only when `nit sync` is run by hand (nothing schedules it; the Mac's
+  last snapshot is 2026-08-31), and the folder is not in the Mac's restic path list.
 - `git status` **still stats** the file (detection is deliberately unfiltered) → so the file is
   still *read* on every `nit update` (relevant to the TCC angle, §9).
 - **No `skip-worktree`** is used anywhere in nit (verified: `grep skip.worktree` → none).
