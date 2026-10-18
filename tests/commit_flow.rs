@@ -78,6 +78,52 @@ impl Sandbox {
             .unwrap()
     }
 
+    /// `nit` as a named session: two names are two sessions working side by side.
+    fn nit_as(&self, session: &str, args: &[&str]) -> Output {
+        self.base(env!("CARGO_BIN_EXE_nit"))
+            .env("NIT_SESSION_ANCHOR", session)
+            .env("NIT_SESSION_STARTED", "t0")
+            .args(args)
+            .output()
+            .unwrap()
+    }
+
+    fn ok_as(&self, session: &str, args: &[&str]) -> String {
+        let out = self.nit_as(session, args);
+        assert!(
+            out.status.success(),
+            "nit {:?} as {}: {}",
+            args,
+            session,
+            said(&out)
+        );
+        said(&out)
+    }
+
+    /// What this (default) session has staged, as `nit diff --cached` shows it.
+    fn my_staged(&self) -> Vec<String> {
+        let out = self.nit(&["diff", "--cached", "--name-only", "-z"]);
+        assert!(out.status.success(), "{}", said(&out));
+        text(&out.stdout)
+            .split('\0')
+            .filter(|p| !p.is_empty())
+            .map(String::from)
+            .collect()
+    }
+
+    /// A first commit made outside nit, so HEAD exists.
+    fn base_commit(&self, files: &[(&str, &str)]) {
+        for (name, content) in files {
+            self.write(name, content);
+            self.git_ok(&["add", name]);
+        }
+        self.git_ok(&["commit", "-q", "-m", "base"]);
+    }
+
+    fn show(&self, rev_path: &str) -> String {
+        self.git_ok(&["show", rev_path])
+    }
+
     /// Raw git on the sandbox repository: how "another session" or a hand-run
     /// command touches the index without telling nit.
     fn git(&self, args: &[&str]) -> Output {
@@ -209,7 +255,7 @@ fn a_commit_git_refuses_is_reported_as_a_failure_and_the_record_is_kept() {
         said(&refused)
     );
     assert_eq!(sb.commit_count(), 0);
-    assert_eq!(sb.staged(), names(&["a.txt"]));
+    assert_eq!(sb.my_staged(), names(&["a.txt"]));
 
     // The record of what this session staged survived the refusal: once git
     // is willing, the same `nit commit` goes through with no new `nit add`.
@@ -405,7 +451,7 @@ fn a_path_list_commits_only_those_paths_and_keeps_the_rest_staged() {
 
     assert!(commit.status.success(), "{}", said(&commit));
     assert_eq!(sb.committed(), names(&[".claude/log.jsonl"]));
-    assert_eq!(sb.staged(), names(&["docs/draft.md"]));
+    assert_eq!(sb.my_staged(), names(&["docs/draft.md"]));
     // The rest is still this session's: a plain commit now takes it.
     let rest = sb.nit(&["commit", "-m", "the draft"]);
     assert!(rest.status.success(), "{}", said(&rest));
@@ -424,4 +470,251 @@ fn a_path_list_naming_a_path_this_session_did_not_stage_is_refused() {
 
     assert!(!commit.status.success(), "{}", said(&commit));
     assert_eq!(sb.commit_count(), 0);
+}
+
+// ─── A private staging area per session (2026-10-18) ──────────────────────
+// docs/session_private_index_design_2026-10-18.md
+
+#[test]
+fn two_sessions_each_commit_only_their_own_and_the_shared_index_stays_clean() {
+    let sb = Sandbox::new();
+    sb.base_commit(&[("seed.txt", "s\n")]);
+    sb.write("a.txt", "a\n");
+    sb.write("b.txt", "b\n");
+    sb.ok_as("A", &["add", "a.txt"]);
+    sb.ok_as("B", &["add", "b.txt"]);
+    assert!(
+        sb.staged().is_empty(),
+        "staging never reaches the shared index: {:?}",
+        sb.staged()
+    );
+
+    sb.ok_as("A", &["commit", "-m", "A's"]);
+    assert_eq!(sb.committed(), names(&["a.txt"]));
+    sb.ok_as("B", &["commit", "-m", "B's"]);
+    assert_eq!(sb.committed(), names(&["b.txt"]));
+    assert!(sb.staged().is_empty(), "{:?}", sb.staged());
+    assert!(
+        sb.git_ok(&["status", "--porcelain", "--untracked-files=no"])
+            .trim()
+            .is_empty()
+    );
+}
+
+#[test]
+fn a_commit_landing_between_add_and_commit_is_kept() {
+    let sb = Sandbox::new();
+    sb.base_commit(&[("seed.txt", "s\n")]);
+    sb.write("a.txt", "a\n");
+    sb.ok_as("A", &["add", "a.txt"]);
+    sb.write("b.txt", "b\n");
+    sb.ok_as("B", &["add", "b.txt"]);
+    sb.ok_as("B", &["commit", "-m", "B's"]);
+
+    sb.ok_as("A", &["commit", "-m", "A's"]);
+
+    assert_eq!(sb.committed(), names(&["a.txt"]));
+    assert_eq!(
+        sb.git_ok(&["log", "-1", "--format=%s", "HEAD~1"]).trim(),
+        "B's"
+    );
+    assert_eq!(sb.show("HEAD:b.txt"), "b\n", "B's file survives A's commit");
+}
+
+#[test]
+fn a_path_another_session_committed_since_staging_is_refused() {
+    let sb = Sandbox::new();
+    sb.base_commit(&[("x.txt", "base\n")]);
+    sb.write("x.txt", "A's version\n");
+    sb.ok_as("A", &["add", "x.txt"]);
+    sb.write("x.txt", "B's version\n");
+    sb.ok_as("B", &["add", "x.txt"]);
+    sb.ok_as("B", &["commit", "-m", "B's"]);
+
+    let refused = sb.nit_as("A", &["commit", "-m", "A's"]);
+
+    assert!(!refused.status.success(), "{}", said(&refused));
+    assert!(said(&refused).contains("x.txt"), "{}", said(&refused));
+    assert_eq!(sb.subject(), "B's", "B's commit stands");
+    assert_eq!(sb.show("HEAD:x.txt"), "B's version\n");
+}
+
+#[test]
+fn what_was_staged_is_committed_not_a_later_edit() {
+    let sb = Sandbox::new();
+    sb.write("a.txt", "staged\n");
+    assert!(sb.nit(&["add", "a.txt"]).status.success());
+    sb.write("a.txt", "edited after staging\n");
+
+    let commit = sb.nit(&["commit", "-m", "x"]);
+
+    assert!(commit.status.success(), "{}", said(&commit));
+    assert_eq!(sb.show("HEAD:a.txt"), "staged\n");
+    assert_eq!(
+        fs::read_to_string(sb.home.join("a.txt")).unwrap(),
+        "edited after staging\n"
+    );
+}
+
+#[test]
+fn a_removal_staged_with_nit_rm_is_this_sessions() {
+    let sb = Sandbox::new();
+    sb.base_commit(&[("old.txt", "o\n"), ("keep.txt", "k\n")]);
+    let rm = sb.nit(&["rm", "--cached", "-q", "old.txt"]);
+    assert!(rm.status.success(), "{}", said(&rm));
+
+    let commit = sb.nit(&["commit", "-m", "untrack old.txt"]);
+
+    assert!(commit.status.success(), "{}", said(&commit));
+    assert!(
+        sb.git_ok(&["ls-files", "old.txt"]).trim().is_empty(),
+        "no longer tracked"
+    );
+    assert!(sb.home.join("old.txt").exists(), "the file stays on disk");
+    assert_eq!(sb.show("HEAD:keep.txt"), "k\n");
+}
+
+#[test]
+fn untracking_a_rendered_template_target_records_the_removal() {
+    // spela's config, 2026-10-18: the commit deployed the template first, and
+    // the pathspec commit then took the fresh render over the staged removal.
+    let sb = Sandbox::new();
+    sb.base_commit(&[(".config/app/config.toml", "a = 1\n")]);
+    sb.write("dotfiles/templates/.config/app/config.toml.tmpl", "a = 1\n");
+    sb.write(".gitignore", ".config/app/config.toml\n");
+    assert!(
+        sb.nit(&["rm", "--cached", "-q", ".config/app/config.toml"])
+            .status
+            .success()
+    );
+    assert!(
+        sb.nit(&[
+            "add",
+            "dotfiles/templates/.config/app/config.toml.tmpl",
+            ".gitignore"
+        ])
+        .status
+        .success()
+    );
+
+    let mut commit = sb.nit(&["commit", "-m", "template it"]);
+    if !commit.status.success() && said(&commit).contains("re-run nit commit") {
+        commit = sb.nit(&["commit", "-m", "template it"]);
+    }
+
+    assert!(commit.status.success(), "{}", said(&commit));
+    assert!(
+        sb.git_ok(&["ls-files", ".config/app/config.toml"])
+            .trim()
+            .is_empty(),
+        "the rendered target must not be tracked"
+    );
+    assert!(
+        sb.home.join(".config/app/config.toml").exists(),
+        "the target is rendered"
+    );
+}
+
+#[test]
+fn amending_another_sessions_commit_is_refused() {
+    let sb = Sandbox::new();
+    sb.base_commit(&[("seed.txt", "s\n")]);
+    sb.write("a.txt", "a\n");
+    sb.ok_as("A", &["add", "a.txt"]);
+    sb.ok_as("A", &["commit", "-m", "A's"]);
+    sb.write("b.txt", "b\n");
+    sb.ok_as("B", &["add", "b.txt"]);
+    sb.ok_as("B", &["commit", "-m", "B's"]);
+
+    let amend = sb.nit_as("A", &["commit", "--amend", "-m", "A's, reworded"]);
+
+    assert!(!amend.status.success(), "{}", said(&amend));
+    assert_eq!(sb.subject(), "B's", "B's commit is untouched");
+    assert_eq!(sb.commit_count(), 3);
+}
+
+#[test]
+fn a_reused_session_id_does_not_inherit_staging() {
+    let sb = Sandbox::new();
+    sb.base_commit(&[("seed.txt", "s\n")]);
+    sb.write("a.txt", "a\n");
+    sb.ok_as("7", &["add", "a.txt"]);
+
+    // Same id, another start time: a new process that got the same PID.
+    let out = sb
+        .base(env!("CARGO_BIN_EXE_nit"))
+        .env("NIT_SESSION_ANCHOR", "7")
+        .env("NIT_SESSION_STARTED", "t1")
+        .args(["commit", "-m", "x"])
+        .output()
+        .unwrap();
+
+    assert!(!out.status.success(), "{}", said(&out));
+    assert_eq!(
+        sb.commit_count(),
+        1,
+        "nothing of the ended session was committed"
+    );
+}
+
+#[test]
+fn staging_done_by_the_old_nit_is_adopted() {
+    let sb = Sandbox::new();
+    sb.base_commit(&[("seed.txt", "s\n")]);
+    sb.write("a.txt", "a\n");
+    sb.git_ok(&["add", "a.txt"]);
+    let list = sb.home.join(".local/share/nit/staged/42.json");
+    fs::create_dir_all(list.parent().unwrap()).unwrap();
+    fs::write(&list, "[\"a.txt\"]").unwrap();
+
+    let commit = sb.nit_as("42", &["commit", "-m", "from before the upgrade"]);
+
+    assert!(commit.status.success(), "{}", said(&commit));
+    assert_eq!(sb.committed(), names(&["a.txt"]));
+    assert!(sb.staged().is_empty(), "{:?}", sb.staged());
+}
+
+#[test]
+fn diff_cached_shows_only_this_sessions_staging() {
+    let sb = Sandbox::new();
+    sb.base_commit(&[("seed.txt", "s\n")]);
+    sb.write("a.txt", "a\n");
+    sb.write("b.txt", "b\n");
+    sb.ok_as("A", &["add", "a.txt"]);
+    sb.ok_as("B", &["add", "b.txt"]);
+
+    let a = sb.ok_as("A", &["diff", "--cached", "--name-only"]);
+
+    assert!(a.contains("a.txt") && !a.contains("b.txt"), "{a}");
+}
+
+#[test]
+fn staging_part_of_a_file_on_the_session_index_is_committed_as_staged() {
+    // 2026-09-30: a session staged two rows of a file other sessions were also
+    // editing; the pathspec commit then took the whole work-tree file.
+    let sb = Sandbox::new();
+    sb.base_commit(&[("rows.md", "one\ntwo\n")]);
+    sb.write(
+        "rows.md",
+        "one\nTWO\nthree (another session's, unfinished)\n",
+    );
+    let index = sb.ok_as("A", &["session-index"]);
+    let index = index.lines().last().unwrap().trim().to_string();
+    let patch = "--- a/rows.md\n+++ b/rows.md\n@@ -1,2 +1,2 @@\n one\n-two\n+TWO\n";
+    sb.write("p.patch", patch);
+    let apply = sb
+        .base("git")
+        .env("GIT_INDEX_FILE", &index)
+        .args(["--git-dir"])
+        .arg(sb.repo())
+        .args(["--work-tree"])
+        .arg(&sb.home)
+        .args(["apply", "--cached", "p.patch"])
+        .output()
+        .unwrap();
+    assert!(apply.status.success(), "{}", said(&apply));
+
+    sb.ok_as("A", &["commit", "-m", "TWO only"]);
+
+    assert_eq!(sb.show("HEAD:rows.md"), "one\nTWO\n");
 }

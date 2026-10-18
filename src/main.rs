@@ -13,6 +13,7 @@ mod git;
 mod permissions;
 mod pick;
 mod pull_gate;
+mod session;
 mod sync_status;
 mod syncbase;
 mod template;
@@ -278,6 +279,12 @@ enum NitCommand {
     /// copy), or it was deleted. Refuses new content and anything staged.
     Discard { paths: Vec<String> },
 
+    /// Print this session's private staging index, current and seeded if new,
+    /// for git commands nit does not wrap:
+    /// `GIT_INDEX_FILE=$(nit session-index) git apply --cached fix.patch`.
+    /// What is staged on it that way is this session's at the next `nit commit`.
+    SessionIndex {},
+
     /// Any unrecognized subcommand falls through to git
     #[command(external_subcommand)]
     Git(Vec<String>),
@@ -432,6 +439,11 @@ fn run_command(cmd: NitCommand, config: &NitConfig) -> Result<(), Box<dyn std::e
         NitCommand::Run { name } => cmd_run(&name, config),
         NitCommand::DriftTriage { dismiss, quiet } => drift_queue::cmd(config, &dismiss, quiet),
         NitCommand::Discard { paths } => cmd_discard(&paths, config),
+        NitCommand::SessionIndex {} => {
+            let path = session::Session::current().ready_index(config.git_strategy())?;
+            println!("{}", path.display());
+            Ok(())
+        }
         NitCommand::FleetAddRecipient {
             tier,
             pubkey,
@@ -577,9 +589,20 @@ fn default_log_dir() -> PathBuf {
 fn cmd_add(paths: &[String], config: &NitConfig) -> Result<(), Box<dyn std::error::Error>> {
     let strategy = config.git_strategy();
 
-    // Session-intent scoping: snapshot the index so we can record exactly
-    // what THIS invocation stages (delta) into this session-anchor's store.
-    let staged_before = staged_index_snapshot(strategy);
+    // Each session stages into its own index (`session`), except while a
+    // merge is under way: git keeps the merge in the shared index.
+    let merging = merge_in_progress(strategy);
+    let session = session::Session::current();
+    if !merging {
+        session.adopt_old_staging(strategy);
+    }
+    let stage = |args: &[&str]| -> Result<(), Box<dyn std::error::Error>> {
+        if merging {
+            git::run_git_with(strategy, args)
+        } else {
+            session.stage(strategy, args)
+        }
+    };
 
     // Discover templates and build reverse lookup
     let mappings = template::discover_templates(config);
@@ -592,7 +615,7 @@ fn cmd_add(paths: &[String], config: &NitConfig) -> Result<(), Box<dyn std::erro
         // Handle "." and "-A" as bulk operations
         if path_str == "." || path_str == "-A" {
             // Stage all modified tracked files via git
-            let added = git::run_git_with(strategy, &["add", path_str]);
+            let added = stage(&["add", path_str]);
 
             // Scan all templates for drift awareness + write acks
             if added.is_ok() && !mappings.is_empty() {
@@ -601,9 +624,6 @@ fn cmd_add(paths: &[String], config: &NitConfig) -> Result<(), Box<dyn std::erro
                     report_template_drift(mapping, config);
                 }
             }
-            // Recorded even when git failed part-way: whatever it did stage
-            // is this session's.
-            record_session_staged_delta(strategy, &staged_before);
             return added;
         }
 
@@ -632,7 +652,7 @@ fn cmd_add(paths: &[String], config: &NitConfig) -> Result<(), Box<dyn std::erro
     if !named.is_empty() {
         let mut args = vec!["add"];
         args.extend(named.iter().map(String::as_str));
-        if let Err(e) = git::run_git_with(strategy, &args) {
+        if let Err(e) = stage(&args) {
             refused = Some(e);
         }
     }
@@ -647,7 +667,7 @@ fn cmd_add(paths: &[String], config: &NitConfig) -> Result<(), Box<dyn std::erro
 
         // Stage the template source instead
         let source_str = source.to_string_lossy().to_string();
-        if let Err(e) = git::run_git_with(strategy, &["add", &source_str]) {
+        if let Err(e) = stage(&["add", &source_str]) {
             refused.get_or_insert(e);
             continue;
         }
@@ -665,10 +685,6 @@ fn cmd_add(paths: &[String], config: &NitConfig) -> Result<(), Box<dyn std::erro
             );
         }
     }
-
-    record_session_staged_delta(strategy, &staged_before);
-    // Naming a path claims it, also when it was staged before this call.
-    syncbase::record_staged_named(strategy, &named);
 
     match refused {
         Some(e) => Err(e),
@@ -1130,132 +1146,6 @@ fn detect_live_drift(mapping: &template::TemplateMapping, _config: &NitConfig) -
 // commit still renders+deploys its templates — but ONLY its own).
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, PartialEq)]
-struct CommitPlan {
-    /// Exact pathspec for `git commit -- <...>` (work-tree-relative).
-    commit_pathspec: Vec<String>,
-    /// Indices into the caller's discovered-`mappings` slice whose template
-    /// SOURCE is in scope → the ONLY templates this commit may render+deploy.
-    deploy_mapping_idx: Vec<usize>,
-    /// True when no template source is in scope → AC-5.7 zero-friction path
-    /// (skip all ack checks) even if another session staged/modified a template.
-    plain_only: bool,
-    /// True when this session recorded NO staged paths (raw `git add` bypassing
-    /// `nit add`, or a fresh session). The scope is then empty and the caller
-    /// refuses, naming what is staged. Until 2026-10-13 this fell back to
-    /// committing the whole index with a warning, which was the one path left
-    /// on which a commit could carry another session's work.
-    session_tracking_bypassed: bool,
-    /// Staged in the shared index but OUTSIDE this commit's scope: a
-    /// concurrent session's work, or staging that recorded no session intent
-    /// (raw `git add` run outside nit). Reported at commit time so a partial
-    /// commit can never LOOK complete — the silent half of the 2026-08-27
-    /// half-committed-rename incident.
-    out_of_scope: Vec<String>,
-}
-
-/// See module contract above. `template_source_rels[i]` is the work-tree-
-/// relative source path of the caller's `mappings[i]` (parallel slices).
-fn plan_commit_scope(
-    session_staged: &[String],
-    index_staged: &[String],
-    template_source_rels: &[String],
-) -> CommitPlan {
-    use std::collections::BTreeSet;
-    let index_set: BTreeSet<&str> = index_staged.iter().map(String::as_str).collect();
-
-    // Scope selection:
-    //  - session recorded paths → intersection(session, index): commit ONLY
-    //    what THIS session staged AND is still staged. A concurrent session's
-    //    shared-index entries are absent from `session_staged` → excluded.
-    //    This session's since-unstaged paths are absent from the index →
-    //    excluded.
-    //  - session recorded nothing → empty scope, flagged
-    //    `session_tracking_bypassed`: nothing in the index is this session's,
-    //    so everything staged is reported as out of scope and the caller
-    //    refuses. `nit add <paths>` claims a path that is already staged.
-    let session_tracking_bypassed = session_staged.is_empty();
-    let mut commit_pathspec: Vec<String> = session_staged
-        .iter()
-        .filter(|p| index_set.contains(p.as_str()))
-        .cloned()
-        .collect();
-    // Sort for deterministic output + order-independent pathspec (git treats
-    // `git commit -- a b` and `git commit -- b a` identically).
-    commit_pathspec.sort();
-
-    let scope_set: BTreeSet<&str> = commit_pathspec.iter().map(String::as_str).collect();
-    let mut out_of_scope: Vec<String> = index_staged
-        .iter()
-        .filter(|p| !scope_set.contains(p.as_str()))
-        .cloned()
-        .collect();
-    out_of_scope.sort();
-    out_of_scope.dedup();
-
-    let deploy_mapping_idx: Vec<usize> = template_source_rels
-        .iter()
-        .enumerate()
-        .filter(|(_, src)| scope_set.contains(src.as_str()))
-        .map(|(i, _)| i)
-        .collect();
-
-    CommitPlan {
-        plain_only: deploy_mapping_idx.is_empty(),
-        commit_pathspec,
-        deploy_mapping_idx,
-        session_tracking_bypassed,
-        out_of_scope,
-    }
-}
-
-/// Narrow a commit plan to the paths named after `--`. Every named path must
-/// already be in the plan (staged by this session), or the commit is refused
-/// with the missing ones, since committing a path nobody claimed is the
-/// bundling the session scope exists to prevent. Returns the narrowed plan and
-/// this session's other staged paths, which stay staged.
-fn limit_commit_plan(
-    plan: CommitPlan,
-    only: &[String],
-    template_source_rels: &[String],
-) -> Result<(CommitPlan, Vec<String>), Vec<String>> {
-    use std::collections::BTreeSet;
-    let in_scope: BTreeSet<&str> = plan.commit_pathspec.iter().map(String::as_str).collect();
-    let missing: Vec<String> = only
-        .iter()
-        .filter(|p| !in_scope.contains(p.as_str()))
-        .cloned()
-        .collect();
-    if !missing.is_empty() {
-        return Err(missing);
-    }
-    let wanted: BTreeSet<&str> = only.iter().map(String::as_str).collect();
-    let own_left: Vec<String> = plan
-        .commit_pathspec
-        .iter()
-        .filter(|p| !wanted.contains(p.as_str()))
-        .cloned()
-        .collect();
-    let mut commit_pathspec: Vec<String> = wanted.iter().map(|p| p.to_string()).collect();
-    commit_pathspec.sort();
-    let deploy_mapping_idx: Vec<usize> = template_source_rels
-        .iter()
-        .enumerate()
-        .filter(|(_, src)| wanted.contains(src.as_str()))
-        .map(|(i, _)| i)
-        .collect();
-    Ok((
-        CommitPlan {
-            plain_only: deploy_mapping_idx.is_empty(),
-            commit_pathspec,
-            deploy_mapping_idx,
-            session_tracking_bypassed: plan.session_tracking_bypassed,
-            out_of_scope: plan.out_of_scope,
-        },
-        own_left,
-    ))
-}
-
 /// A path as the user or a tool wrote it, as the work-tree-relative name the
 /// index uses: an absolute path under $HOME loses the prefix, a leading `./`
 /// or `:/` goes.
@@ -1268,29 +1158,6 @@ fn normalize_commit_path(p: &str, home: &Path) -> String {
     rel.trim_start_matches(":/")
         .trim_start_matches("./")
         .to_string()
-}
-
-/// Record into the current session-anchor's staged store the paths THIS
-/// `nit add` invocation newly staged (index delta vs `before`). Union
-/// semantics across invocations accumulate the session's full staging
-/// intent. Delta-based (not explicit-path-based) on purpose: it avoids
-/// path-normalization hazards (git emits work-tree-root-relative paths;
-/// so does this) and conservatively under-records rather than over-records
-/// — an unrecorded path is excluded from scope (safe: a benign "nothing
-/// staged by this session" beats wrongly bundling another session's work).
-fn record_session_staged_delta(
-    strategy: &crate::config::GitStrategy,
-    before: &std::collections::BTreeSet<String>,
-) {
-    syncbase::record_staged_delta(strategy, before);
-}
-
-/// Snapshot the currently-staged set (work-tree-root-relative), for delta
-/// computation in `record_session_staged_delta`.
-fn staged_index_snapshot(
-    strategy: &crate::config::GitStrategy,
-) -> std::collections::BTreeSet<String> {
-    syncbase::staged_index_snapshot(strategy)
 }
 
 /// Pure: resolve the final commit message from `-m`/`-F` precedence
@@ -1484,15 +1351,96 @@ fn cmd_commit(
         return Ok(());
     }
 
-    if index_staged.is_empty() && !amend {
-        return Err("nothing staged to commit".into());
+    // Each session stages into its own index (2026-10-18,
+    // docs/session_private_index_design_2026-10-18.md). What this session
+    // staged is in that index; the shared index holds only what raw git or
+    // the nit before that date staged.
+    let session = session::Session::current();
+    session.adopt_old_staging(strategy);
+    session::prune_ended();
+    syncbase::prune_dead_staged();
+    let mine = session.staged(strategy);
+    let shared_only: Vec<String> = index_staged
+        .iter()
+        .filter(|p| !mine.contains(p))
+        .cloned()
+        .collect();
+
+    if amend {
+        if head_is_on_upstream(strategy) {
+            return Err(
+                "the last commit is already on the remote, and amending it would need a \
+                 forced push. Make a new commit instead."
+                    .into(),
+            );
+        }
+        let head = session::head(strategy);
+        if head.is_none() || session.load().last_commit != head {
+            let who = git::git_output_with(strategy, &["log", "-1", "--format=%h %s"])
+                .unwrap_or_default();
+            return Err(format!(
+                "the last commit ({}) was not made by this session, so it may not be \
+                 amended. Make a new commit instead.",
+                who.trim()
+            )
+            .into());
+        }
     }
-    if amend && head_is_on_upstream(strategy) {
+
+    let scope: Vec<String> = if only.is_empty() {
+        mine.clone()
+    } else {
+        let missing: Vec<&String> = only.iter().filter(|p| !mine.contains(p)).collect();
+        if !missing.is_empty() {
+            for p in &missing {
+                eprintln!("nit:     {}", p);
+            }
+            return Err(format!(
+                "{} named path(s) are not staged by this session: `nit add` them first",
+                missing.len()
+            )
+            .into());
+        }
+        only.clone()
+    };
+    if scope.is_empty() && !amend {
+        if !shared_only.is_empty() {
+            eprintln!(
+                "nit: this session has staged nothing with `nit add`. Staged by another \
+                 session, or with raw git ({}):",
+                shared_only.len()
+            );
+            for p in &shared_only {
+                eprintln!("nit:     {}", p);
+            }
+            eprintln!(
+                "nit: to commit some of them from here, name them: `nit add <paths>`, \
+                 then `nit commit`."
+            );
+        }
         return Err(
-            "the last commit is already on the remote, and amending it would need a \
-             forced push. Make a new commit instead."
-                .into(),
+            "nothing staged by this session to commit. Run `nit add <paths>` first.".into(),
         );
+    }
+    let left: Vec<&String> = mine.iter().filter(|p| !scope.contains(p)).collect();
+    if !left.is_empty() {
+        eprintln!(
+            "nit: {} other path(s) this session staged stay staged (not named):",
+            left.len()
+        );
+        for p in &left {
+            eprintln!("nit:     {}", p);
+        }
+    }
+    if !shared_only.is_empty() {
+        eprintln!(
+            "nit: \u{26a0} {} path(s) staged in the shared index are not in this commit \
+             (another session, or raw git):",
+            shared_only.len()
+        );
+        for p in &shared_only {
+            eprintln!("nit:     {}", p);
+        }
     }
     let msg: Option<&str> = match (explicit_msg.as_deref(), amend) {
         (Some(m), _) => Some(m),
@@ -1500,144 +1448,23 @@ fn cmd_commit(
         (None, false) => Some("nit commit"),
     };
 
-    // 2. Discover templates + their work-tree-root-relative source paths
-    //    (parallel to `mappings`, fed to the pure scope planner).
+    // Templates whose source this commit carries: acked before, deployed after.
     let mappings = template::discover_templates(config);
     let home = dirs::home_dir().expect("cannot determine home directory");
-    let template_source_rels: Vec<String> = mappings
+    let scoped_templates: Vec<&template::TemplateMapping> = mappings
         .iter()
-        .map(|m| {
-            m.source
+        .filter(|m| {
+            let rel = m
+                .source
                 .strip_prefix(&home)
                 .unwrap_or(&m.source)
                 .to_string_lossy()
-                .to_string()
+                .to_string();
+            scope.contains(&rel)
         })
         .collect();
-
-    // 3. Session-intent scoping (2026-05-17 keystone). The session anchor is
-    //    the stable identity across all of CC's per-Bash-call ephemeral
-    //    shells (see syncbase::get_session_anchor). `nit add` recorded what
-    //    THIS session staged; scope commit + template-deploy to that set so a
-    //    concurrent session's shared-index entries are never bundled or
-    //    live-deployed (the 2026-05-17 incident class).
-    let session_staged = syncbase::read_session_staged(my_anchor);
-    let plan = plan_commit_scope(&session_staged, &index_staged, &template_source_rels);
-    let (plan, own_left_staged) = if only.is_empty() {
-        (plan, Vec::new())
-    } else {
-        match limit_commit_plan(plan, &only, &template_source_rels) {
-            Ok(pair) => pair,
-            Err(missing) => {
-                for p in &missing {
-                    eprintln!("nit:     {}", p);
-                }
-                return Err(format!(
-                    "{} named path(s) are not staged by this session: `nit add` them first",
-                    missing.len()
-                )
-                .into());
-            }
-        }
-    };
-    // After the commit: forget only what was committed when a path list was
-    // given, so the rest of this session's staging stays its own.
-    let finish_staged = || {
-        if only.is_empty() {
-            syncbase::clear_session_staged(my_anchor);
-        } else {
-            syncbase::remove_session_staged(my_anchor, &only);
-        }
-    };
-    if !own_left_staged.is_empty() {
-        eprintln!(
-            "nit: {} other path(s) this session staged stay staged (not named):",
-            own_left_staged.len()
-        );
-        for p in &own_left_staged {
-            eprintln!("nit:     {}", p);
-        }
-    }
-
-    // An empty scope is a refusal, unless this is an amend, which may reword
-    // the last commit with nothing of its own staged.
-    if plan.commit_pathspec.is_empty() && !amend {
-        if plan.session_tracking_bypassed {
-            eprintln!(
-                "nit: this session has staged nothing with `nit add`. Staged by another \
-                 session, or with raw git ({}):",
-                plan.out_of_scope.len()
-            );
-            for p in &plan.out_of_scope {
-                eprintln!("nit:     {}", p);
-            }
-            eprintln!(
-                "nit: to commit some of them from here, name them: `nit add <paths>`, \
-                 then `nit commit`."
-            );
-            return Err("nothing staged by this session to commit".into());
-        }
-        return Err("nothing staged by THIS session to commit — the paths this \
-                    session staged are no longer staged (already committed, or \
-                    unstaged). Run `nit add <paths>` first."
-            .into());
-    }
-
-    // Fail loud on a partial commit. Scoping means the index can hold staged
-    // work this commit will NOT include; reporting only the committed count
-    // makes a half-finished operation look finished (2026-08-27: a `git mv`
-    // rename committed its add half and left the delete half staged, reported
-    // as "1 file changed").
-    if !plan.out_of_scope.is_empty() {
-        eprintln!(
-            "nit: \u{26a0} {} staged path(s) NOT in this commit's scope:",
-            plan.out_of_scope.len()
-        );
-        for p in &plan.out_of_scope {
-            eprintln!("nit:     {}", p);
-        }
-        eprintln!(
-            "nit: staged by another session, or staged without recording session \
-             intent (raw `git add`). To include them: `nit add <paths>` then commit \
-             again. To drop them: `nit reset <paths>`."
-        );
-    }
-
-    // Deploy/ack scope = ONLY templates whose source is in this session's
-    // committed scope. A concurrent session's in-flight template (present in
-    // the shared index but absent from this session's record) is NEVER here.
-    let scoped_templates: Vec<&template::TemplateMapping> = plan
-        .deploy_mapping_idx
-        .iter()
-        .map(|&i| &mappings[i])
-        .collect();
-
-    // Scoped pathspec for `git commit -- :/<path>`. The `:/` (work-tree-top)
-    // pathspec magic anchors at the work-tree root regardless of CWD — nit
-    // runs from any directory; without it git resolves paths relative to CWD
-    // (incident sharp-edge #5: wrapper/pathspec opacity → false-empty scope).
-    let commit_pathspecs: Vec<String> = plan
-        .commit_pathspec
-        .iter()
-        .map(|p| format!(":/{}", p))
-        .collect();
-
-    // 4. AC-5.7: only plain files in scope → zero-friction, scoped commit.
+    let mut drifted_rels: Vec<String> = Vec::new();
     let did = if amend { "amended with" } else { "committed" };
-    if plan.plain_only {
-        run_git_commit(
-            strategy,
-            &commit_git_args(msg, amend, false, &commit_pathspecs),
-        )?;
-        finish_staged();
-        syncbase::prune_dead_staged();
-        eprintln!(
-            "nit: {} {} path(s) (plain files only, no templates)",
-            did,
-            plan.commit_pathspec.len()
-        );
-        return Ok(());
-    }
 
     // 5. AC-5.2: ack-gate each in-scope template source (4-cell matrix).
     //    Acks are keyed by the same session anchor.
@@ -1649,7 +1476,6 @@ fn cmd_commit(
 
     let mut blocked = false;
     let mut block_reasons: Vec<String> = Vec::new();
-    let mut drifted_rels: Vec<String> = Vec::new();
 
     for mapping in &scoped_templates {
         let rel = target_rel_path(&mapping.target);
@@ -1730,7 +1556,33 @@ fn cmd_commit(
         return Err("commit blocked by ack validation".into());
     }
 
-    // 6. All acks valid — deploy ONLY this session's in-scope templates.
+    // The commit: HEAD as it is now plus exactly this session's staged
+    // entries, built in a temporary index. No pathspec, so the work tree can
+    // never override what was staged, and nothing is deployed before git has
+    // accepted the commit.
+    let mut commit_args: Vec<String> = vec!["commit".to_string()];
+    if amend {
+        commit_args.push("--amend".to_string());
+    }
+    match msg {
+        Some(m) => {
+            commit_args.push("-m".to_string());
+            commit_args.push(m.to_string());
+        }
+        None => commit_args.push("--no-edit".to_string()),
+    }
+    session.commit(strategy, &scope, &commit_args, amend)?;
+
+    if scoped_templates.is_empty() {
+        eprintln!(
+            "nit: {} {} path(s) (plain files only, no templates)",
+            did,
+            scope.len()
+        );
+        return Ok(());
+    }
+
+    // 6. Committed: deploy ONLY this session's in-scope templates.
     //    EARS:43 honored (a commit renders+deploys its templates) but NEVER
     //    another session's in-flight template — that is the deploy-side-effect
     //    footgun this keystone closes.
@@ -1783,22 +1635,10 @@ fn cmd_commit(
         eprintln!("nit: warning: secret deployment failed: {}", e);
     }
 
-    // 7. Git commit — scoped to exactly this session's staged paths via
-    //    `:/`-anchored pathspec (never another session's shared-index entry).
-    if let Err(e) = run_git_commit(
-        strategy,
-        &commit_git_args(msg, amend, false, &commit_pathspecs),
-    ) {
-        eprintln!(
-            "nit: {} template(s) in scope were rendered and deployed before git \
-             refused, so the deployed files are ahead of history until the commit \
-             goes through.",
-            scoped_templates.len()
-        );
-        return Err(e);
+    // Decrypt secrets (drift-check enforced — commit path has no force escape)
+    if let Err(e) = encrypt::deploy_secrets(config, false) {
+        eprintln!("nit: warning: secret deployment failed: {}", e);
     }
-    finish_staged();
-    syncbase::prune_dead_staged();
 
     // Run triggers (skip drifted files)
     let log_dir = default_log_dir();
@@ -1834,7 +1674,7 @@ fn cmd_commit(
     eprintln!(
         "nit: {} {} path(s), {} template(s) deployed",
         did,
-        plan.commit_pathspec.len(),
+        scope.len(),
         scoped_templates.len()
     );
 
@@ -2035,6 +1875,9 @@ fn cmd_update(safe: bool, config: &NitConfig) -> Result<(), Box<dyn std::error::
         .as_ref()
         .map(|s| s.always_commit.clone())
         .unwrap_or_default();
+    // Held through the pull below, so a session's commit never lands in the
+    // middle of it; released right after the pull, before templates and triggers.
+    let commit_lock = session::commit_lock().ok();
     if !always.is_empty() {
         let before = git::git_output_with(strategy, &["status", "--porcelain"]).unwrap_or_default();
         let due = always_commit_due(&before, &always);
@@ -2192,6 +2035,7 @@ fn cmd_update(safe: bool, config: &NitConfig) -> Result<(), Box<dyn std::error::
     // 1. git pull
     eprintln!("nit: pulling latest...");
     let pull_status = git::exec_git_with(strategy, &["pull", "--no-rebase", "--no-edit"])?;
+    drop(commit_lock);
     if !pull_status.success() {
         status.result = sync_status::SyncResult::PullFailed;
         status.errors.push("git pull failed".to_string());
@@ -2441,9 +2285,11 @@ fn cmd_status(
     // Trigger count
     let trigger_count = config.applicable_triggers().len();
 
+    let mine = session::Session::current().staged(strategy).len();
     println!(
-        "nit: {} templates ({} drifted), {} triggers | git: {} staged, {} modified, {} untracked",
-        template_count, drift_count, trigger_count, staged, modified, untracked
+        "nit: {} templates ({} drifted), {} triggers | git: {} staged by this session, {} in \
+         the shared index, {} modified, {} untracked",
+        template_count, drift_count, trigger_count, mine, staged, modified, untracked
     );
     // Last-sync health summary (from ~/.local/share/nit/last-sync.json).
     if let Some(last) = sync_status::load_status() {
@@ -2507,59 +2353,25 @@ fn cmd_status(
             }
         }
 
-        // Session-intent commit-scope preview — answers "what exactly will
-        // `nit commit` include/deploy?" (incident sharp-edge #5: this
-        // verification primitive was missing). Uses the SAME pure
-        // `plan_commit_scope` cmd_commit uses, fed the SAME
-        // `git diff --cached --name-only` index, so the preview cannot lie.
-        let index_staged: Vec<String> = syncbase::staged_paths(strategy).unwrap_or_default();
-        if !index_staged.is_empty() {
-            let home = dirs::home_dir().expect("cannot determine home directory");
-            let tmpl_rels: Vec<String> = mappings
-                .iter()
-                .map(|m| {
-                    m.source
-                        .strip_prefix(&home)
-                        .unwrap_or(&m.source)
-                        .to_string_lossy()
-                        .to_string()
-                })
-                .collect();
-            let sess = syncbase::read_session_staged(syncbase::get_session_anchor());
-            let plan = plan_commit_scope(&sess, &index_staged, &tmpl_rels);
+        // What `nit commit` would take: this session's own staging (its
+        // private index since 2026-10-18), and what the shared index holds
+        // that is not this session's.
+        let session = session::Session::current();
+        let mine = session.staged(strategy);
+        let shared = syncbase::staged_paths(strategy).unwrap_or_default();
+        let others: Vec<&String> = shared.iter().filter(|p| !mine.contains(p)).collect();
+        if !mine.is_empty() || !others.is_empty() {
             println!();
-            if plan.session_tracking_bypassed {
+            println!("Commit scope (this session): {} path(s)", mine.len());
+            for p in &mine {
+                println!("  + {}", p);
+            }
+            if !others.is_empty() {
                 println!(
-                    "Commit scope: this session has staged nothing with `nit add`, so \
-                     `nit commit` would refuse. {} path(s) are staged by another session \
-                     or with raw git; `nit add <paths>` claims the ones that are yours.",
-                    index_staged.len()
+                    "  ({} path(s) staged in the shared index are not this session's: raw \
+                     git, or the nit before 2026-10-18. `nit add <paths>` claims yours)",
+                    others.len()
                 );
-            } else {
-                let excluded = index_staged
-                    .len()
-                    .saturating_sub(plan.commit_pathspec.len());
-                println!(
-                    "Commit scope (this session): {} path(s) commit, {} template(s) deploy",
-                    plan.commit_pathspec.len(),
-                    plan.deploy_mapping_idx.len()
-                );
-                for p in &plan.commit_pathspec {
-                    println!("  + {}", p);
-                }
-                if plan.commit_pathspec.is_empty() {
-                    println!(
-                        "  (nothing this session staged is still staged — `nit commit` \
-                         would refuse; run `nit add`)"
-                    );
-                }
-                if excluded > 0 {
-                    println!(
-                        "  ({} index path(s) are from another session — EXCLUDED from \
-                         this session's commit, preserved for theirs)",
-                        excluded
-                    );
-                }
             }
         }
     }
@@ -2985,61 +2797,6 @@ mod tests {
         ));
     }
 
-    // ─── limit_commit_plan: commit only the named paths ────────────────
-    fn plan_of(session: &[&str], index: &[&str]) -> CommitPlan {
-        let s: Vec<String> = session.iter().map(|x| x.to_string()).collect();
-        let i: Vec<String> = index.iter().map(|x| x.to_string()).collect();
-        plan_commit_scope(&s, &i, &[])
-    }
-
-    #[test]
-    fn a_path_list_commits_only_those_and_leaves_the_rest_this_sessions() {
-        let plan = plan_of(
-            &[".claude/log.jsonl", "docs/a.md"],
-            &[".claude/log.jsonl", "docs/a.md"],
-        );
-        let (limited, left) = limit_commit_plan(plan, &[".claude/log.jsonl".into()], &[]).unwrap();
-        assert_eq!(
-            limited.commit_pathspec,
-            vec![".claude/log.jsonl".to_string()]
-        );
-        assert_eq!(left, vec!["docs/a.md".to_string()]);
-        assert!(limited.plain_only);
-    }
-
-    #[test]
-    fn a_path_list_naming_an_unclaimed_path_is_refused() {
-        // Another session staged b.md; naming it must not commit it.
-        let plan = plan_of(&["a.md"], &["a.md", "b.md"]);
-        let err = limit_commit_plan(plan, &["b.md".into()], &[]).unwrap_err();
-        assert_eq!(err, vec!["b.md".to_string()]);
-    }
-
-    #[test]
-    fn a_named_template_source_is_still_deployed() {
-        let src = vec!["dotfiles/templates/.zshenv.tmpl".to_string()];
-        let s = vec![
-            "dotfiles/templates/.zshenv.tmpl".to_string(),
-            "x.md".to_string(),
-        ];
-        let plan = plan_commit_scope(&s, &s, &src);
-        let (limited, _) = limit_commit_plan(plan, &[src[0].clone()], &src).unwrap();
-        assert_eq!(limited.deploy_mapping_idx, vec![0]);
-        assert!(!limited.plain_only);
-    }
-
-    #[test]
-    fn commit_paths_are_normalized_to_index_names() {
-        let home = Path::new("/Users/someone");
-        assert_eq!(
-            normalize_commit_path("/Users/someone/.claude/log.jsonl", home),
-            ".claude/log.jsonl"
-        );
-        assert_eq!(normalize_commit_path("./docs/a.md", home), "docs/a.md");
-        assert_eq!(normalize_commit_path(":/docs/a.md", home), "docs/a.md");
-        assert_eq!(normalize_commit_path("docs/a.md", home), "docs/a.md");
-    }
-
     // ─── PulledAroundGuard: an edit the pull went around stays safe ────
     #[test]
     fn guard_drops_the_copy_of_an_untouched_edit() {
@@ -3369,173 +3126,10 @@ source_dir = "~/dotfiles/templates"
         assert_eq!(result, home.join(".claude/CLAUDE.md"));
     }
 
-    // ── Session-intent commit scoping (2026-05-17 keystone) ───────────────
-    //
-    // RED-GREEN contract for plan_commit_scope. Headline:
-    // `scopes_out_concurrent_session_index_entries` — the 3cf94eb8 incident
-    // regression: Session 1 recorded only its 3 docs; Session 2's skills +
-    // .zshenv.tmpl were in the SHARED index. Session 1's commit must include
-    // ONLY its 3 docs and deploy NO template.
-
+    // The 2026-05-17 scope planner and its tests were replaced 2026-10-18 by
+    // a private index per session (src/session.rs, tests/commit_flow.rs).
     fn sv(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| s.to_string()).collect()
-    }
-
-    #[test]
-    fn scopes_out_concurrent_session_index_entries() {
-        let session = sv(&[
-            "dotfiles/CLAUDE.md",
-            "dotfiles/TODO.md",
-            "dotfiles/docs/demeter_excavation_2026_05_14.md",
-        ]);
-        let index = sv(&[
-            "dotfiles/CLAUDE.md",
-            "dotfiles/TODO.md",
-            "dotfiles/docs/demeter_excavation_2026_05_14.md",
-            ".claude/skills/reflect/SKILL.md", // Session 2's (sample of 17)
-            ".claude/skills/recall/SKILL.md",
-            "dotfiles/templates/.zshenv.tmpl", // Session 2's in-flight template
-        ]);
-        let tmpl_rels = sv(&["dotfiles/templates/.zshenv.tmpl"]);
-        let plan = plan_commit_scope(&session, &index, &tmpl_rels);
-        assert_eq!(
-            plan.commit_pathspec,
-            sv(&[
-                "dotfiles/CLAUDE.md",
-                "dotfiles/TODO.md",
-                "dotfiles/docs/demeter_excavation_2026_05_14.md",
-            ]),
-            "commit ONLY Session 1's 3 docs — not Session 2's skills/tmpl"
-        );
-        assert!(
-            plan.deploy_mapping_idx.is_empty(),
-            "NO template deployed — .zshenv.tmpl was another session's in-flight edit"
-        );
-        assert!(plan.plain_only, "plain-only → zero-friction (AC-5.7)");
-        assert!(!plan.session_tracking_bypassed);
-    }
-
-    #[test]
-    fn ac_5_7_plain_only_zero_friction_with_unrelated_staged_template() {
-        let session = sv(&["dotfiles/CLAUDE.md"]);
-        let index = sv(&["dotfiles/CLAUDE.md", "dotfiles/templates/.zshenv.tmpl"]);
-        let tmpl_rels = sv(&["dotfiles/templates/.zshenv.tmpl"]);
-        let plan = plan_commit_scope(&session, &index, &tmpl_rels);
-        assert!(
-            plan.plain_only,
-            "another session's staged template must NOT pull us off the zero-friction path"
-        );
-        assert!(plan.deploy_mapping_idx.is_empty());
-        assert_eq!(plan.commit_pathspec, sv(&["dotfiles/CLAUDE.md"]));
-    }
-
-    #[test]
-    fn ac_5_2_own_staged_template_is_in_scope_and_gated() {
-        let session = sv(&["dotfiles/templates/.zshenv.tmpl", "dotfiles/CLAUDE.md"]);
-        let index = sv(&[
-            "dotfiles/templates/.zshenv.tmpl",
-            "dotfiles/CLAUDE.md",
-            "dotfiles/templates/.zprofile.tmpl",
-        ]);
-        let tmpl_rels = sv(&[
-            "dotfiles/templates/.zshenv.tmpl",
-            "dotfiles/templates/.zprofile.tmpl",
-        ]);
-        let plan = plan_commit_scope(&session, &index, &tmpl_rels);
-        assert_eq!(
-            plan.deploy_mapping_idx,
-            vec![0usize],
-            "deploy ONLY the session's own template (idx 0), never idx 1 (other session's)"
-        );
-        assert!(
-            !plan.plain_only,
-            "a template is in scope → ack-gate runs (AC-5.2)"
-        );
-        assert_eq!(
-            plan.commit_pathspec,
-            sv(&["dotfiles/CLAUDE.md", "dotfiles/templates/.zshenv.tmpl"]),
-            "sorted scope"
-        );
-    }
-
-    #[test]
-    fn ears_43_never_deploys_another_sessions_staged_template() {
-        let session = sv(&["dotfiles/CLAUDE.md"]);
-        let index = sv(&["dotfiles/CLAUDE.md", "dotfiles/templates/.zshenv.tmpl"]);
-        let tmpl_rels = sv(&["dotfiles/templates/.zshenv.tmpl"]);
-        let plan = plan_commit_scope(&session, &index, &tmpl_rels);
-        assert!(
-            plan.deploy_mapping_idx.is_empty(),
-            "another session's in-flight template must NEVER render+deploy live"
-        );
-    }
-
-    #[test]
-    fn scope_is_session_intersect_index_excludes_unstaged() {
-        let plan = plan_commit_scope(&sv(&["a.txt", "b.txt"]), &sv(&["a.txt"]), &[]);
-        assert_eq!(
-            plan.commit_pathspec,
-            sv(&["a.txt"]),
-            "a session path no longer in the index drops out of scope"
-        );
-        assert!(!plan.session_tracking_bypassed);
-    }
-
-    // RED-GREEN for the 2026-08-27 half-committed-rename incident. `git mv`
-    // stages BOTH halves; with `--no-renames` the index view reports both, so
-    // both must reach the pathspec — committing only the new path produces a
-    // spurious add and leaves the delete staged.
-    #[test]
-    fn staged_rename_commits_both_halves() {
-        let both = sv(&["docs/new_name.md", "docs/old_name.md"]);
-        let plan = plan_commit_scope(&both, &both, &[]);
-        assert_eq!(
-            plan.commit_pathspec, both,
-            "both halves of a rename must be in scope, or git records an add \
-             and orphans the deletion in the index"
-        );
-        assert!(plan.out_of_scope.is_empty(), "nothing left staged behind");
-    }
-
-    #[test]
-    fn out_of_scope_reports_what_this_commit_leaves_staged() {
-        let session = sv(&["docs/mine.md"]);
-        let index = sv(&["docs/mine.md", "docs/theirs.md", "docs/old_name.md"]);
-        let plan = plan_commit_scope(&session, &index, &[]);
-        assert_eq!(plan.commit_pathspec, sv(&["docs/mine.md"]));
-        assert_eq!(
-            plan.out_of_scope,
-            sv(&["docs/old_name.md", "docs/theirs.md"]),
-            "staged-but-unscoped paths are reported so a partial commit \
-             cannot look complete"
-        );
-    }
-
-    // Until 2026-10-13 a session with no record committed the whole index
-    // with a warning. That was the one path left on which a commit could
-    // carry another session's work, and its template with it.
-    #[test]
-    fn a_session_with_no_record_has_an_empty_scope_and_everything_is_out_of_it() {
-        let index = sv(&["x.txt", "y.txt", "dotfiles/templates/.zshenv.tmpl"]);
-        let tmpl_rels = sv(&["dotfiles/templates/.zshenv.tmpl"]);
-        let plan = plan_commit_scope(&[], &index, &tmpl_rels);
-        assert!(
-            plan.session_tracking_bypassed,
-            "no session record → flagged, so the caller's refusal can say why"
-        );
-        assert!(
-            plan.commit_pathspec.is_empty(),
-            "nothing in the index is this session's"
-        );
-        assert_eq!(
-            plan.out_of_scope,
-            sv(&["dotfiles/templates/.zshenv.tmpl", "x.txt", "y.txt"]),
-            "the refusal names every staged path"
-        );
-        assert!(
-            plan.deploy_mapping_idx.is_empty() && plan.plain_only,
-            "another session's staged template is never deployed from here"
-        );
     }
 
     // ── The final `git commit` argument list ──────────────────────────────
@@ -3584,17 +3178,6 @@ source_dir = "~/dotfiles/templates"
         // there, so this call fails and commits nothing.
         let args = commit_git_args(Some("msg"), false, false, &[]);
         assert_eq!(args, sv(&["commit", "-m", "msg", "--only"]));
-    }
-
-    #[test]
-    fn nonempty_session_but_empty_scope_signals_caller_error() {
-        // Session recorded a.txt; it is no longer staged → empty scope, NOT
-        // bypassed. Caller turns this into a clean "nothing staged by this
-        // session" error — never a bare `git commit`.
-        let plan = plan_commit_scope(&sv(&["a.txt"]), &sv(&["b.txt"]), &[]);
-        assert!(plan.commit_pathspec.is_empty());
-        assert!(!plan.session_tracking_bypassed);
-        assert!(plan.plain_only, "no template in the (empty) scope");
     }
 
     // ── nit-transparency: passthrough `--` preservation (sharp-edge #5) ────

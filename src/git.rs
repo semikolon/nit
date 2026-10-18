@@ -38,7 +38,7 @@ pub fn git_dir_for(strategy: &GitStrategy) -> PathBuf {
 }
 
 /// Build a git Command with the right --git-dir/--work-tree flags
-fn git_command(strategy: &GitStrategy) -> Command {
+pub(crate) fn git_command(strategy: &GitStrategy) -> Command {
     let mut cmd = Command::new("git");
     match strategy {
         GitStrategy::Bare => {
@@ -131,14 +131,46 @@ pub fn fall_through(args: &[String]) -> ! {
 pub fn fall_through_with(strategy: &GitStrategy, args: &[String]) -> ! {
     let str_args: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
-    // Every fall-through records its index delta, so a passthrough that stages
-    // (`nit mv`, `nit rm`, `nit git add`) records the same session intent
-    // `nit add` does. Without it `nit commit` scopes the work out and drops it
-    // silently. Done HERE rather than per-subcommand: this is the single
-    // chokepoint every fall-through crosses, so a future staging subcommand is
-    // covered without anyone extending a list. A read-only subcommand
-    // (`log`, `diff`, `show`) yields an empty delta, so the wrap costs nothing.
-    let staged_before = crate::syncbase::staged_index_snapshot(strategy);
+    // Since 2026-10-18 each session stages into its own index
+    // (`crate::session`). A fall-through that stages (`rm`, `mv`, `restore`,
+    // path-form `reset`) runs against that index and records what it changed;
+    // `diff --cached` shows it. Everything else, and anything while a merge is
+    // under way (git keeps the merge in the shared index), uses the shared one.
+    let merging =
+        crate::git::git_output_with(strategy, &["rev-parse", "-q", "--verify", "MERGE_HEAD"])
+            .is_ok();
+    if !merging {
+        let session = crate::session::Session::current();
+        match session_route(&str_args) {
+            Route::Stage => {
+                session.adopt_old_staging(strategy);
+                let code = match session.stage(strategy, &str_args) {
+                    Ok(()) => 0,
+                    Err(e) => {
+                        eprintln!("nit: {e}");
+                        1
+                    }
+                };
+                std::process::exit(code);
+            }
+            Route::ReadStaged => {
+                session.adopt_old_staging(strategy);
+                if session.staged(strategy).is_empty() {
+                    std::process::exit(0); // this session has staged nothing
+                }
+                let status = git_command(strategy)
+                    .env("GIT_INDEX_FILE", session.index_path())
+                    .args(&str_args)
+                    .status()
+                    .unwrap_or_else(|e| {
+                        eprintln!("nit: failed to exec git: {}", e);
+                        std::process::exit(1);
+                    });
+                std::process::exit(status.code().unwrap_or(1));
+            }
+            Route::Shared => {}
+        }
+    }
 
     let status = git_command(strategy)
         .args(&str_args)
@@ -148,16 +180,62 @@ pub fn fall_through_with(strategy: &GitStrategy, args: &[String]) -> ! {
             std::process::exit(1);
         });
 
-    // Record even on failure: a partially-applied `mv` still staged something,
-    // and unrecorded staged work is exactly the failure this closes.
-    crate::syncbase::record_staged_delta(strategy, &staged_before);
-
     std::process::exit(status.code().unwrap_or(1));
+}
+
+/// Which index a fall-through git command works on.
+#[derive(Debug, PartialEq)]
+enum Route {
+    /// Writes staging: this session's index.
+    Stage,
+    /// Shows staging (`diff --cached`): this session's index.
+    ReadStaged,
+    Shared,
+}
+
+fn session_route(args: &[&str]) -> Route {
+    let Some(sub) = args.first() else {
+        return Route::Shared;
+    };
+    let rest = &args[1..];
+    match *sub {
+        "rm" | "mv" | "restore" => Route::Stage,
+        "reset" => {
+            const MODES: [&str; 5] = ["--soft", "--hard", "--mixed", "--keep", "--merge"];
+            let moves_head = rest.iter().any(|a| MODES.contains(a));
+            let names_paths = rest.contains(&"--")
+                || rest
+                    .iter()
+                    .any(|a| !a.starts_with('-') && std::path::Path::new(a).exists());
+            if !moves_head && names_paths {
+                Route::Stage
+            } else {
+                Route::Shared
+            }
+        }
+        "diff" if rest.iter().any(|a| *a == "--cached" || *a == "--staged") => Route::ReadStaged,
+        _ => Route::Shared,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn staging_commands_go_to_the_session_and_the_rest_to_the_shared_index() {
+        assert_eq!(session_route(&["rm", "--cached", "x"]), Route::Stage);
+        assert_eq!(session_route(&["mv", "a", "b"]), Route::Stage);
+        assert_eq!(session_route(&["reset", "--", "x"]), Route::Stage);
+        assert_eq!(session_route(&["reset", "--soft", "HEAD~1"]), Route::Shared);
+        assert_eq!(session_route(&["reset", "--hard"]), Route::Shared);
+        assert_eq!(
+            session_route(&["diff", "--cached", "--stat"]),
+            Route::ReadStaged
+        );
+        assert_eq!(session_route(&["diff", "HEAD~1"]), Route::Shared);
+        assert_eq!(session_route(&["log", "-3"]), Route::Shared);
+    }
 
     #[test]
     fn a_git_that_exits_non_zero_is_an_error_and_names_the_command() {

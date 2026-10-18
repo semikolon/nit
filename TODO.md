@@ -9,21 +9,16 @@
 
 ---
 
-## Three commit gaps met while templating spela's config (2026-10-18)
+## Commit gaps: closed by a private staging area per session (2026-10-18)
 
-- [ ] **`nit commit -- <path>` records a template target's new render instead of its staged
-  removal.** Untracking a file that a new template renders: `nit rm --cached` it, move it aside,
-  `nit commit -- <template> <path>`. The commit deploys templates first, so the file is back on
-  disk, and git's pathspec commit takes the worktree content over the staged removal (dotfiles
-  `7247078d` tracked the render; `a9043c62` removed it). Fix: deploy templates after the git
-  commit, or commit with the index rather than a pathspec when a named path is a staged removal.
-- [ ] **A removal staged with `nit rm --cached` is not this session's.** `nit commit` with no
-  path list then says nothing to commit, while `nit diff --cached` shows the removal. `nit rm`
-  should record its paths in the session's staged set, as `nit add` does.
-- [ ] **`nit commit --amend` amends whatever HEAD is.** Another session committed between this
-  session's commit and its amend; the amend rewrote that session's commit with this session's
-  message (`44e6a6b5` → `8158cfdf`, restored with `nit reset --soft`). Refuse to amend a HEAD
-  this session did not make, and name whose it is.
+The three gaps met while templating spela's config (a template target's removal recorded as its
+render; a `nit rm --cached` removal that was nobody's; an amend that rewrote another session's
+commit), and the 2026-09-30 partial-staging case below, are closed structurally rather than one
+by one: each session stages into its own index. `docs/session_private_index_design_2026-10-18.md`.
+
+- [ ] **Watch the first days on the fleet**: a session that hits "were committed by someone else
+  since this session staged them" should be rare and always real; a refusal on a path nobody
+  else touched would mean the compare-and-swap base is recorded wrong.
 
 ## Left open by the commit fix of 2026-10-13
 
@@ -42,7 +37,10 @@ Two things it did not close:
   `nit status` shows it as staged like any other. Wanted: `nit status` and the abort message name
   the staged paths that are in no live session's record, since those wait for nobody.
 
-## `nit commit` commits a staged path whole, so a hunk-level stage cannot survive it (2026-09-30)
+## `nit commit` commits a staged path whole, so a hunk-level stage cannot survive it (2026-09-30) — CLOSED 2026-10-18
+
+Closed by the private staging area: the commit takes the staged blob, never the work tree, and
+partial staging goes through `GIT_INDEX_FILE=$(nit session-index) git apply --cached`. History:
 
 Two CC sessions edited `~/.claude/glossary/deliberus.md` at once. One staged only its own two rows
 (`git apply --cached`, since nit has no partial-stage or unstage wrapper) and ran `nit commit`, which

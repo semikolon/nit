@@ -445,52 +445,11 @@ pub fn read_session_staged(anchor: u32) -> Vec<String> {
     stored.iter().map(|p| unquote_c_path(p)).collect()
 }
 
-/// Union `paths` into the CURRENT session anchor's staged set (atomic).
-pub fn record_session_staged(paths: &[String]) {
-    record_session_staged_for_anchor(get_session_anchor(), paths);
-}
-
-/// Union `paths` into a specific anchor's staged set (testable variant).
-/// Sorted + de-duplicated for determinism.
-pub fn record_session_staged_for_anchor(anchor: u32, paths: &[String]) {
-    if paths.is_empty() {
-        return;
-    }
-    let merged = merge_staged(read_session_staged(anchor), paths);
-    let json = serde_json::to_string_pretty(&merged).expect("failed to serialize staged set");
-    atomic_write(&staged_file_path(anchor), &json);
-}
-
-/// Pure: union `existing` + `new`, sorted + de-duplicated. The sorted on-disk
-/// form is deterministic; the set is what the commit-scope planner intersects
-/// against. Extracted pure so it is RED-GREEN testable without filesystem I/O
-/// (codebase idiom: resolve_path_with, …).
-fn merge_staged(existing: Vec<String>, new: &[String]) -> Vec<String> {
-    let mut set: std::collections::BTreeSet<String> = existing.into_iter().collect();
-    set.extend(new.iter().cloned());
-    set.into_iter().collect()
-}
-
 /// Clear an anchor's staged record. Called after a successful commit — the
 /// recorded paths are now in git history; the next changeset starts fresh.
 /// Idempotent + infallible (mirrors `clear_drift`).
 pub fn clear_session_staged(anchor: u32) {
     let _ = fs::remove_file(staged_file_path(anchor));
-}
-
-/// Forget these paths from an anchor's staged record, keeping the rest. Used
-/// after a commit limited to a path list; the record goes when it is empty.
-pub fn remove_session_staged(anchor: u32, paths: &[String]) {
-    let kept: Vec<String> = read_session_staged(anchor)
-        .into_iter()
-        .filter(|p| !paths.contains(p))
-        .collect();
-    if kept.is_empty() {
-        clear_session_staged(anchor);
-    } else {
-        let json = serde_json::to_string_pretty(&kept).expect("failed to serialize staged set");
-        atomic_write(&staged_file_path(anchor), &json);
-    }
 }
 
 /// Prune staged-record files whose anchor PID is no longer running
@@ -1114,25 +1073,6 @@ mod tests {
     }
 
     // ── Session-intent staged store (2026-05-17 keystone) ─────────────────
-
-    #[test]
-    fn merge_staged_unions_sorts_dedups() {
-        let out = merge_staged(
-            vec!["b".to_string(), "a".to_string()],
-            &["a".to_string(), "c".to_string()],
-        );
-        assert_eq!(
-            out,
-            vec!["a".to_string(), "b".to_string(), "c".to_string()],
-            "union across nit-add invocations, sorted, de-duplicated"
-        );
-    }
-
-    #[test]
-    fn merge_staged_empty_new_keeps_existing_sorted() {
-        let out = merge_staged(vec!["z".to_string(), "a".to_string()], &[]);
-        assert_eq!(out, vec!["a".to_string(), "z".to_string()]);
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1228,74 +1168,10 @@ pub fn staged_paths(
     crate::git::git_output_with(strategy, &STAGED_NAMES).map(|out| parse_nul_paths(&out))
 }
 
-/// The staged paths that fall under `pathspecs`. An empty `pathspecs` answers
-/// with nothing: without that guard git would read "no pathspec" as "all of
-/// the index", and a caller recording the result would claim every staged
-/// path for its session.
-pub fn staged_paths_under(
-    strategy: &crate::config::GitStrategy,
-    pathspecs: &[String],
-) -> Vec<String> {
-    if pathspecs.is_empty() {
-        return Vec::new();
-    }
-    let mut args: Vec<&str> = STAGED_NAMES.to_vec();
-    args.push("--");
-    args.extend(pathspecs.iter().map(String::as_str));
-    crate::git::git_output_with(strategy, &args)
-        .map(|out| parse_nul_paths(&out))
-        .unwrap_or_default()
-}
-
 /// Paths still in conflict in a merge that is under way.
 pub fn unmerged_paths(
     strategy: &crate::config::GitStrategy,
 ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
     crate::git::git_output_with(strategy, &["diff", "--name-only", "--diff-filter=U", "-z"])
         .map(|out| parse_nul_paths(&out))
-}
-
-/// Snapshot the staged set (work-tree-root-relative) for delta computation.
-pub fn staged_index_snapshot(
-    strategy: &crate::config::GitStrategy,
-) -> std::collections::BTreeSet<String> {
-    staged_paths(strategy)
-        .unwrap_or_default()
-        .into_iter()
-        .collect()
-}
-
-/// Record every staged path under `pathspecs` as this session's.
-///
-/// The delta alone cannot see a path that was staged before this `nit add`
-/// ran: a file two sessions both edit, or a path staged by a session that is
-/// gone. Its name is in the index before and after, so the delta is empty,
-/// the path is never recorded, and `nit commit` keeps answering "not in this
-/// commit's scope: `nit add` it", which the session has just done. Naming a
-/// path is the claim.
-pub fn record_staged_named(strategy: &crate::config::GitStrategy, pathspecs: &[String]) {
-    let named = staged_paths_under(strategy, pathspecs);
-    if !named.is_empty() {
-        record_session_staged(&named);
-    }
-}
-
-/// Record into this session-anchor's store the paths newly staged since
-/// `before`. Delta-based rather than explicit-path-based on purpose: it avoids
-/// path-normalization hazards and conservatively under-records rather than
-/// over-records — an unrecorded path is excluded from commit scope, and a
-/// benign "nothing staged by this session" beats wrongly bundling another
-/// session's work.
-pub fn record_staged_delta(
-    strategy: &crate::config::GitStrategy,
-    before: &std::collections::BTreeSet<String>,
-) {
-    let newly: Vec<String> = staged_paths(strategy)
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|p| !before.contains(p))
-        .collect();
-    if !newly.is_empty() {
-        record_session_staged(&newly);
-    }
 }

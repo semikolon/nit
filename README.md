@@ -68,10 +68,10 @@ nit enforces this structurally:
 - **Drift shown at every touchpoint**: `nit add`, `nit apply`, `nit pick`, `nit commit` — all four show any difference between template source and target on disk. You can't interact with templates without seeing the current state.
 - **Ack-gated commits**: `nit commit` refuses to proceed for template changes until you've reviewed the drift. No flag to bypass this — the tool enforces review, not your discipline.
 - **Per-session isolation**: each terminal session tracks its own review state. No lock file, no contention between concurrent sessions. Scales to any number of agents.
-- **Session-scoped commits**: `nit commit` commits only what *this* session staged, never a concurrent session's work sitting in the shared index — so two agents working in parallel cannot bundle each other's in-flight changes or deploy each other's templates. Staging through any nit command records that intent, including `nit mv`, `nit rm` and `nit git add`. A path that is already staged becomes this session's when `nit add` names it, and a session that has staged nothing is refused with the staged paths listed: there is no fallback to committing the whole index.
-- **Nothing is dropped silently**: when the index holds staged work outside a commit's scope, `nit commit` prints those paths and how to include or drop them. A partial commit never looks complete.
+- **A private staging area per session**: each session stages into its own git index (git's `GIT_INDEX_FILE`), not the shared one. `nit add`, `nit rm`, `nit mv`, path-form `nit reset` and `nit restore` write there, and `nit diff --cached` shows it. `nit commit` builds the commit from HEAD as it is now plus exactly what this session staged, so two agents working in parallel can never bundle each other's work, a commit another session made in between is kept, and what was staged is what gets committed even if the file changed since. If another commit changed a path after this session staged it, the commit is refused and names the path. For staging nit does not wrap, `GIT_INDEX_FILE=$(nit session-index) git apply --cached fix.patch`. Design: `docs/session_private_index_design_2026-10-18.md`.
+- **Nothing is dropped silently**: when the shared index holds staged work that is not this session's (raw git), `nit commit` prints it. A partial commit never looks complete.
 - **A refused commit is reported as refused**: `nit commit` fails when git does, and keeps the session's record of what it staged, so the same command can be run again once the cause is gone.
-- **Merges and amends without raw git**: while a merge is under way `nit commit` concludes it (git commits a merge whole, so the session scope does not apply there, and nit says so). `nit commit --amend` folds this session's staged paths into the last commit, or rewords it when the session has staged nothing, and refuses once that commit is on the remote.
+- **Merges and amends without raw git**: while a merge is under way `nit commit` concludes it from the shared index, where git keeps the merge (the session scope does not apply there, and nit says so). `nit commit --amend` folds this session's staged paths into the last commit, or rewords it, and is refused when the last commit is another session's or already on the remote.
 - **No auto-merge**: drift is saved for conscious review, never silently incorporated. You decide what's junk and what's valuable.
 - **No interactive prompts**: all output to stderr. No TTY input, ever. Agents and humans use the same interface.
 - **Smart `nit add`**: detects template targets and redirects to staging the source — agents don't need to know which files are templates.
@@ -85,9 +85,10 @@ nit enforces this structurally:
 | `nit apply [file]` | Render + deploy templates locally (no commit) |
 | `nit pick [file]` | Review template drift ("nitpick" your configs) |
 | `nit pick --dismiss <file>` | Dismiss saved drift (shows diff before removing) |
-| `nit commit -m "..."` | Commit what this session staged: render + deploy + ack check + git commit + triggers |
+| `nit commit -m "..."` | Commit what this session staged: ack check + git commit, then render + deploy + triggers |
 | `nit commit --amend [-m "..."]` | Fold this session's staged paths into the last commit, or reword it (refused once pushed) |
 | `nit commit -m "..." -- <paths>` | Commit only these of this session's staged paths; the rest stay staged |
+| `nit session-index` | Print this session's staging index, for `GIT_INDEX_FILE` with git commands nit does not wrap |
 | `nit discard <file>` | Restore a file to HEAD only when nothing is lost (its bytes are in an earlier commit, or it was deleted) |
 | `nit drift-triage` | Write the drift queue: each edited tracked file, whether it is already in git, and which agent sessions touched it |
 | `nit update` | Pull + render + deploy + triggers (fleet sync); first commits any edited file on `fleet.toml`'s `[sync] always_commit` list |
