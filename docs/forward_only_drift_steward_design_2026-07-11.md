@@ -116,7 +116,7 @@ markers counted).
 | `.claude/decisions_state.json` | 5 KB | none markers, but per-machine detection state | none | CC decision-detection scratch state | genuine runtime state → forward_only ok, or gitignore |
 | `.claude/decisions_graphiti_cache.jsonl` | 86 KB | **47** /Users paths, **15** host refs | **7 secret-ish** | a cache | keep OUT of shared git → **local-only history**; never push |
 | `.config/spela/config.toml` | 1 KB, single-host (Darwin) | 1 host marker | none | tiny mixed config + runtime-written | marginal — templatize flags or leave |
-| `.codex/config.toml` | 6.5 KB | 15 `[projects."/Users/…"]` (identical across his Macs) | **8 secret-ish** (MCP bearer tokens) | mixed: human config + Codex-auto-appended project-trust + tokens | **templatize** stable part; secrets → env (partly done, `feat(codex): bearer-token extraction to env var`); local churn stays. Secret-care. |
+| `.codex/config.toml` | 6.5 KB | 15 `[projects."/Users/…"]` (identical across his Macs) | **8 secret-ish** (MCP bearer tokens) | mixed: human config + Codex-auto-appended project-trust + tokens | **templatize** stable part; secrets → env (partly done, `feat(codex): bearer-token extraction to env var`); local churn stays. Secret-care.  **Superseded 2026-10-18:** the tokens are env-var names now, so it is plain-tracked, off `forward_only`; the steward commits Codex's edits. |
 
 **Two corrections Claude owns from this session (docs-not-lying):**
 1. **superwhisper is NOT "noisy."** Its one real churn in history was Fredrik *adding a favorite
@@ -515,8 +515,8 @@ job (10.2.4).
 3. **`skip-worktree` adoption?** *Recommendation: no.* It overrides the `3d6bfec` "detect all
    drift" invariant that stopped a real 2026-05-04 clobber, and if decision 1 goes to gitignore,
    the problem `skip-worktree` was solving disappears with it.
-4. **codex/config.toml templatization** — still deferred; it is a separate careful job (8
-   secret-ish MCP tokens), not part of the Steward.
+4. **codex/config.toml templatization** — superseded 2026-10-18: the tokens had moved to env
+   vars, so the file left `forward_only` and is plain-tracked; the Steward commits its changes.
 5. **The hemma-overlay adapter (§12) — build now or later?** *Recommendation: later.* Ship the nit
    adapter first; keep the classifier's interface able to accept a second adapter without a rewrite.
 

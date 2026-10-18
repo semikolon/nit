@@ -60,7 +60,7 @@ the 2026-10-15 rulings). Built: `pull_gate` (the nightly pulls around edits it d
 - [ ] **hemma overlay adapter** (doc §12): one classifier, two adapters, one escalation path.
 - [ ] **Deploy targets tracked as sources** (doc §10.3): a mechanical signal (a trigger declares
   its outputs) would let the queue flag them; today the steward recognises them by judgement.
-- [ ] **codex `config.toml` templatization**: separate careful job (MCP bearer tokens).
+- [x] ~~**codex `config.toml` templatization**~~ superseded 2026-10-18: the bearer tokens had already moved to env vars, so the file is plain-tracked (off `forward_only`) and the drift steward commits Codex's changes.
 
 ---
 
