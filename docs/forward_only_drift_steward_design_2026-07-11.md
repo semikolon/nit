@@ -937,6 +937,32 @@ does not push.
 the way were closed the same day by a private staging index per session (`9bbbf995`,
 `docs/session_private_index_design_2026-10-18.md`).
 
+### 17.1 The list widened to tool-written files, and new files go to their writer (2026-10-20)
+
+Fredrik, on two sessions that each left the connections register uncommitted because the other
+had appended a line to it: *"Should the autonomous git approach stuff that's in our global rules
+not apply to this such that changes like this get automatically committed by the session that
+makes them, or why do you guys tip toe around small stuff like this?"* The foreign-edit stop is
+right for a file someone is halfway through editing and wrong for one a single tool writes whole
+lines or whole outputs into, so those files belong on `always_commit`, where the guard does not
+stop and the nightly commits them.
+
+Added after a sweep of what the guard had stopped on since 17 October (`~/.local/share/drift-steward/fired.jsonl`),
+each checked identical on the Mac, Darwin and Shannon and written only on the Mac: the connections
+register (`connection-add`, 22 stops), the dotfiles corpus graph's `found.jsonl` (its own `add`),
+`tools_index.md` (`verktyg --write`, 4 stops), and the six moving-map PDFs and pages `bygg.py`
+builds (18 stops; `bygg.py` itself stays with the session that edits it). Left off: `~/.claude/settings.json`
+(a session's half-wired hook would reach other machines before its script), `sound_config.json`
+(the daemon no longer writes it, `ruby_sleep_state.py`), `karabiner.json` (the app writes each
+machine's own devices into it), and the Deliberus glossary (hand-edited, its status column is his).
+
+`always_commit` covers edits to tracked files only. A NEW file a tool writes is committed by the
+tool at write time, as the decisions log already was (§ 10.2.1): since 2026-10-20 the Tier 2
+writer commits each analysis through `~/.claude/hooks/tier2_commit.py`, its own path plus any
+older untracked analysis beside it, git in a repository and nit under $HOME, never pushed. Its
+backlog went in through the same helper: 75 files in `~/dotfiles/.claude/tier2_analyses` and 144
+in `~/.claude/hooks/.claude/tier2_analyses`, invisible because nit hides untracked files.
+
 ## Appendix — evidence index (hashes + sources)
 
 - `3d6bfec` — forward-only sync (original spec; detect-all-then-filter; nit sync = commit).
