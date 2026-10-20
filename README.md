@@ -161,7 +161,7 @@ templates/.config/foo/config.tmpl   → ~/.config/foo/config
 templates/Library/LaunchAgents/x.plist.tmpl → ~/Library/LaunchAgents/x.plist
 ```
 
-Rendered files include a warning comment so you know not to edit them directly. Template variables include `hostname`, `os`, `arch`, `role`, and custom data from `fleet.toml`.
+Rendered files include a warning comment so you know not to edit them directly. Template variables include `hostname`, `os`, `arch`, `role`, and custom data from `fleet.toml`. `hostname` is the machine's name in `fleet.toml` (for example `macmini`), not the operating system's host name; a template that compares it with the latter renders empty on that machine.
 
 ### What is "drift"?
 
