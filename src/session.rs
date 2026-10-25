@@ -424,6 +424,10 @@ impl Session {
             meta.staged.remove(p);
         }
         meta.last_commit = Some(after.clone());
+        // The index now matches the new commit for the paths just committed. Rebuilding against
+        // the commit before it read them as fresh staging, based on that older commit, and the
+        // next commit of the same file was refused as someone else's (2026-10-25).
+        meta.built_from = Some(after.clone());
         if !meta.staged.is_empty() {
             self.rebuild(strategy, &mut meta)?;
         }

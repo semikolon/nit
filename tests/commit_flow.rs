@@ -540,6 +540,33 @@ fn a_path_another_session_committed_since_staging_is_refused() {
 }
 
 #[test]
+fn a_file_committed_twice_while_another_stays_staged_is_not_blamed_on_someone_else() {
+    // 2026-10-25: with connections.md left staged, every commit of a session put the paths it
+    // had just committed back into the session's record, based on the commit before. The next
+    // commit of the same file was refused as "committed by someone else", naming the session's
+    // own commit.
+    let sb = Sandbox::new();
+    sb.base_commit(&[("doc.md", "v1\n"), ("other.md", "o1\n")]);
+    sb.write("doc.md", "v2\n");
+    sb.write("other.md", "o2\n");
+    sb.ok_as("A", &["add", "doc.md", "other.md"]);
+    sb.ok_as("A", &["commit", "-m", "doc v2", "--", "doc.md"]);
+    assert_eq!(sb.show("HEAD:doc.md"), "v2\n");
+
+    sb.write("doc.md", "v3\n");
+    sb.ok_as("A", &["add", "doc.md"]);
+    let second = sb.nit_as("A", &["commit", "-m", "doc v3", "--", "doc.md"]);
+
+    assert!(second.status.success(), "{}", said(&second));
+    assert_eq!(sb.show("HEAD:doc.md"), "v3\n");
+    assert_eq!(
+        sb.show("HEAD:other.md"),
+        "o1\n",
+        "the other staged file stays out"
+    );
+}
+
+#[test]
 fn what_was_staged_is_committed_not_a_later_edit() {
     let sb = Sandbox::new();
     sb.write("a.txt", "staged\n");
