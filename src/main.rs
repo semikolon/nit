@@ -562,7 +562,15 @@ fn prepend_warning(rendered: &str, target: &Path) -> String {
 /// Deploy a single rendered template to its target.
 /// Writes the rendered content (with warning comment) to the target path.
 /// Creates parent directories as needed.
+/// Write a rendered template to its target, leaving the file untouched when it
+/// already holds exactly this content. An unconditional write gave every rendered
+/// target a fresh mtime at each nightly `nit update`, so a file's mtime no longer
+/// told when its content last changed (found 2026-10-27 reading LaunchAgent mtimes
+/// from Recovery during a boot hang: some 30 plists all dated 02:00).
 fn write_target(target: &Path, content: &str) -> Result<(), Box<dyn std::error::Error>> {
+    if std::fs::read(target).is_ok_and(|existing| existing == content.as_bytes()) {
+        return Ok(());
+    }
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -2787,6 +2795,33 @@ fn read_identity_pubkey(identity_path: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── write_target: unchanged content keeps its mtime ───────────────
+    #[test]
+    fn unchanged_content_is_not_rewritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("agent.plist");
+        std::fs::write(&target, "same").unwrap();
+        let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        std::fs::File::options()
+            .write(true)
+            .open(&target)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        write_target(&target, "same").unwrap();
+        assert_eq!(std::fs::metadata(&target).unwrap().modified().unwrap(), old);
+    }
+
+    #[test]
+    fn changed_or_missing_content_is_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("sub/agent.plist");
+        write_target(&target, "first").unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "first");
+        write_target(&target, "second").unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "second");
+    }
 
     // ─── discard_verdict: discard only what is provably in git ─────────
     #[test]
