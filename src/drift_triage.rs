@@ -374,7 +374,7 @@ fn ntfy_token() -> Option<String> {
 /// token would make every alert a silent no-op — the precise failure this
 /// module exists to end. Credentials go to curl through a config file on
 /// STDIN rather than argv, so the token never appears in the process list.
-pub fn notify_ntfy(url: &str, title: &str, body: &str) -> bool {
+pub fn notify_ntfy(url: &str, title: &str, body: &str, icon: Option<&str>) -> bool {
     use std::io::Write;
 
     if url.trim().is_empty() {
@@ -384,23 +384,53 @@ pub fn notify_ntfy(url: &str, title: &str, body: &str) -> bool {
         return false;
     };
 
+    // No emoji or tags before the title; an image on the right when `icon` names a
+    // PNG (`[sync] ntfy_icon`), uploaded with the push so it needs no public URL.
+    // Relative paths are taken from $HOME; a missing file sends the words alone.
+    let icon = icon
+        .filter(|p| !p.trim().is_empty())
+        .and_then(|p| {
+            let p = std::path::PathBuf::from(p);
+            if p.is_absolute() {
+                Some(p)
+            } else {
+                dirs::home_dir().map(|h| h.join(p))
+            }
+        })
+        .filter(|p| p.is_file());
+    let mut args: Vec<String> = vec![
+        "-fsS".into(),
+        "--max-time".into(),
+        NOTIFY_TIMEOUT_SECS.into(),
+        "-K".into(),
+        "-".into(),
+    ];
+    match &icon {
+        Some(png) => args.extend([
+            "-T".into(),
+            png.to_string_lossy().into_owned(),
+            "--url-query".into(),
+            format!("title={}", title),
+            "--url-query".into(),
+            format!("message={}", body),
+            "--url-query".into(),
+            "priority=high".into(),
+            "--url-query".into(),
+            "filename=icon.png".into(),
+        ]),
+        None => args.extend([
+            "-H".into(),
+            format!("Title: {}", title),
+            "-H".into(),
+            "Priority: high".into(),
+            "-d".into(),
+            body.to_string(),
+        ]),
+    }
+    args.push(url.to_string());
+
     let mut child = match std::process::Command::new("curl")
-        .args([
-            "-fsS",
-            "--max-time",
-            NOTIFY_TIMEOUT_SECS,
-            "-K",
-            "-",
-            "-H",
-            &format!("Title: {}", title),
-            "-H",
-            "Priority: high",
-            "-H",
-            "Tags: warning",
-            "-d",
-            body,
-            url,
-        ])
+        .args(&args)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -419,24 +449,18 @@ pub fn notify_ntfy(url: &str, title: &str, body: &str) -> bool {
 
 /// The human-readable body of the deadlock alert.
 pub fn deadlock_message(machine: &str, days: i64, files: &[TriagedFile]) -> String {
+    // Extremely brief, per the push template; `nit drift-triage` on the machine says the rest.
     let stale = files.iter().filter(|f| f.kind.is_safe_to_discard()).count();
     let total = files.len();
-    let mut msg = format!(
-        "{} has not synced for {} days. {} tracked file(s) block the pull.",
-        machine, days, total
-    );
-    if stale == total && total > 0 {
-        msg.push_str(
-            " All of them are stale copies already in git — nothing would be lost by discarding.",
-        );
+    let unique = total - stale;
+    let what = if total > 0 && stale == total {
+        format!("{} stale files, safe to discard", total)
     } else if stale > 0 {
-        msg.push_str(&format!(
-            " {} are stale; {} carry content never committed and need a look.",
-            stale,
-            total - stale
-        ));
-    }
-    msg
+        format!("{} files block it, {} need a look", total, unique)
+    } else {
+        format!("{} files need a look", total)
+    };
+    format!("{}, {} days: {}", machine, days, what)
 }
 
 #[cfg(test)]
@@ -607,7 +631,7 @@ mod tests {
             .collect();
         let msg = deadlock_message("merian", 67, &files);
         assert!(msg.contains("67 days"));
-        assert!(msg.contains("nothing would be lost"));
+        assert!(msg.contains("safe to discard"));
     }
 
     #[test]
@@ -628,9 +652,8 @@ mod tests {
             },
         ];
         let msg = deadlock_message("merian", 5, &files);
-        assert!(msg.contains("1 are stale"));
-        assert!(msg.contains("1 carry content never committed"));
-        assert!(!msg.contains("nothing would be lost"));
+        assert_eq!(msg, "merian, 5 days: 2 files block it, 1 need a look");
+        assert!(!msg.contains("safe to discard"));
     }
 
     #[test]
@@ -691,7 +714,7 @@ mod tests {
 
     #[test]
     fn notify_with_an_empty_url_is_a_no_op() {
-        assert!(!notify_ntfy("", "t", "b"));
-        assert!(!notify_ntfy("   ", "t", "b"));
+        assert!(!notify_ntfy("", "t", "b", None));
+        assert!(!notify_ntfy("   ", "t", "b", None));
     }
 }

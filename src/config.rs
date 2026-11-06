@@ -117,6 +117,11 @@ pub struct SyncConfig {
     /// missing URL degrades the alert, never the safety.
     #[serde(default)]
     pub ntfy_url: Option<String>,
+    /// A PNG to attach to that alert, shown by the phone on the right of the
+    /// push. Relative to $HOME unless absolute. Unset, or a missing file, sends
+    /// the words alone.
+    #[serde(default)]
+    pub ntfy_icon: Option<String>,
 }
 
 fn default_sync_command() -> String {

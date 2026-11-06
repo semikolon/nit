@@ -2007,11 +2007,16 @@ fn cmd_update(safe: bool, config: &NitConfig) -> Result<(), Box<dyn std::error::
                 })
                 .flatten();
             if let Some(url) = notify_url {
+                let icon = config
+                    .fleet
+                    .sync
+                    .as_ref()
+                    .and_then(|s| s.ntfy_icon.as_deref());
                 let body = drift_triage::deadlock_message(&machine_name, days, &triaged);
                 // Only stamp on a DELIVERED alert: a failed push (a travel
                 // machine off the VPN, a token without rights to the topic)
                 // must not buy a week of silence.
-                if drift_triage::notify_ntfy(url, "nit sync deadlocked", &body) {
+                if drift_triage::notify_ntfy(url, "nit sync stuck", &body, icon) {
                     status.last_notified_at = Some(now.to_rfc3339());
                 } else {
                     // Say so. An alert that fails quietly is the same bug as an
