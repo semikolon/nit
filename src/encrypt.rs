@@ -2,6 +2,7 @@
 
 use std::fs;
 use std::io::{Read, Write};
+#[cfg(test)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
@@ -280,6 +281,40 @@ pub fn decrypt_bytes(
         .map_err(|e| format!("decrypted content is not valid UTF-8: {}", e).into())
 }
 
+/// Write a secret file atomically: a 0600 temp file in the same directory, then a rename
+/// over the target. A process sourcing the target (a shell, a daemon reading its env) sees
+/// the old file or the new one, never half of it, and the plaintext is never readable by
+/// others, since the temp file is created 0600 rather than chmod-ed after the write.
+/// A symlinked target is written through, as `fs::write` did. The temp name starts with
+/// `.nit-` so a glob such as `tier-*.env` never picks it up.
+pub fn write_secret_atomic(target: &Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let real = fs::canonicalize(target).unwrap_or_else(|_| target.to_path_buf());
+    let parent = real.parent().unwrap_or_else(|| Path::new("."));
+    let name = real
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let temp = parent.join(format!(".nit-{}-{}.tmp", name, std::process::id()));
+    let _ = fs::remove_file(&temp);
+    let result = (|| {
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temp)?;
+        f.write_all(contents)?;
+        f.sync_all()?;
+        fs::rename(&temp, &real)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result
+}
+
 /// Decrypt an age-encrypted file and write the plaintext to a target path
 /// with 0600 permissions. Creates parent directories if needed.
 ///
@@ -299,8 +334,7 @@ pub fn decrypt_to_target(
         fs::create_dir_all(parent)?;
     }
 
-    fs::write(target_path, &plaintext)?;
-    fs::set_permissions(target_path, fs::Permissions::from_mode(0o600))?;
+    write_secret_atomic(target_path, plaintext.as_bytes())?;
 
     Ok(())
 }
@@ -528,9 +562,7 @@ pub fn deploy_secrets_with(
             });
             continue;
         }
-        match fs::write(&target_path, plaintext.as_bytes())
-            .and_then(|()| fs::set_permissions(&target_path, fs::Permissions::from_mode(0o600)))
-        {
+        match write_secret_atomic(&target_path, plaintext.as_bytes()) {
             Ok(()) => results.push(SecretResult {
                 tier: tier_name.clone(),
                 target: target_path.display().to_string(),
@@ -596,6 +628,67 @@ mod tests {
         )
         .unwrap();
         (pubkey, identity_path)
+    }
+
+    #[test]
+    fn write_secret_atomic_replaces_with_0600_and_leaves_no_temp() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("tier-x.env");
+        fs::write(&target, "OLD=1\n").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
+
+        write_secret_atomic(&target, b"NEW=2\n").unwrap();
+
+        assert_eq!(fs::read_to_string(&target).unwrap(), "NEW=2\n");
+        let mode = fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "a replaced 0644 file must come out 0600");
+        let names: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(names, vec!["tier-x.env".to_string()], "no temp file left");
+    }
+
+    #[test]
+    fn write_secret_atomic_creates_a_missing_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("fresh.env");
+        write_secret_atomic(&target, b"A=1\n").unwrap();
+        assert_eq!(fs::read_to_string(&target).unwrap(), "A=1\n");
+    }
+
+    #[test]
+    fn write_secret_atomic_writes_through_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.env");
+        let link = dir.path().join("link.env");
+        fs::write(&real, "OLD=1\n").unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        write_secret_atomic(&link, b"NEW=2\n").unwrap();
+
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read_to_string(&real).unwrap(), "NEW=2\n");
+    }
+
+    #[test]
+    fn write_secret_atomic_leaves_the_old_file_when_the_write_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("tier-y.env");
+        fs::write(&target, "KEEP=1\n").unwrap();
+        // A directory where the temp file must go makes create_new fail.
+        let blocker = dir
+            .path()
+            .join(format!(".nit-tier-y.env-{}.tmp", std::process::id()));
+        fs::create_dir(&blocker).unwrap();
+        // remove_file on a directory fails, so the pre-clean cannot clear it.
+        assert!(write_secret_atomic(&target, b"NEW=2\n").is_err());
+        assert_eq!(fs::read_to_string(&target).unwrap(), "KEEP=1\n");
     }
 
     #[test]
