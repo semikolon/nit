@@ -53,11 +53,12 @@ enum NitCommand {
     Apply {
         /// Specific file to apply (default: all)
         file: Option<String>,
-        /// Override the secrets drift check — clobber unflushed manual edits
-        /// to ~/.secrets/tier-*.env. Only use when you've consciously decided
-        /// to discard the target-side changes (e.g., the edit was a mistake
-        /// or has already been incorporated by other means).
-        #[arg(long)]
+        /// Overwrite ~/.secrets/tier-*.env with the encrypted source even where the
+        /// file on this machine differs, DISCARDING whatever the source lacks. A file
+        /// that is merely a stale copy of an earlier committed version is refreshed
+        /// without this flag; use it only when you have decided that what is on this
+        /// machine is to be thrown away. (Formerly `--force-drift`, still accepted.)
+        #[arg(long = "discard-target-edits", alias = "force-drift")]
         force_drift: bool,
     },
 
@@ -846,6 +847,12 @@ fn cmd_apply(
                 match &r.status {
                     encrypt::DeployStatus::Deployed => {
                         eprintln!("nit: secret {} → {}", r.tier, r.target);
+                    }
+                    encrypt::DeployStatus::Refreshed { versions_back } => {
+                        eprintln!(
+                            "nit: secret {} → {} (stale copy of the source's version {} commit(s) back, refreshed; nothing lost)",
+                            r.tier, r.target, versions_back
+                        );
                     }
                     encrypt::DeployStatus::Skipped(reason) => {
                         eprintln!("nit: secret {} skipped: {}", r.tier, reason);
@@ -2139,6 +2146,12 @@ fn cmd_update(safe: bool, config: &NitConfig) -> Result<(), Box<dyn std::error::
                 match &r.status {
                     encrypt::DeployStatus::Deployed => {
                         eprintln!("nit: secret {} → {}", r.tier, r.target);
+                    }
+                    encrypt::DeployStatus::Refreshed { versions_back } => {
+                        eprintln!(
+                            "nit: secret {} → {} (stale copy of the source's version {} commit(s) back, refreshed; nothing lost)",
+                            r.tier, r.target, versions_back
+                        );
                     }
                     encrypt::DeployStatus::Skipped(reason) => {
                         eprintln!("nit: secret {} skipped: {}", r.tier, reason);

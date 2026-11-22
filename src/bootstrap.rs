@@ -201,6 +201,12 @@ strategy = "bare"
                     crate::encrypt::DeployStatus::Deployed => {
                         eprintln!("  ✓ secret: {}", r.tier);
                     }
+                    crate::encrypt::DeployStatus::Refreshed { versions_back } => {
+                        eprintln!(
+                            "  ✓ secret: {} (stale copy {} commit(s) back, refreshed)",
+                            r.tier, versions_back
+                        );
+                    }
                     crate::encrypt::DeployStatus::Skipped(reason) => {
                         eprintln!("  ⊘ secret: {} ({})", r.tier, reason);
                     }

@@ -25,12 +25,12 @@ pub struct SecretResult {
 pub enum DriftClass {
     /// Source has key(s) the target lacks, with NO target-only keys and NO
     /// changed values → the source legitimately advanced; the deployed target
-    /// is stale. `nit apply --force-drift` (take source) is the safe fix;
+    /// is stale. `nit apply --discard-target-edits` takes the source;
     /// `nit encrypt` here would WRONGLY push the stale target back.
     StaleTarget { missing: usize },
     /// Target has extra key(s) and/or changed value(s) not in the source → a
     /// genuine local edit `nit encrypt` would flush. Discarding via
-    /// `--force-drift` would lose it. (Wins over StaleTarget when both hold:
+    /// `--discard-target-edits` would lose it. (Wins over StaleTarget when both hold:
     /// any target-unique content is the dangerous-to-discard signal.)
     LikelyUnflushedEdit { extra: usize, changed: usize },
     /// Non-env content, or a byte-diff with no key-level delta (whitespace /
@@ -42,6 +42,13 @@ pub enum DriftClass {
 #[derive(Debug)]
 pub enum DeployStatus {
     Deployed,
+    /// The target differed from the source, but its bytes are exactly an EARLIER committed
+    /// version of this same secret: a stale copy nobody has edited, so deploying the
+    /// current source loses nothing. `versions_back` counts the source's commits back
+    /// from the newest (1 = the newest commit's version).
+    Refreshed {
+        versions_back: usize,
+    },
     Skipped(String),
     Error(String),
     /// Target file diverges from source-decrypt. `classification` captures the
@@ -112,7 +119,7 @@ fn parse_env(buf: &[u8]) -> std::collections::BTreeMap<String, String> {
 /// advanced upstream and the target is stale. Conservative priority: ANY
 /// target-unique content (extra key OR changed value) ⇒ `LikelyUnflushedEdit`
 /// (the dangerous-to-discard case) even if keys are also missing; pure
-/// missing-only ⇒ `StaleTarget` (safe to `--force-drift`).
+/// missing-only ⇒ `StaleTarget` (a stale source, or keys deleted by hand: only the earlier-version check can tell).
 fn classify_env_drift(source: &[u8], target: &[u8]) -> DriftClass {
     let src = parse_env(source);
     let tgt = parse_env(target);
@@ -145,20 +152,23 @@ fn classify_env_drift(source: &[u8], target: &[u8]) -> DriftClass {
 pub fn drift_guidance(class: &DriftClass, target: &str) -> String {
     match class {
         DriftClass::StaleTarget { missing } => format!(
-            "target is STALE ({missing} key(s) the source added upstream are \
-             missing; no local edits) — `nit apply --force-drift` is SAFE here \
-             (take the authoritative source). Do NOT `nit encrypt`: it would \
-             push the stale target back over the source."
+            "target lacks {missing} key(s) the source has and holds nothing the \
+             source lacks. Either the source advanced upstream (the usual cause), or \
+             someone deleted keys here by hand; nit could not match this file to an \
+             earlier committed version of the source, so it did not decide. \
+             `nit apply --discard-target-edits` takes the source (it loses nothing in \
+             the first case, only the deletion in the second). Do NOT `nit encrypt`: \
+             it would push the stale target back over the source."
         ),
         DriftClass::LikelyUnflushedEdit { extra, changed } => format!(
             "target has LOCAL edits not in the source ({extra} extra key(s), \
              {changed} changed) — run `nit encrypt {target}` to flush them into \
-             the source, or `nit apply --force-drift` to DISCARD them."
+             the source, or `nit apply --discard-target-edits` to DISCARD them."
         ),
         DriftClass::Ambiguous => format!(
             "target diverges from source (non-key-level or mixed) — \
              `nit encrypt {target}` to flush target→source, or \
-             `nit apply --force-drift` to overwrite target with source."
+             `nit apply --discard-target-edits` to overwrite target with source."
         ),
     }
 }
@@ -216,6 +226,21 @@ pub fn decrypt_file(
     encrypted_path: &Path,
     identity_path: &Path,
 ) -> Result<String, Box<dyn std::error::Error>> {
+    let ciphertext = fs::read(encrypted_path).map_err(|e| {
+        format!(
+            "cannot read encrypted file {}: {}",
+            encrypted_path.display(),
+            e
+        )
+    })?;
+    decrypt_bytes(&ciphertext, identity_path)
+}
+
+/// Decrypt age ciphertext held in memory (armored or binary) with an identity file.
+pub fn decrypt_bytes(
+    ciphertext: &[u8],
+    identity_path: &Path,
+) -> Result<String, Box<dyn std::error::Error>> {
     let identity_file = age::IdentityFile::from_file(
         identity_path
             .to_str()
@@ -234,19 +259,11 @@ pub fn decrypt_file(
         .into_identities()
         .map_err(|e| format!("cannot parse identities: {}", e))?;
 
-    let ciphertext = fs::read(encrypted_path).map_err(|e| {
-        format!(
-            "cannot read encrypted file {}: {}",
-            encrypted_path.display(),
-            e
-        )
-    })?;
-
     // Auto-detect armor: chezmoi (and `age -a` / `age --armor`) writes
     // ASCII-armored age files starting with `-----BEGIN AGE ENCRYPTED FILE-----`.
     // age::Decryptor::new_buffered expects BINARY format. Wrap with
     // ArmoredReader which transparently handles both armored and binary input.
-    let armored = age::armor::ArmoredReader::new(&ciphertext[..]);
+    let armored = age::armor::ArmoredReader::new(ciphertext);
     let decryptor = age::Decryptor::new_buffered(armored)
         .map_err(|e| format!("cannot create decryptor: {}", e))?;
 
@@ -333,12 +350,92 @@ pub fn rekey_file(
 /// For each tier, checks if this machine's public key is among the recipients.
 /// Returns results for each tier.
 ///
-/// `force_drift_override = true` skips the drift-check that protects against
-/// silent overwrites of unflushed manual edits. Use only when the user has
-/// explicitly confirmed they want to discard target-side changes.
+/// `force_drift_override = true` (`nit apply --discard-target-edits`) skips the drift
+/// check that protects against silent overwrites of unflushed manual edits. Use only when
+/// the user has explicitly confirmed they want to discard target-side changes. Without it,
+/// a drifted target is still refreshed automatically when it is provably a stale copy of
+/// an earlier committed version (`stale_copy_depth`); anything else is reported, not
+/// overwritten.
 pub fn deploy_secrets(
     config: &NitConfig,
     force_drift_override: bool,
+) -> Result<Vec<SecretResult>, Box<dyn std::error::Error>> {
+    deploy_secrets_with(config, force_drift_override, &|age_path, identity| {
+        earlier_versions_from_git(&config.local.git.strategy, age_path, identity)
+    })
+}
+
+/// How many of a secret's earlier committed versions are compared with a drifted target.
+/// Tiers change a few times a month, so this reaches back months; a target older than
+/// that stays blocked and is resolved by hand, which is the safe failure.
+const EARLIER_VERSIONS_CHECKED: usize = 40;
+
+/// Position (1 = the newest commit's version) of the first earlier version whose bytes
+/// equal `target`, or `None`. A match PROVES the target is a stale copy of this very secret
+/// that nobody has edited: it is byte-for-byte something nit once deployed. That is the
+/// same test `nit discard` applies to tracked files (restore only when nothing is lost),
+/// and it is stricter than the key-level classifier, which cannot tell a source that
+/// advanced from keys deleted by hand.
+pub fn stale_copy_depth(target: &[u8], earlier_newest_first: &[Vec<u8>]) -> Option<usize> {
+    earlier_newest_first
+        .iter()
+        .position(|v| v.as_slice() == target)
+        .map(|i| i + 1)
+}
+
+/// Plaintext of the last `EARLIER_VERSIONS_CHECKED` committed versions of an encrypted
+/// secret, newest first, decrypted in memory with this machine's identity (nothing is
+/// written to disk). A version this machine cannot decrypt (an older recipient list, a
+/// damaged blob) is skipped, so a failure here can only leave the target blocked.
+pub fn earlier_versions_from_git(
+    strategy: &crate::config::GitStrategy,
+    encrypted_path: &Path,
+    identity_path: &Path,
+) -> Vec<Vec<u8>> {
+    let Ok(rel) = encrypted_path.strip_prefix(crate::git::work_tree()) else {
+        return Vec::new();
+    };
+    let Some(rel) = rel.to_str() else {
+        return Vec::new();
+    };
+    let log = match crate::git::git_output_with(
+        strategy,
+        &[
+            "log",
+            "--format=%H",
+            "-n",
+            &EARLIER_VERSIONS_CHECKED.to_string(),
+            "--",
+            // `:/` roots the pathspec at the work tree. Without it git reads `rel`
+            // relative to the CURRENT directory and finds nothing from anywhere but $HOME.
+            &format!(":/{rel}"),
+        ],
+    ) {
+        Ok(l) => l,
+        Err(_) => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    for sha in log.lines().filter(|l| !l.trim().is_empty()) {
+        let blob = crate::git::git_command(strategy)
+            .args(["show", &format!("{sha}:{rel}")])
+            .output();
+        let Ok(blob) = blob else { continue };
+        if !blob.status.success() {
+            continue;
+        }
+        if let Ok(plain) = decrypt_bytes(&blob.stdout, identity_path) {
+            out.push(plain.into_bytes());
+        }
+    }
+    out
+}
+
+/// `deploy_secrets` with the source of earlier versions injected (tests hand it a list;
+/// production reads git).
+pub fn deploy_secrets_with(
+    config: &NitConfig,
+    force_drift_override: bool,
+    earlier: &dyn Fn(&Path, &Path) -> Vec<Vec<u8>>,
 ) -> Result<Vec<SecretResult>, Box<dyn std::error::Error>> {
     let identity_path = expand_tilde(&config.local.identity);
     let secrets_dir = &config.secrets_dir;
@@ -380,7 +477,7 @@ pub fn deploy_secrets(
         }
 
         // Drift check: decrypt source, compare to existing target. Skip the
-        // deploy if they diverge unless --force-drift was passed (the user is
+        // deploy if they diverge unless --discard-target-edits was passed (the user is
         // explicitly confirming they want to clobber unflushed edits).
         let plaintext = match decrypt_file(&encrypted_path, &identity_path) {
             Ok(s) => s,
@@ -394,20 +491,30 @@ pub fn deploy_secrets(
             }
         };
 
+        let mut refreshed_from: Option<usize> = None;
         if !force_drift_override
             && let Some((target_bytes, source_bytes, classification)) =
                 check_target_drift(plaintext.as_bytes(), &target_path)
         {
-            results.push(SecretResult {
-                tier: tier_name.clone(),
-                target: target_path.display().to_string(),
-                status: DeployStatus::DriftDetected {
-                    target_bytes,
-                    source_bytes,
-                    classification,
-                },
-            });
-            continue;
+            // Before blocking, ask whether the target is merely a stale copy: byte-equal
+            // to an earlier committed version of this secret. Then nobody edited it and
+            // the source advanced (or removed a key) upstream, so deploying loses nothing.
+            let on_disk = fs::read(&target_path).unwrap_or_default();
+            match stale_copy_depth(&on_disk, &earlier(&encrypted_path, &identity_path)) {
+                Some(n) => refreshed_from = Some(n),
+                None => {
+                    results.push(SecretResult {
+                        tier: tier_name.clone(),
+                        target: target_path.display().to_string(),
+                        status: DeployStatus::DriftDetected {
+                            target_bytes,
+                            source_bytes,
+                            classification,
+                        },
+                    });
+                    continue;
+                }
+            }
         }
 
         // Deploy: write plaintext atomically to target with 0600 perms.
@@ -427,7 +534,10 @@ pub fn deploy_secrets(
             Ok(()) => results.push(SecretResult {
                 tier: tier_name.clone(),
                 target: target_path.display().to_string(),
-                status: DeployStatus::Deployed,
+                status: match refreshed_from {
+                    Some(versions_back) => DeployStatus::Refreshed { versions_back },
+                    None => DeployStatus::Deployed,
+                },
             }),
             Err(e) => results.push(SecretResult {
                 tier: tier_name.clone(),
@@ -793,14 +903,18 @@ mod tests {
         assert_eq!(classify_env_drift(source, target), DriftClass::Ambiguous);
     }
 
-    /// Guidance must be direction-correct: StaleTarget says force-drift is
-    /// SAFE and warns off `nit encrypt`; UnflushedEdit names `nit encrypt
+    /// Guidance must be direction-correct: StaleTarget says what nit could not
+    /// prove and warns off `nit encrypt`; UnflushedEdit names `nit encrypt
     /// <target>` and DISCARD; Ambiguous offers both.
     #[test]
     fn drift_guidance_is_direction_correct() {
         let stale = drift_guidance(&DriftClass::StaleTarget { missing: 2 }, "/tmp/t.env");
-        assert!(stale.contains("STALE"));
-        assert!(stale.contains("`nit apply --force-drift` is SAFE"));
+        assert!(stale.contains("lacks 2 key(s)"));
+        assert!(stale.contains("nit apply --discard-target-edits"));
+        assert!(
+            !stale.contains("is SAFE"),
+            "not proven stale, so it must not be called safe"
+        );
         assert!(stale.contains("Do NOT `nit encrypt`"));
 
         let edit = drift_guidance(
@@ -816,7 +930,7 @@ mod tests {
 
         let amb = drift_guidance(&DriftClass::Ambiguous, "/tmp/t.env");
         assert!(amb.contains("non-key-level or mixed"));
-        assert!(amb.contains("--force-drift"));
+        assert!(amb.contains("--discard-target-edits"));
     }
 
     /// Anchoring scenario for the May 5, 2026 drift-detection feature: target
@@ -895,6 +1009,189 @@ mod tests {
             "ORIGINAL=value\n",
             "target SHOULD have been clobbered when force_drift_override=true"
         );
+    }
+
+    // ── 2026-11-22: a stale target is refreshed when it is provably a stale copy ──
+
+    /// Build a one-tier config whose encrypted source decrypts to `source` and whose
+    /// deployed target holds `target`.
+    fn drift_fixture(
+        source: &str,
+        target: &str,
+    ) -> (tempfile::TempDir, NitConfig, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let (pubkey, identity_path) = setup_keypair(dir.path());
+        let secrets_dir = dir.path().join("secrets");
+        fs::create_dir(&secrets_dir).unwrap();
+        let plaintext_path = dir.path().join("plaintext.tmp");
+        fs::write(&plaintext_path, source).unwrap();
+        encrypt_file(
+            &plaintext_path,
+            std::slice::from_ref(&pubkey),
+            &secrets_dir.join("tier-all.env.age"),
+        )
+        .unwrap();
+        let target_path = dir.path().join("deployed/tier-all.env");
+        fs::create_dir_all(target_path.parent().unwrap()).unwrap();
+        fs::write(&target_path, target).unwrap();
+        let config = build_test_config(
+            dir.path(),
+            &identity_path,
+            &secrets_dir,
+            &[(
+                "tier-all",
+                &[pubkey.as_str()],
+                target_path.to_str().unwrap(),
+            )],
+        );
+        (dir, config, target_path)
+    }
+
+    fn versions(list: &[&str]) -> Vec<Vec<u8>> {
+        list.iter().map(|v| v.as_bytes().to_vec()).collect()
+    }
+
+    #[test]
+    fn stale_copy_depth_finds_the_position_newest_first() {
+        let earlier = versions(&["A=3\n", "A=2\n", "A=1\n"]);
+        assert_eq!(stale_copy_depth(b"A=3\n", &earlier), Some(1));
+        assert_eq!(stale_copy_depth(b"A=1\n", &earlier), Some(3));
+        assert_eq!(stale_copy_depth(b"A=9\n", &earlier), None);
+        assert_eq!(stale_copy_depth(b"A=1\n", &[]), None);
+    }
+
+    /// The case that blocked the spela key on Darwin: the source gained a key upstream and
+    /// the deployed target is the previous version. It is refreshed with no flag.
+    #[test]
+    fn a_target_that_is_an_earlier_version_is_refreshed_without_the_flag() {
+        let v1 = "A=1\nB=2\n";
+        let v2 = "A=1\nB=2\nNEW=3\n";
+        let (_d, config, target) = drift_fixture(v2, v1);
+        let results = deploy_secrets_with(&config, false, &|_, _| versions(&[v2, v1])).unwrap();
+        assert!(
+            matches!(
+                results[0].status,
+                DeployStatus::Refreshed { versions_back: 2 }
+            ),
+            "got {:?}",
+            results[0].status
+        );
+        assert_eq!(fs::read_to_string(&target).unwrap(), v2);
+    }
+
+    /// A key removed upstream: the target still has it and is byte-equal to an older version.
+    /// The key-level classifier calls that an unflushed edit (extra key); the history proof
+    /// shows nobody edited anything, so the removal propagates.
+    #[test]
+    fn a_key_removed_upstream_propagates_when_the_target_is_an_old_version() {
+        let v1 = "A=1\nB=2\n";
+        let v2 = "A=1\nB=2\nGONE=3\n";
+        let (_d, config, target) = drift_fixture(v1, v2);
+        let results = deploy_secrets_with(&config, false, &|_, _| versions(&[v1, v2])).unwrap();
+        assert!(matches!(results[0].status, DeployStatus::Refreshed { .. }));
+        assert_eq!(fs::read_to_string(&target).unwrap(), v1);
+    }
+
+    /// The May 2026 incident: a key added by hand on the machine and never encrypted. It is
+    /// in no earlier version, so it is blocked and the file is left untouched.
+    #[test]
+    fn a_key_added_by_hand_is_still_blocked_and_kept() {
+        let v1 = "A=1\nB=2\n";
+        let edited = "A=1\nB=2\nSARPETORP_WIFI_PSK=hunter2\n";
+        let (_d, config, target) = drift_fixture(v1, edited);
+        let results = deploy_secrets_with(&config, false, &|_, _| versions(&[v1])).unwrap();
+        assert!(matches!(
+            results[0].status,
+            DeployStatus::DriftDetected { .. }
+        ));
+        assert_eq!(fs::read_to_string(&target).unwrap(), edited);
+    }
+
+    /// A key deleted by hand looks like a stale target to the key-level classifier
+    /// (missing-only). It matches no earlier version, so it is blocked, not refreshed.
+    #[test]
+    fn a_key_deleted_by_hand_is_blocked_not_mistaken_for_stale() {
+        let v1 = "A=1\nB=2\nC=3\n";
+        let (_d, config, target) = drift_fixture(v1, "A=1\nB=2\n");
+        let results = deploy_secrets_with(&config, false, &|_, _| versions(&[v1])).unwrap();
+        match &results[0].status {
+            DeployStatus::DriftDetected { classification, .. } => {
+                assert_eq!(*classification, DriftClass::StaleTarget { missing: 1 })
+            }
+            other => panic!("expected DriftDetected, got {:?}", other),
+        }
+        assert_eq!(fs::read_to_string(&target).unwrap(), "A=1\nB=2\n");
+    }
+
+    /// A changed value, not in any earlier version: blocked.
+    #[test]
+    fn a_hand_changed_value_is_blocked() {
+        let v1 = "A=1\nB=2\n";
+        let (_d, config, target) = drift_fixture(v1, "A=1\nB=999\n");
+        let results = deploy_secrets_with(&config, false, &|_, _| versions(&[v1])).unwrap();
+        assert!(matches!(
+            results[0].status,
+            DeployStatus::DriftDetected { .. }
+        ));
+        assert_eq!(fs::read_to_string(&target).unwrap(), "A=1\nB=999\n");
+    }
+
+    /// No history at all (a shallow clone, or every older version encrypted to a recipient
+    /// list this machine is not on): nothing can be proven, so it stays blocked.
+    #[test]
+    fn with_no_history_the_old_behaviour_holds() {
+        let (_d, config, target) = drift_fixture("A=1\nNEW=2\n", "A=1\n");
+        let results = deploy_secrets_with(&config, false, &|_, _| Vec::new()).unwrap();
+        assert!(matches!(
+            results[0].status,
+            DeployStatus::DriftDetected { .. }
+        ));
+        assert_eq!(fs::read_to_string(&target).unwrap(), "A=1\n");
+    }
+
+    /// History is only read when there is something to prove: no drift, no lookup.
+    #[test]
+    fn history_is_not_read_when_the_target_already_matches() {
+        let (_d, config, _t) = drift_fixture("A=1\n", "A=1\n");
+        let calls = std::cell::Cell::new(0);
+        let results = deploy_secrets_with(&config, false, &|_, _| {
+            calls.set(calls.get() + 1);
+            Vec::new()
+        })
+        .unwrap();
+        assert!(matches!(results[0].status, DeployStatus::Deployed));
+        assert_eq!(calls.get(), 0);
+    }
+
+    /// The explicit flag still discards, and it never reads history.
+    #[test]
+    fn the_discard_flag_still_overwrites_without_proof() {
+        let (_d, config, target) = drift_fixture("A=1\n", "A=1\nHAND=edit\n");
+        let results = deploy_secrets_with(&config, true, &|_, _| panic!("no lookup")).unwrap();
+        assert!(matches!(results[0].status, DeployStatus::Deployed));
+        assert_eq!(fs::read_to_string(&target).unwrap(), "A=1\n");
+    }
+
+    /// Against this machine's real repository and key, not a fixture (run with
+    /// `cargo test -- --ignored`): the git history of a real tier is readable and decrypts,
+    /// newest first, and the commit that added `SPELA_ANTHROPIC_API_KEY` (2026-11-22) is
+    /// the newest version while the one before it lacks the key. This is the case the
+    /// feature exists for, and the one the synthetic tests above only imitate.
+    #[test]
+    #[ignore = "needs the Mac's real repo and age identity"]
+    fn real_history_of_tier_servers_reads_back_in_order() {
+        let home = dirs::home_dir().unwrap();
+        let versions = earlier_versions_from_git(
+            &crate::config::GitStrategy::Bare,
+            &home.join("dotfiles/secrets/tier-servers.env.age"),
+            &home.join(".config/nit/age-key.txt"),
+        );
+        assert!(versions.len() >= 3, "found {} versions", versions.len());
+        let has = |v: &Vec<u8>| String::from_utf8_lossy(v).contains("SPELA_ANTHROPIC_API_KEY=");
+        assert!(has(&versions[0]), "newest version holds the new key");
+        assert!(!has(&versions[1]), "the version before it does not");
+        // The target Darwin held before the update equals versions[1] byte for byte.
+        assert_eq!(stale_copy_depth(&versions[1], &versions), Some(2));
     }
 
     /// Drift check is content-based, not mtime-based: identical content → no drift,

@@ -357,6 +357,8 @@ target = "~/.secrets/tier-servers.env"
 
 Ciphertext lives in git on all machines. Only machines with the right key can decrypt.
 
+**A secrets file that differs from its source.** Secrets have no saved copy of what a deploy overwrites (unlike template drift, which `nit pick` keeps), so nit refuses to overwrite a differing target unless it can prove nothing is lost. The proof: the target's bytes equal an earlier committed version of that same secret (the last 40 are decrypted in memory and compared). Then it is a stale copy nobody edited, and the current source is deployed without a flag, with a line saying how many commits back it was. Anything else is reported and left alone: a key added by hand (the case that lost a wifi password in May 2026), a value changed, a key deleted by hand, a machine that cannot decrypt the older versions. For those, `nit encrypt <target>` flushes the machine's file into the source, and `nit apply --discard-target-edits` (formerly `--force-drift`, still accepted) throws the machine's file away in favour of the source.
+
 ## Triggers
 
 Hash-based provisioning scripts defined in `triggers.toml`:
