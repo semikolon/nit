@@ -9,6 +9,13 @@
 
 ---
 
+## Removing a folder takes three tries (found 2026-11-23, moving the life-simulation record)
+
+`nit add -A -- <dir>` is refused (`unexpected argument '-A'`), so staging a folder's deletions has no flag; and
+`nit commit -m … -- <dir>` refuses a directory whose deletions this session staged with `nit rm -r` (*"1 named path(s)
+are not staged by this session"*), so every file had to be named. Wanted: `nit commit -- <dir>` takes the session's
+staged entries under that directory, deletions included.
+
 ## `nit add` again does not clear "committed by someone else" (found 2026-11-05)
 
 - [ ] **The refusal tells the session to `nit add` the path again, and that cannot work.** The base a path was staged on is recorded once (`session.rs`, `meta.staged.entry(p).or_insert_with(...)` in the record step and the `extra` insert in `rebuild`), so a second `nit add`, or `git restore --staged` then `nit add`, keeps the old base and the commit is refused forever. Seen 2026-11-05: `dotfiles/TODO.md` staged with base `08d7847`, another session committed `8ebe622f` on top, the session re-read and re-added on the new version (staged diff against HEAD: one line, its own), refused three times. Fix: when `nit add` stages a path whose recorded base differs from HEAD's blob, set the base to HEAD's blob (the session has just staged on top of the new version), and test it. Until then the only way through is editing `~/.local/share/nit/sessions/<pid>.json` by hand, which the auto-mode guard rightly refuses.
